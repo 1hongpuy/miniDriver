@@ -1,0 +1,75 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>MiniDrive - 我的云盘</title>
+<link rel="stylesheet" href="/style.css">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>📷</text></svg>">
+</head>
+<body>
+
+<!-- ========== 顶部栏 ========== -->
+<header>
+  <h1>📷 MiniDrive</h1>
+  <span class="subtitle">我的摄影素材库</span>
+</header>
+
+<!-- ========== 面包屑导航 ========== -->
+<div id="breadcrumb">
+  <span class="crumb" data-path="/">🏠 根目录</span>
+  <span id="breadcrumbPath"></span>
+</div>
+
+<!-- ========== 工具栏 ========== -->
+<div id="toolbar">
+  <input type="text" id="searchBox" placeholder="搜索文件名...">
+  <select id="filterType">
+    <option value="all">全部</option>
+    <option value="image">图片</option>
+    <option value="video">视频</option>
+  </select>
+  <button id="newFolderBtn" title="新建目录">+ 📁</button>
+  <button id="refreshBtn">刷新</button>
+</div>
+
+<!-- ========== 上传区域 ========== -->
+<div id="upload-area">
+  <label for="fileInput" class="upload-label">
+    <span class="upload-icon">+</span>
+    <span>选择文件或拖拽到此处</span>
+    <span id="currentDirLabel" style="display:block;font-size:12px;color:#8b949e;margin-top:4px;"></span>
+  </label>
+  <input type="file" id="fileInput" multiple accept="image/*,video/*,.raw,.nef,.nrw,.cr2,.cr3,.arw,.dng,.orf,.rw2,.pef,.raf,.3fr,.mov,.mkv,.mp4,.avi,.wmv,.webm,.mts,.m2ts,.tiff,.tif,.heic">
+  <button id="uploadBtn">开始上传</button>
+  <div id="uploadStatus"></div>
+</div>
+
+<!-- ========== 文件网格 ========== -->
+<div id="gallery">
+  <p style="text-align:center;color:#8b949e;padding:40px;grid-column:1/-1;">加载中...</p>
+</div>
+
+<!-- ========== 预览弹窗 ========== -->
+<div id="preview" class="preview-hidden" onclick="closePreview()">
+  <span class="preview-close">&times;</span>
+  <div id="previewContent"></div>
+  <div id="previewInfo"></div>
+</div>
+
+<!-- ========== 移动文件弹窗 ========== -->
+<div id="moveDialog" class="dialog-hidden">
+  <div class="dialog-box">
+    <h3>移动文件</h3>
+    <p id="moveFileName"></p>
+    <label>目标路径：<input type="text" id="moveTargetPath" placeholder="/photos/2026/"></label>
+    <div class="dialog-btns">
+      <button id="moveConfirmBtn">确认移动</button>
+      <button id="moveCancelBtn">取消</button>
+    </div>
+  </div>
+</div>
+
+<script src="/app.js"></script>
+</body>
+</html>

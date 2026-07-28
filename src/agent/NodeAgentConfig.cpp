@@ -64,6 +64,7 @@ NodeAgentConfig parse(const YAML::Node& root)
     if(!root || !root.IsMap()) invalid("root must be a map");
     const YAML::Node node = root["node"];
     const YAML::Node cluster = root["cluster"];
+    const YAML::Node web = root["web"];
     const YAML::Node services = root["services"];
     if(!node || !node.IsMap()) invalid("missing node");
     if(!cluster || !cluster.IsMap()) invalid("missing cluster");
@@ -74,7 +75,11 @@ NodeAgentConfig parse(const YAML::Node& root)
     config.advertiseAddress = required<std::string>(node, "advertiseAddress");
     config.secretFile = required<std::string>(cluster, "secretFile");
     if(config.nodeId.empty() || config.advertiseAddress.empty() || config.secretFile.empty()) invalid("empty required field");
-
+    if(web) {
+        if(!web.IsMap()) invalid("web must be a map");
+        if(web["allowedOrigin"]) config.webAllowedOrigin = web["allowedOrigin"].as<std::string>();
+    }
+    
     bool hasEnabledDataNode = false;
     std::set<std::string> ids;
     std::set<uint16_t> ports;

@@ -39,7 +39,7 @@ void createParentDirectory(const std::string& path)
 }
 
 ChildSpec childSpec(const ManagedServiceConfig& service, const NodeAgentConfig& config,
-                    const std::string& binaryDirectory)
+    const std::string& binaryDirectory)
 {
     const std::filesystem::path executable = std::filesystem::path(binaryDirectory) /
         (service.type == ServiceType::kGateway ? "minikv_v2_gateway" : "minikv_v2_datanode");
@@ -53,9 +53,12 @@ ChildSpec childSpec(const ManagedServiceConfig& service, const NodeAgentConfig& 
         spec.argv = {spec.executable, std::to_string(service.listenPort), service.dataDir};
     } else {
         spec.argv = {spec.executable, config.nodeId, config.advertiseAddress,
-                     std::to_string(service.listenPort), service.dataDir,
-                     config.gatewayAddress, std::to_string(config.gatewayPort)};
-    }
+                    std::to_string(service.listenPort), service.dataDir,
+                    config.gatewayAddress, std::to_string(config.gatewayPort)};
+        if(!config.webAllowedOrigin.empty()) {
+            spec.environment["MINIKV_V2_ALLOWED_ORIGIN"] = config.webAllowedOrigin;
+        }
+    }      
     return spec;
 }
 

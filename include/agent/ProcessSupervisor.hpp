@@ -15,6 +15,7 @@ struct ChildSpec {
     std::string id;
     std::string executable;
     std::vector<std::string> argv;
+    std::map<std::string, std::string> environment;
     std::string stdoutPath;
     std::string stderrPath;
     RestartPolicy restart;

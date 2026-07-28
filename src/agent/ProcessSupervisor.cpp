@@ -69,6 +69,10 @@ void ProcessSupervisor::spawn(ChildState& state)
         if(stdoutFd != STDOUT_FILENO) ::close(stdoutFd);
         if(stderrFd != STDERR_FILENO) ::close(stderrFd);
 
+        for(const auto& [name, value] : state.spec.environment) {
+            if(::setenv(name.c_str(), value.c_str(), 1) != 0) _exit(127);
+        }
+
         std::vector<char*> argv;
         argv.reserve(state.spec.argv.size() + 1);
         for(std::string& value : state.spec.argv) argv.push_back(value.data());

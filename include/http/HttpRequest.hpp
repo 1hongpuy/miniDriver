@@ -22,7 +22,8 @@ public:
         kPost,    //提交数据
         kHead,    //只获取头部，不返回boby
         kPut,     //替换资源
-        kDelete   //删除资源
+        kDelete,  //删除资源
+        kOptions  //CORS 预检
     };
 
     HttpRequest() : method_(kInvalid) {}
@@ -47,6 +48,10 @@ public:
         else if(len == 6 && ::strncasecmp(start, "DELETE", 6) == 0)
         {
             method_ = kDelete;
+        }
+        else if(len == 7 && ::strncasecmp(start, "OPTIONS", 7) == 0)
+        {
+            method_ = kOptions;
         }
         else{
             method_ = kInvalid;
@@ -141,6 +146,7 @@ public:
             case kHead: return "HEAD";
             case kPut:  return "PUT";    
             case kDelete: return "DELETE";
+            case kOptions: return "OPTIONS";
             default:      return "UNKNOWN";
         }
     }
@@ -189,7 +195,6 @@ private:
 
 }
 }
-
 
 
 

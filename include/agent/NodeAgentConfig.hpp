@@ -40,6 +40,7 @@ struct NodeAgentConfig {
     std::string gatewayAddress;
     uint16_t gatewayPort = 0;
     std::string secretFile;
+    std::string webAllowedOrigin;
     std::vector<ManagedServiceConfig> services;
 };
 

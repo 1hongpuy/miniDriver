@@ -75,7 +75,7 @@ void AsyncHttpRequest::open(AsyncHttpRequestOptions options, ReadyCallback ready
     Ptr self(shared_from_this());
     loop_->runInLoop([self, options = std::move(options), ready = std::move(ready), 
                       response = std::move(response)]() mutable {
-        
+        self->openInLoop(std::move(options), std::move(ready), std::move(response));
     });
 }
 

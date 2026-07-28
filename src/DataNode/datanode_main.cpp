@@ -6,6 +6,7 @@
 #include "network/EventLoop.hpp"
 #include "network/TcpConnection.hpp"
 #include "http/AsyncHttpClient.hpp"
+#include "http/CorsPolicy.hpp"
 #include "DataNode/FastDataStore.hpp"
 #include "DataNode/HttpGatewayControlClient.hpp"
 #include "DataNode/ReplicaUploadPipe.hpp"
@@ -32,6 +33,7 @@ using miniKV::network::EventLoop;
 using miniKV::network::TcpConnectionPtr;
 using namespace miniKV::util;
 using namespace miniKV::datanode;
+
 namespace {
 
 struct ReplicaTarget {
@@ -58,6 +60,13 @@ std::string configuredSecret(int argc, char** argv)
     if(const char* value = std::getenv("MINIKV_V2_CLUSTER_SECRET")) return value;
     return {};
 }
+
+std::string configuredAllowedOrigin()
+{
+    if(const char* value = std::getenv("MINIKV_V2_ALLOWED_ORIGIN")) return value;
+    return {};
+}
+
 
 bool parseReplicaTarget(const std::string& value, ReplicaTarget& out)
 {
@@ -114,11 +123,13 @@ public:
     ChunkUploadStream(EventLoop* loop, FastDataStore& store, std::atomic<uint32_t>& activeWrites,
                       std::string nodeId, GatewayControlClient& gatewayControl,
                       std::string gatewayAddress, uint16_t gatewayPort,
-                      std::string clusterSecret, const HttpRequest& request, std::string chunkHash)
+                      std::string clusterSecret, CorsPolicy corsPolicy,
+                      std::string requestOrigin, const HttpRequest& request, std::string chunkHash)
         : loop_(loop), store_(store), activeWrites_(activeWrites), nodeId_(std::move(nodeId)),
-          gatewayControl_(gatewayControl),
-          gatewayAddress_(std::move(gatewayAddress)), gatewayPort_(gatewayPort),
-          clusterSecret_(std::move(clusterSecret)), chunkHash_(std::move(chunkHash))
+            gatewayControl_(gatewayControl),
+            gatewayAddress_(std::move(gatewayAddress)), gatewayPort_(gatewayPort),
+            clusterSecret_(std::move(clusterSecret)), corsPolicy_(std::move(corsPolicy)),
+            requestOrigin_(std::move(requestOrigin)), chunkHash_(std::move(chunkHash))
     {
         setup(request);
     }
@@ -310,6 +321,8 @@ private:
     std::string gatewayAddress_;
     uint16_t gatewayPort_ = 0;
     std::string clusterSecret_;
+    CorsPolicy corsPolicy_;
+    std::string requestOrigin_;
     std::string chunkHash_;
     std::string uploadToken_;
     UploadCapability capability_;
@@ -349,6 +362,7 @@ int main(int argc, char** argv)
     const std::string gatewayAddress = argv[5];
     const uint16_t gatewayPort = static_cast<uint16_t>(std::stoul(argv[6]));
     const std::string clusterSecret = configuredSecret(argc, argv);
+    const CorsPolicy corsPolicy(configuredAllowedOrigin());
     if(clusterSecret.empty()) {
         std::cerr << "MINIKV_V2_CLUSTER_SECRET or a command-line clusterSecret is required\n";
         return 2;
@@ -393,45 +407,61 @@ int main(int argc, char** argv)
     };
 
     miniKV::http::HttpServer server(&loop, nullptr, port);
-    server.setStreamCheck([](const HttpRequest& request) {
+    server.setStreamCheck([&](const HttpRequest& request) {
         return request.method() == HttpRequest::kPut &&
-               beginsWith(request.path(), "/v2/chunks/") && request.contentLength() > 0;
+               beginsWith(request.path(), "/v2/chunks/") && request.contentLength() > 0 &&
+               corsPolicy.allows(request.getHeader("Origin"));
     });
+
     server.setBodyStreamSetup([&](HttpContext* context, const HttpRequest& request,
-                                  const TcpConnectionPtr& upstream) {
+        const TcpConnectionPtr& upstream) {
         const std::string hash = request.path().substr(std::string("/v2/chunks/").size());
         auto stream = std::make_shared<ChunkUploadStream>(&loop, store, activeWrites, nodeId, gatewayControl,
-            gatewayAddress, gatewayPort, clusterSecret, request, hash);
+        gatewayAddress, gatewayPort, clusterSecret, corsPolicy, request.getHeader("Origin"), request, hash);
         stream->startReplica(upstream);
         context->setUserData(stream);
         context->setBodyCallback(request.contentLength(), [stream](const char* bytes, size_t size) {
-            return stream->consume(bytes, size);
+        return stream->consume(bytes, size);
         });
     });
     server.setHttpCallback([&](const HttpRequest& request, HttpResponse* response,
-                               const TcpConnectionPtr&, const DeferredResponse::Ptr& deferred) {
+        const TcpConnectionPtr&, const DeferredResponse::Ptr& deferred) {
         const std::string& path = request.path();
+        const std::string origin = request.getHeader("Origin");
+        const bool chunkRequest = beginsWith(path, "/v2/chunks/");
+        if(chunkRequest && !corsPolicy.allows(origin)) {
+            json(response, 403, jsonError("origin is not allowed"));
+            return;
+        }
+        if(chunkRequest && request.method() == HttpRequest::kOptions) {
+            response->setStatusCode(HttpResponse::k200Ok);
+            corsPolicy.appendHeaders(*response, origin);
+            return;
+        }
         if(request.method() == HttpRequest::kPut && beginsWith(path, "/v2/chunks/")) {
             auto stream = std::static_pointer_cast<ChunkUploadStream>(request.userData());
             if(stream == nullptr) {
                 json(response, 400, jsonError("streaming body is required"));
+                corsPolicy.appendHeaders(*response, origin);
                 return;
             }
             stream->finish(deferred);
             return;
         }
         if((request.method() == HttpRequest::kGet || request.method() == HttpRequest::kHead) &&
-           beginsWith(path, "/v2/chunks/")) {
+        beginsWith(path, "/v2/chunks/")) {
             const std::string hash = path.substr(std::string("/v2/chunks/").size());
             std::string bytes;
             if(!store.get(hash, bytes)) {
                 json(response, 404, jsonError("chunk not found"));
+                corsPolicy.appendHeaders(*response, origin);
                 return;
             }
             response->setStatusCode(HttpResponse::k200Ok);
             response->addHeader("Content-Length", std::to_string(bytes.size()));
             response->addHeader("X-Chunk-Hash", hash);
             if(request.method() == HttpRequest::kGet) response->setBody(bytes);
+            corsPolicy.appendHeaders(*response, origin);
             return;
         }
         json(response, 404, jsonError("route not found"));

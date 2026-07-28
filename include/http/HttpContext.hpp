@@ -33,7 +33,13 @@ public:
         kGotAll,
         kError
     };
-    using BodyDataCallback = std::function<void(const char* data, size_t len)>;
+
+    enum class BodyConsumeResult {
+        kContinue,
+        kPause,
+        kAbort
+    };
+    using BodyDataCallback = std::function<BodyConsumeResult(const char* data, size_t len)>;
     HttpContext() : state_(kExpectRequestLine), bodyTotal(0), bodyReceived_(0) {}
     void setUserData(std::shared_ptr<void> d) { request_.setUserData(d); }
 
@@ -75,6 +81,7 @@ public:
     bool gotAll()  const { return state_ == kGotAll; }
     bool isError() const { return state_ == kError; }
     bool headersReady() const { return state_ == kHeadersComplete; }
+    bool bodyPause() const { return bodyPaused_; }
     State state()  const { return state_; }
     HttpRequest& request() { return request_; }
 
@@ -85,6 +92,7 @@ public:
         bodyCallback_ = nullptr;
         bodyReceived_ = 0;
         bodyTotal     = 0;
+        bodyPaused_ = false;
     }
 
    
@@ -93,7 +101,20 @@ public:
         bodyTotal     = request_.contentLength();
         bodyReceived_ = 0;
         bodyCallback_ = cb;
+        bodyPaused_   = false;
         state_        = kStreamingBody;
+    }
+
+    void setMaxStreamBodyBytes(size_t bytes) {
+        if(bytes > 0) maxStreamBodyBytes_ = bytes;
+    }
+
+    void resumeBody()
+    {
+        if(state_ == kStreamingBody)
+        {
+            bodyPaused_ = false;
+        }
     }
 
     void setGotAll() {
@@ -214,11 +235,27 @@ private:
     }
 
     bool streamBody(network::Buffer* buf) {
+        if(bodyPaused_) //暂停
+        {
+            return false;
+        }
+
         size_t availl = buf->readableBytes();
         if(availl == 0) return false;
+        size_t toFeed = std::min({availl, bodyTotal - bodyReceived_, maxStreamBodyBytes_});
+        if(!bodyCallback_)
+        {
+            state_ = kError;
+            return false;
+        }
 
-        size_t toFeed = std::min(availl, bodyTotal - bodyReceived_);
-        bodyCallback_(buf->peek(), toFeed);
+        const BodyConsumeResult result = bodyCallback_(buf->peek(), toFeed);
+        if(result == BodyConsumeResult::kAbort)
+        {
+            state_ = kError;
+            return false;
+        }
+
         buf->retrieve(toFeed);
         bodyReceived_ += toFeed;
 
@@ -226,6 +263,12 @@ private:
         {
             state_ = kGotAll;
             return true;
+        }
+
+        if(result == BodyConsumeResult::kPause)
+        {
+            bodyPaused_ = true;
+            return false;
         }
         return false;             
     }
@@ -251,6 +294,8 @@ private:
     BodyDataCallback bodyCallback_;
     size_t bodyReceived_ = 0;
     size_t bodyTotal     = 0;
+    bool   bodyPaused_   = false;
+    size_t maxStreamBodyBytes_ = 64 * 1024;
 
     State state_;
     HttpRequest request_;

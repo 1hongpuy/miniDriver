@@ -45,7 +45,10 @@ void TcpConnection::handleRead(){
         handleClose(); //对方发送FIN报文，
     }
     else{
-        messageCallback_(shared_from_this(), &inputBuffer_);
+        if(messageCallback_)
+        {
+            messageCallback_(shared_from_this(), &inputBuffer_);
+        }
     }
 }
 
@@ -53,7 +56,39 @@ void TcpConnection::handleWrite(){
     // 连接已断开则不再写
     if(state_ != kConnected && state_ != kDisconnecting) return;
 
-    if(sendFileCtx_ && sendFileCtx_->fd >= 0)
+
+    if(channel_->isWriting() && outputBuffer_.readableBytes() > 0) //设置了写监控
+    {
+        const size_t oldQueuedBytes = outputBuffer_.readableBytes();
+        ssize_t n = write(fd(), outputBuffer_.peek(), outputBuffer_.readableBytes());
+        if(n > 0)
+        {
+            outputBuffer_.retrieve(n);
+            checkLowWaterMark(oldQueuedBytes);
+            if(outputBuffer_.readableBytes() == 0)
+            {
+                channel_->disableWriting();
+                if(writeCompleteCallback_)
+                {
+                    writeCompleteCallback_(shared_from_this());
+                }
+                if(state_ == kDisconnecting)
+                {
+                    shutdownInLoop();
+                }
+            }
+        }
+        else if(errno == EAGAIN || errno == EWOULDBLOCK)
+        {
+            channel_->enableWriteing();
+            return ;
+        }
+        else {
+            handleError();
+            return ;
+        }
+    }
+    if(sendFileCtx_ && sendFileCtx_->fd >= 0 && outputBuffer_.readableBytes() == 0)
     {
         while(sendFileCtx_->remaining > 0)
         {
@@ -81,36 +116,73 @@ void TcpConnection::handleWrite(){
         }
         return ;
     }
+}
+
+void TcpConnection::pauseRead()
+{
+    TcpConnectionPtr self(shared_from_this());
     
-    if(channel_->isWriting()) //设置了写监控
+    loop_->runInLoop([self](){
+        self->pauseReadInLoop();
+    });
+}
+
+void TcpConnection::pauseReadInLoop()
+{
+    if(state_ != kConnected || readPaused_)
     {
-        ssize_t n = write(fd(), outputBuffer_.peek(), outputBuffer_.readableBytes());
-        if(n > 0)
-        {
-            outputBuffer_.retrieve(n);
-            if(outputBuffer_.readableBytes() == 0)
+        return;
+    }
+
+    readPaused_ = true;
+    channel_->disableReading();
+}
+
+void TcpConnection::resumeRead() {
+    TcpConnectionPtr self(shared_from_this());
+    
+    loop_->runInLoop([self](){
+        self->resumeReadInLoop();
+    });
+}
+
+void TcpConnection::resumeReadInLoop()
+{
+    if(state_ != kConnected || readPaused_)
+    {
+        return;
+    }
+
+    readPaused_ = false;
+    channel_->enableReading();
+
+    //恢复后，要再次触发一次这个http，把buffer部分的数据进行读取
+    if(inputBuffer_.readableBytes() > 0 && messageCallback_)
+    {
+        TcpConnectionPtr self(shared_from_this());
+        loop_->queueInLoop([self](){
+            if(self->state_ == kConnected && !self->readPaused_ && 
+                self->inputBuffer_.readableBytes() > 0 && self->messageCallback_)
             {
-                channel_->disableWriting();
-                if(state_ == kDisconnecting)
-                {
-                    shutdownInLoop();
-                }
+                self->messageCallback_(self, &self->inputBuffer_);
             }
-        }
+        });
     }
 }
 
 void TcpConnection::shutdown() {
-    if(state_ == kConnected)
-    {
-        setState(kDisconnecting);
-
-        if(!channel_->isWriting())
+    TcpConnectionPtr self(shared_from_this());
+    loop_->runInLoop([self](){
+        if(self->state_ != kConnected)
         {
-            shutdownInLoop();
+            return;
         }
-
-    }
+        self->setState(kDisconnecting);
+        if(!self->channel_->isWriting())
+        {
+            self->shutdownInLoop();
+        }
+    });
 }
 
 void TcpConnection::shutdownInLoop() //半关闭，发送一个FIN
@@ -123,35 +195,88 @@ void TcpConnection::shutdownInLoop() //半关闭，发送一个FIN
 
 //主动完全发送数据
 void TcpConnection::send(const std::string &buf)
-{
-    if(state_ == kConnected) //已经连接了
+{ 
+    //拷贝
+    if(buf.empty())
     {
-        ssize_t nwrote = 0;
-        size_t remaining = buf.size();
+        return;
+    }
+    TcpConnectionPtr self(shared_from_this());
+    loop_->runInLoop([self, buf](){
+        self->sendInLoop(buf);
+    });
+}
 
-        if(!channel_->isWriting() && outputBuffer_.readableBytes() == 0)
+void TcpConnection::send(const char* data, size_t size)
+{ 
+    //拷贝
+    if(data == nullptr || size == 0)
+    {
+        return ;
+    }
+    send(std::string(data, size));
+}
+
+void TcpConnection::sendInLoop(const std::string& buf)
+{
+    if(state_ != kConnected)
+    {
+        return ;
+    }
+    ssize_t nwrote = 0;
+    size_t remaining = buf.size();
+
+    if(!channel_->isWriting() && outputBuffer_.readableBytes() == 0)
+    {
+        //这里没有监听epoll 写事件，并且buffer没有要发送的数据
+        nwrote = write(fd(), buf.data(), buf.size());
+        if(nwrote >= 0) //写入成功的字节数
         {
-            //这里没有监听epoll 写事件，并且buffer没有要发送的数据
-            nwrote = write(fd(), buf.data(), buf.size());
-            if(nwrote >= 0) //写入成功的字节数
-            {
-                remaining -= nwrote;
-            }
+            remaining -= static_cast<size_t>(nwrote);
         }
-        if(remaining > 0)
+        else if(errno == EAGAIN || errno == EWOULDBLOCK)
         {
-            outputBuffer_.append((buf.data()+nwrote), remaining);
-            if(!channel_->isWriting())
-            {
-                channel_->enableWriteing();
-            }
+            nwrote = 0;
         }
+        else {
+            handleError();
+            return;
+        }
+    }
+    if(remaining > 0)
+    {
+        const size_t oldQueuedBytes = outputBuffer_.readableBytes();
+        outputBuffer_.append((buf.data()+nwrote), remaining);
+        checkHighWaterMark(oldQueuedBytes);
+        if(!channel_->isWriting())
+        {
+            channel_->enableWriteing();
+        }
+    }
+}
+
+void TcpConnection::checkHighWaterMark(size_t oldQueuedBytes)
+{
+    const size_t queuedBytes = outputBuffer_.readableBytes();
+    if(highWaterMarkCallback_ && highWaterMark_ > 0 && oldQueuedBytes < highWaterMark_ && queuedBytes >= highWaterMark_)
+    {
+        highWaterMarkCallback_(shared_from_this(), queuedBytes);
+    }
+}
+
+void TcpConnection::checkLowWaterMark(size_t oldQueuedBytes)
+{
+    const size_t queuedBytes = outputBuffer_.readableBytes();
+    if(lowWaterMarkCallback_ && lowWaterMark_ > 0 && oldQueuedBytes >= lowWaterMark_ && queuedBytes < lowWaterMark_)
+    {
+        lowWaterMarkCallback_(shared_from_this(), queuedBytes);
     }
 }
 
 void TcpConnection::connectEstablished() {
     //改变状态，变成连接状态
     setState(kConnected);
+    readPaused_ = false;
     channel_->tie(shared_from_this());
     channel_->enableReading();
     if(connectionCallback_) connectionCallback_(shared_from_this());
@@ -160,29 +285,55 @@ void TcpConnection::connectEstablished() {
 
 void TcpConnection::connectDestroyed() //整个TCP连接断开最后调用的函数
 {
-    if(state_ == kConnectiong || state_ == kDisconnecting)
+    if(state_ != kDisconnected)
     {
         setState(kDisconnected);
-        channel_->disableAll();
+    }
+    channel_->disableAll();
+    if(connectionCallback_)
+    {
         connectionCallback_(shared_from_this());
     }
     channel_->remove();
 }
 
 void TcpConnection::handleClose(){//对方断开连接的报警机制
+    if(state_  == kDisconnected)
+    {
+        return;
+    }
     setState(kDisconnected);
     channel_->disableAll();
     TcpConnectionPtr guardThis(shared_from_this());
-    internalCloseCallback_(guardThis);
+    if(internalCloseCallback_)
+    {
+        internalCloseCallback_(guardThis);
+    }
     //这样的guardThis的生命周期会到这个函数运行完成之后，才会结束，这样才会析构
 }
 
 void TcpConnection::handleError(){
+    if(errorCallback_)
+    {
+        errorCallback_(shared_from_this());
+    }
     handleClose();
 }
 
 void TcpConnection::startSendFile(const std::string &filePath, size_t fileSize)
 {
+    TcpConnectionPtr self(shared_from_this());
+    loop_->runInLoop([self, filePath, fileSize](){
+        self->startSendFileInLoop(filePath, fileSize);
+    });
+}
+
+void TcpConnection::startSendFileInLoop(const std::string& filePath, size_t fileSize)
+{
+    if(state_ != kConnected)
+    {
+        return;
+    }
     int fd = ::open(filePath.c_str(), O_RDONLY);
     if(fd < 0)
     {

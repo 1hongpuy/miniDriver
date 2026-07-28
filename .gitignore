@@ -5,6 +5,17 @@ data/
 file/
 tunnel.log
 
+# Runtime state, deployment secrets, and diagnostics must stay local.
+run/
+logs/
+*.log
+*.secret
+cluster.secret
+*.pem
+*.key
+perf.data*
+cloudflared.new
+
 cloudflared
 reference_impl/
 
@@ -15,7 +26,6 @@ reference_impl/
 *.o
 *.a
 *.so
-
 
 
 

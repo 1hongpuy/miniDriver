@@ -163,8 +163,9 @@ class UploadHandler : public Handler {
     
             ctx->setUserData(sctx);
             ctx->setBodyCallback(req.contentLength(),
-                [parser](const char* data, size_t len) {
+                [parser](const char* data, size_t len) ->  HttpContext::BodyConsumeResult{
                     parser->feed(data, len);
+                    return HttpContext::BodyConsumeResult::kContinue;
                 });
         }
     

@@ -7,6 +7,7 @@
 #include "http/HttpRequest.hpp"
 #include "http/HttpResponse.hpp"
 #include "http/HttpContext.hpp"
+#include "http/DeferredResponse.hpp"
 #include "utils/ThreadPool.hpp"
 #include <algorithm>
 #include <asm-generic/errno-base.h>
@@ -30,7 +31,8 @@ class HttpServer {
 public:
     using HttpCallback = std::function<void(const HttpRequest&, 
                                             HttpResponse*, 
-                                            const network::TcpConnectionPtr&)>;
+                                            const network::TcpConnectionPtr&,
+                                            const DeferredResponse::Ptr&)>;
     using StreamCheck = std::function<bool(const HttpRequest&)>;
 
     using BodyStreamSetup = std::function<void(HttpContext*, const HttpRequest&, 
@@ -55,7 +57,7 @@ public:
     void setBodyStreamSetup(BodyStreamSetup cb) { bodyStreamSetup_ = std::move(cb); }
     void start() { server_.start(); }
 
-    network::EventLoop* loop() { return loop_;}
+    network::EventLoop*  loop() { return loop_;}
     utils::ThreadPool*   threadPool()  {return threadPool_; }
 
 private:
@@ -78,10 +80,20 @@ private:
 
         HttpContext* ctx = it->second.get();
 
+        if(ctx->bodyPause())
+        {
+            ctx->resumeBody();
+        }
+
         while(buf->readableBytes() > 0)
         {
             if(!ctx->parseRequest(buf)) //error或者没有完
             {
+                if(ctx->bodyPause())
+                {
+                    conn->pauseRead();
+                    return;
+                }
                 if(ctx->isError())
                 {
                     sendError(conn, HttpResponse::k400BadRequest, "Bad Request");
@@ -118,11 +130,12 @@ private:
 
                 if(httpCallback_ && threadPool_)
                 {
-                    threadPool_->enqueue([this, conn, req = std::move(req), ctxPtr = it->second]()mutable {
+                    auto deferred = DeferredResponse::create(loop_, conn, !keepAlive);
+                    threadPool_->enqueue([this, conn, req = std::move(req), ctxPtr = it->second, deferred]()mutable {
                         auto resp = std::make_shared<HttpResponse>();
                         resp->setCloseConnection(!isKeepAlive(req));
 
-                        httpCallback_(req, resp.get(), conn);
+                        httpCallback_(req, resp.get(), conn, deferred);
 
                         loop_->queueInLoop([this, conn, resp, ctxPtr](){
                             std::cout << "[SEND] isSendFile=" << resp->isSendFile() 
@@ -148,7 +161,9 @@ private:
                 else if(httpCallback_) {
                     HttpResponse resp;
                     resp.setCloseConnection(!keepAlive);
-                    httpCallback_(req, &resp, conn);
+                    auto deferred = DeferredResponse::create(loop_, conn, !keepAlive);
+                    httpCallback_(req, &resp, conn, deferred);
+                    if(deferred->deferred()) return;
 
                     network::Buffer outBuf;
                     resp.appendToBuffer(&outBuf);

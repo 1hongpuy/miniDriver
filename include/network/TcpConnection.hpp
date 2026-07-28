@@ -24,6 +24,11 @@ using TcpConnectionPtr = std::shared_ptr<TcpConnection>;
 using ConnectionCallback = std::function<void(const TcpConnectionPtr&)>;
 using MessageCallback = std::function<void(const TcpConnectionPtr&, Buffer*)>;
 using CloseCallback = std::function<void(const TcpConnectionPtr&)>;
+using WriteCompleteCallback = std::function<void(const TcpConnectionPtr&)>;
+using ErrorCallback = std::function<void(const TcpConnectionPtr&)>;
+using WaterMarkCallback = std::function<void(const TcpConnectionPtr&, size_t)>;
+
+
 
 class TcpConnection : public std::enable_shared_from_this<TcpConnection> {
 public:
@@ -31,10 +36,20 @@ public:
     ~TcpConnection();
 
     void send(const std::string& buf);
+    void send(const char* data, size_t size);
     void shutdown();
-    void shutdownInLoop();
     bool connected() const{return state_ == kConnected;}
     int fd() const {return fd_;}
+
+
+    void pauseRead();
+    void resumeRead();
+    bool readPaused() const {
+        return readPaused_;
+    }
+    size_t queuedBytes() const {
+        return outputBuffer_.readableBytes();
+    }
 
     void setConnectionCallback(ConnectionCallback cb){
         connectionCallback_ = std::move(cb);
@@ -47,6 +62,24 @@ public:
     {
         internalCloseCallback_ = std::move(cb);
     }
+    void setWriteCompleteCallback(WriteCompleteCallback cb)
+    {
+        writeCompleteCallback_ = std::move(cb);
+    }
+    void setErrorCallback(ErrorCallback cb)
+    {
+        errorCallback_ = std::move(cb);
+    }
+    void setHighWaterMark(size_t bytes, WaterMarkCallback cb)
+    {
+        highWaterMark_ = bytes;
+        highWaterMarkCallback_ = std::move(cb);
+    }
+    void setLowWaterMark(size_t bytes, WaterMarkCallback cb)
+    {
+        lowWaterMark_ = bytes;
+        lowWaterMarkCallback_ = std::move(cb);
+    }
 
     void connectEstablished();
     void connectDestroyed();
@@ -58,6 +91,13 @@ private:
     void handleWrite();
     void handleClose();
     void handleError();
+    void sendInLoop(const std::string& buf);//？
+    void startSendFileInLoop(const std::string& filePath, size_t fileSize);
+    void shutdownInLoop();
+    void pauseReadInLoop();
+    void resumeReadInLoop();
+    void checkHighWaterMark(size_t oldQueuedBytes);
+    void checkLowWaterMark(size_t oldQueuedBytes);
 
     enum StateE {
         kConnectiong, 
@@ -83,10 +123,17 @@ private:
 
     Buffer inputBuffer_;
     Buffer outputBuffer_;
+    bool readPaused_ = false;
+    size_t highWaterMark_ = 512 * 1024;
+    size_t lowWaterMark_ = 256 * 1024;
 
     ConnectionCallback connectionCallback_;
     MessageCallback messageCallback_;
     CloseCallback internalCloseCallback_;
+    WriteCompleteCallback writeCompleteCallback_;
+    ErrorCallback errorCallback_;
+    WaterMarkCallback highWaterMarkCallback_;
+    WaterMarkCallback lowWaterMarkCallback_;
 };
 
 

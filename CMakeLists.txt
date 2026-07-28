@@ -87,6 +87,16 @@ target_link_libraries(test_async_http_timeout PRIVATE
     pthread
 )
 
+add_executable(test_fast_data_store_read test/test_fast_data_store_read.cpp)
+target_include_directories(test_fast_data_store_read PRIVATE ${LEVELDB_INC})
+target_link_libraries(test_fast_data_store_read PRIVATE
+    minikv_datanode
+    minikv_utils
+    ${LEVELDB_LIB}
+    pthread
+    OpenSSL::Crypto
+)
+
 # 链接上面打包好的网络静态库
 # target_link_libraries(minikv PRIVATE minikv_net)
 # target_link_libraries(minikv PRIVATE minikv_storage)
@@ -99,7 +109,6 @@ target_link_libraries(test_async_http_timeout PRIVATE
 # target_link_libraries(minikv PRIVATE ${LEVELDB_LIB} pthread)
 # target_link_libraries(minikv PRIVATE OpenSSL::Crypto)
 # target_link_libraries(minikv PRIVATE yaml-cpp)
-
 
 
 

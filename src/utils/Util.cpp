@@ -43,7 +43,7 @@ std::string sha256Hex(const char* data, size_t size)
     for(unsigned char value : digestp)
     {
         out += kHexDigits[(value >> 4) & 0x0f];
-        out += kHexDigits[value & 0x04];
+        out += kHexDigits[value & 0x0f];
     }
     return out;
 }
@@ -343,7 +343,6 @@ bool verifyUploadCapability(const std::string& token,
 
 }
 }
-
 
 
 

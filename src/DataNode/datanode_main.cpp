@@ -316,6 +316,11 @@ private:
             body << "}";
             json(&response, 200, body.str());
         }
+        // Streaming PUT completes through DeferredResponse after the original
+        // HttpServer callback has returned. Add CORS here, not only in the
+        // immediate handler path, otherwise browsers treat a successful 200
+        // as an opaque XHR network error.
+        corsPolicy_.appendHeaders(response, requestOrigin_);
         releaseActiveWrite();
         auto deferred = std::move(response_);
         replicaPipe_.reset();

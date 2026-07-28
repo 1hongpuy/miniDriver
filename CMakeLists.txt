@@ -80,6 +80,13 @@ target_link_libraries(minikv_v2_node_agent PRIVATE
     pthread
 )
 
+add_executable(test_async_http_timeout test/test_async_http_timeout.cpp)
+target_link_libraries(test_async_http_timeout PRIVATE
+    minikv_http
+    minikv_net
+    pthread
+)
+
 # 链接上面打包好的网络静态库
 # target_link_libraries(minikv PRIVATE minikv_net)
 # target_link_libraries(minikv PRIVATE minikv_storage)
@@ -92,7 +99,6 @@ target_link_libraries(minikv_v2_node_agent PRIVATE
 # target_link_libraries(minikv PRIVATE ${LEVELDB_LIB} pthread)
 # target_link_libraries(minikv PRIVATE OpenSSL::Crypto)
 # target_link_libraries(minikv PRIVATE yaml-cpp)
-
 
 
 

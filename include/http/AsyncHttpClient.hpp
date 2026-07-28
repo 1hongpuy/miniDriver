@@ -117,6 +117,7 @@ private:
     void onHighWaterMark(size_t queuedBytes);
     void onLowWaterMark(size_t queuedBytes);
     void completeInLoop(HttpClientResponse response, std::string error);
+    void startResponseTimeoutInLoop();
     void cancelTimeoutInLoop();
     void holdLifetimeInLoop();
     void releaseLifetimeInLoop();
@@ -152,7 +153,6 @@ private:
 }
 
 }
-
 
 
 

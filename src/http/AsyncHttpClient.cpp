@@ -115,16 +115,6 @@ void AsyncHttpRequest::openInLoop(AsyncHttpRequestOptions options,
         if(Ptr self = weakSelf.lock()) self->onMessage(connection, buffer);
     });
 
-    if(options_.timeoutMs > 0)
-    {
-        timeoutTimerId_ = loop_->runAfter(options_.timeoutMs, [weakSelf] {
-            if(Ptr self = weakSelf.lock())
-            {
-                HttpClientResponse empty;
-                self->completeInLoop(std::move(empty), "async HTTP request timed out");
-            }
-        });
-    }
     client_->connect(options_.address, options_.port);
 }
 
@@ -198,6 +188,7 @@ void AsyncHttpRequest::finishBodyInLoop()
     if(ready_) //一般只有短时间没有连接成功的时候，就是数据量很小
     {
         state_ = State::kWaitingResponse;
+        startResponseTimeoutInLoop();
     }
 }
 
@@ -263,6 +254,7 @@ void AsyncHttpRequest::onConnection(const network::TcpConnectionPtr& connection)
     ready_ = true;
     flushPreconnectBodyInLoop(); //倾斜缓冲区
     state_ = finishRequested_ ? State::kWaitingResponse : State::kWritingBody;
+    if(finishRequested_) startResponseTimeoutInLoop();
     if(readyCallback_) readyCallback_();
 }
 
@@ -443,6 +435,20 @@ void AsyncHttpRequest::completeInLoop(HttpClientResponse response, std::string e
     if(callback) callback(std::move(response), std::move(error));
 }
 
+void AsyncHttpRequest::startResponseTimeoutInLoop()
+{
+    if(finished_ || timeoutTimerId_ != 0 || options_.timeoutMs <= 0) return;
+
+    std::weak_ptr<AsyncHttpRequest> weakSelf(shared_from_this());
+    timeoutTimerId_ = loop_->runAfter(options_.timeoutMs, [weakSelf] {
+        if(Ptr self = weakSelf.lock())
+        {
+            HttpClientResponse empty;
+            self->completeInLoop(std::move(empty), "async HTTP response timed out");
+        }
+    });
+}
+
 void AsyncHttpRequest::cancelTimeoutInLoop()
 {
     if(timeoutTimerId_ != 0)
@@ -465,6 +471,5 @@ void AsyncHttpRequest::releaseLifetimeInLoop() {
 
 }
 }
-
 
 

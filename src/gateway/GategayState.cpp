@@ -356,6 +356,7 @@ bool GatewayState::heartbeat(const std::string& nodeId, const NodeRuntime& runti
     if(!nodeRecords_.count(nodeId)) return false;
     NodeRuntime next = runtime;
     next.state = NodeLiveState::kOnline;
+    next.lastHeartbeatAt = unixSeconds();
     nodeRuntime_[nodeId] = next;
     return true;
 }
@@ -525,7 +526,6 @@ bool GatewayState::getRoute(const std::string& chunkHash, ChunkRoute& out) const
 
 }
 }
-
 
 
 

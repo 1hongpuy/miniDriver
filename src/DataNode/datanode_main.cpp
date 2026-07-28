@@ -183,6 +183,9 @@ public:
         const auto result = replicaPipe_->push(bytes, size);
         if(result == HttpContext::BodyConsumeResult::kAbort) {
             error_ = "replica stream rejected body bytes";
+            std::cerr << "chunk upload " << chunkHash_ << " replica body rejected\n";
+        } else if(result == HttpContext::BodyConsumeResult::kPause) {
+            std::cerr << "chunk upload " << chunkHash_ << " paused for replica backpressure\n";
         }
         return result;
     }
@@ -201,9 +204,13 @@ public:
 
         bool alreadyExists = false;
         if(!writer_->finish(alreadyExists)) {
+            std::cerr << "chunk upload " << chunkHash_
+                      << " local finish failed after " << writer_->writtenBytes() << " bytes\n";
             completeClient(400, "chunk length or SHA-256 verification failed");
             return;
         }
+        std::cerr << "chunk upload " << chunkHash_ << " local finish succeeded"
+                  << (replicaPipe_ == nullptr ? " without replica\n" : ", waiting for replica\n");
         alreadyExists_ = alreadyExists;
         successfulNodes_.push_back(nodeId_);
 
@@ -250,6 +257,8 @@ private:
     {
         if(response_ == nullptr) return;
         replicaPipe_.reset();
+        std::cerr << "chunk upload " << chunkHash_ << " replica completed: HTTP "
+                  << response.status << ", error=" << (error.empty() ? "<none>" : error) << '\n';
         if(!error.empty() || response.status != 200) {
             replicaError_ = error.empty() ? "replica returned HTTP " + std::to_string(response.status)
                                           : std::move(error);
@@ -266,14 +275,20 @@ private:
     void afterReplica()
     {
         if(position_ != 0) {
+            std::cerr << "chunk upload " << chunkHash_ << " replica node replying to primary\n";
             completeClient(200, "");
             return;
         }
+        std::cerr << "chunk upload " << chunkHash_ << " sending Gateway commit with "
+                  << successfulNodes_.size() << " successful node(s)\n";
         std::weak_ptr<ChunkUploadStream> weakSelf(shared_from_this());
         gatewayControl_.commitChunk({capability_.sessionId, capability_.chunkIndex, chunkHash_,
                                     capability_.chunkSize, successfulNodes_, uploadToken_},
             [weakSelf](RpcResult result) {
             if(auto self = weakSelf.lock()) {
+                std::cerr << "chunk upload " << self->chunkHash_ << " Gateway commit result: HTTP "
+                          << result.httpStatus << ", error="
+                          << (result.error.empty() ? "<none>" : result.error) << '\n';
                 if(!result.ok) {
                     self->completeClient(500, result.error.empty() ? "Gateway commit failed" : std::move(result.error));
                     return;
@@ -286,6 +301,9 @@ private:
     void completeClient(int status, const std::string& error)
     {
         if(response_ == nullptr) return;
+        std::cerr << "chunk upload " << chunkHash_ << " responding to client: HTTP " << status;
+        if(!error.empty()) std::cerr << ", error=" << error;
+        std::cerr << '\n';
         HttpResponse response;
         if(status != 200) {
             json(&response, status, jsonError(error));

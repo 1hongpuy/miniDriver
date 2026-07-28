@@ -50,7 +50,7 @@ struct NodeSnapshot { NodeRecord record; NodeRuntime runtime; };
 
 struct PlacementPlan { //临时写入计划
     uint32_t chunkIndex   = 0;
-    std::string leaseId   = 0;
+    std::string leaseId;
     uint64_t routeVersion = 0; //防止冲突版本号
     int64_t  expiresAt    = 0; //过期时间
     std::vector<NodeSnapshot> chain; //节点备份
@@ -159,7 +159,6 @@ private:
 
 }
 }
-
 
 
 

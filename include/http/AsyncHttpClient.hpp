@@ -131,8 +131,8 @@ private:
     QueueWaterMarkCallback highWaterMarkCallback_;
     QueueWaterMarkCallback lowWaterMarkCallback_;
     std::vector<std::string> preconnectBody_;  //缓冲区 临时保存每次要转发得数据，就是此时我们的tcp连接备份机器还没有成功
-    size_t preconnectBodyBytes_;    //累计存储缓冲区的数据计数
-    uint64_t acceptedBodyBytes_;    //接收body累计数据计数
+    size_t preconnectBodyBytes_ = 0;    //累计存储缓冲区的数据计数
+    uint64_t acceptedBodyBytes_ = 0;    //接收body累计数据计数
 
     //解析
     std::string responseBytes_; //接收到的这个响应
@@ -152,7 +152,6 @@ private:
 }
 
 }
-
 
 
 

@@ -148,7 +148,10 @@ void TcpConnection::resumeRead() {
 
 void TcpConnection::resumeReadInLoop()
 {
-    if(state_ != kConnected || readPaused_)
+    // resumeRead() is only meaningful after pauseReadInLoop() disabled EPOLLIN.
+    // The previous condition returned precisely when the connection was paused,
+    // leaving an upload permanently back-pressured after its replica connected.
+    if(state_ != kConnected || !readPaused_)
     {
         return;
     }
@@ -353,7 +356,6 @@ void TcpConnection::startSendFileInLoop(const std::string& filePath, size_t file
 
 }
 }
-
 
 
 

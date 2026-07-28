@@ -3,6 +3,7 @@
 #include "network/EventLoop.hpp"
 
 #include <cassert>
+#include <iostream>
 #include <utility>
 
 namespace miniKV::datanode {
@@ -65,6 +66,8 @@ void ReplicaUploadPipe::startInLoop(ReplicaUploadPipeOptions options, Completion
                 if(self->finished_) return;
                 self->requestReady_ = true;
                 self->state_ = State::kStreaming;
+                std::cerr << "replica pipe connected; flushing " << self->pendingBytes_
+                          << " pending bytes\n";
                 self->flushPendingInLoop();
                 self->tryResumeUpstreamInLoop();
             }
@@ -112,6 +115,7 @@ miniKV::http::HttpContext::BodyConsumeResult ReplicaUploadPipe::pushInLoop(const
     {
         if(!enqueuePendingInLoop(data, size)) return Result::kAbort;
         upstreamPaused_ = true;
+        std::cerr << "replica pipe paused upstream with " << pendingBytes_ << " pending bytes\n";
         return Result::kPause;
     }
 
@@ -207,6 +211,7 @@ void ReplicaUploadPipe::tryResumeUpstreamInLoop()
     if(finished_ || downstreamBlocked_ || !pendingBlocks_.empty()) return;
     if(!upstreamPaused_) return;
     upstreamPaused_ = false;
+    std::cerr << "replica pipe resuming upstream\n";
     if(options_.resumeUpstream) options_.resumeUpstream();
 }
 
@@ -225,6 +230,8 @@ void ReplicaUploadPipe::failInLoop(std::string error)
 void ReplicaUploadPipe::completeInLoop(HttpClientResponse response, std::string error)
 {
     if(finished_) return;
+    std::cerr << "replica pipe completed: HTTP " << response.status
+              << ", error=" << (error.empty() ? "<none>" : error) << '\n';
     finished_ = true;
     state_ = State::kFinished;
     pendingBlocks_.clear();

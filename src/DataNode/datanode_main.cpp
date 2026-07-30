@@ -10,10 +10,10 @@
 #include "DataNode/FastDataStore.hpp"
 #include "DataNode/HttpGatewayControlClient.hpp"
 #include "DataNode/ReplicaUploadPipe.hpp"
+#include "DataNode/WriteAdmission.hpp"
 #include "utils/Util.hpp"
 
 #include <algorithm>
-#include <atomic>
 #include <cstdlib>
 #include <filesystem>
 #include <functional>
@@ -35,6 +35,8 @@ using namespace miniKV::util;
 using namespace miniKV::datanode;
 
 namespace {
+
+constexpr uint32_t kMaxConcurrentWrites = 2;
 
 struct ReplicaTarget {
     std::string nodeId;
@@ -120,12 +122,12 @@ uint64_t availableBytes(const std::string& path)
 
 class ChunkUploadStream : public std::enable_shared_from_this<ChunkUploadStream> {
 public:
-    ChunkUploadStream(EventLoop* loop, FastDataStore& store, std::atomic<uint32_t>& activeWrites,
+    ChunkUploadStream(EventLoop* loop, FastDataStore& store, WriteAdmission& writeAdmission,
                       std::string nodeId, GatewayControlClient& gatewayControl,
                       std::string gatewayAddress, uint16_t gatewayPort,
                       std::string clusterSecret, CorsPolicy corsPolicy,
                       std::string requestOrigin, const HttpRequest& request, std::string chunkHash)
-        : loop_(loop), store_(store), activeWrites_(activeWrites), nodeId_(std::move(nodeId)),
+        : loop_(loop), store_(store), writeAdmission_(writeAdmission), nodeId_(std::move(nodeId)),
             gatewayControl_(gatewayControl),
             gatewayAddress_(std::move(gatewayAddress)), gatewayPort_(gatewayPort),
             clusterSecret_(std::move(clusterSecret)), corsPolicy_(std::move(corsPolicy)),
@@ -173,6 +175,7 @@ public:
 
     HttpContext::BodyConsumeResult consume(const char* bytes, size_t size)
     {
+        if(admissionRejected_) return HttpContext::BodyConsumeResult::kContinue;
         if(!error_.empty() || writer_ == nullptr) return HttpContext::BodyConsumeResult::kAbort;
         if(!writer_->append(bytes, size)) {
             error_ = "local streaming write failed";
@@ -197,6 +200,10 @@ public:
         response_->defer();
         selfHold_ = shared_from_this();
 
+        if(admissionRejected_) {
+            completeClient(503, "DataNode write capacity reached");
+            return;
+        }
         if(!error_.empty() || writer_ == nullptr) {
             completeClient(400, error_.empty() ? "invalid stream" : error_);
             return;
@@ -244,13 +251,17 @@ private:
             error_ = "request does not match upload token";
             return;
         }
+        if(!writeAdmission_.tryAcquire()) {
+            admissionRejected_ = true;
+            return;
+        }
+        activeWriteCounted_ = true;
         writer_ = store_.beginPut(chunkHash_, capability_.chunkSize);
         if(writer_ == nullptr) {
+            releaseActiveWrite();
             error_ = "cannot allocate local chunk extent";
             return;
         }
-        activeWrites_.fetch_add(1);
-        activeWriteCounted_ = true;
     }
 
     void onReplicaComplete(HttpClientResponse response, std::string error)
@@ -307,6 +318,7 @@ private:
         HttpResponse response;
         if(status != 200) {
             json(&response, status, jsonError(error));
+            if(status == 503) response.addHeader("Retry-After", "1");
         } else {
             std::ostringstream body;
             body << "{\"chunkHash\":\"" << chunkHash_ << "\",\"alreadyExists\":"
@@ -321,6 +333,9 @@ private:
         // immediate handler path, otherwise browsers treat a successful 200
         // as an opaque XHR network error.
         corsPolicy_.appendHeaders(response, requestOrigin_);
+        if(status != 200 && position_ == 0 && !uploadToken_.empty()) {
+            gatewayControl_.releaseLease({uploadToken_}, [](RpcResult) {});
+        }
         releaseActiveWrite();
         auto deferred = std::move(response_);
         replicaPipe_.reset();
@@ -331,14 +346,14 @@ private:
     void releaseActiveWrite()
     {
         if(activeWriteCounted_) {
-            activeWrites_.fetch_sub(1);
+            writeAdmission_.release();
             activeWriteCounted_ = false;
         }
     }
 
     EventLoop* loop_;
     FastDataStore& store_;
-    std::atomic<uint32_t>& activeWrites_;
+    WriteAdmission& writeAdmission_;
     std::string nodeId_;
     GatewayControlClient& gatewayControl_;
     std::string gatewayAddress_;
@@ -359,6 +374,7 @@ private:
     std::string replicaError_;
     bool alreadyExists_ = false;
     bool activeWriteCounted_ = false;
+    bool admissionRejected_ = false;
     std::shared_ptr<ChunkUploadStream> selfHold_;
 };
 
@@ -396,7 +412,7 @@ int main(int argc, char** argv)
         std::cerr << "cannot open DataNode store\n";
         return 1;
     }
-    std::atomic<uint32_t> activeWrites{0};
+    WriteAdmission writeAdmission(kMaxConcurrentWrites);
     EventLoop loop;
     HttpGatewayControlClient gatewayControl(&loop, gatewayAddress, gatewayPort, clusterSecret);
 
@@ -407,7 +423,7 @@ int main(int argc, char** argv)
     registerNode = [&] {
         if(registered || registrationInFlight) return;
         registrationInFlight = true;
-        gatewayControl.registerStorageNode({nodeId, advertiseAddress, port, availableBytes(dataDir), 0, 2},
+        gatewayControl.registerStorageNode({nodeId, advertiseAddress, port, availableBytes(dataDir), 0, kMaxConcurrentWrites},
             [&](RpcResult result) {
                 registrationInFlight = false;
                 if(result.ok) {
@@ -420,7 +436,7 @@ int main(int argc, char** argv)
     };
     heartbeat = [&] {
         gatewayControl.sendHeartbeat({nodeId, store.usedBytes(), availableBytes(dataDir),
-                                      0, 0, 0, 0, activeWrites.load()},
+                                      0, 0, 0, 0, writeAdmission.active()},
             [&](RpcResult result) {
                 if(!result.ok) {
                     registered = false;
@@ -439,7 +455,7 @@ int main(int argc, char** argv)
     server.setBodyStreamSetup([&](HttpContext* context, const HttpRequest& request,
         const TcpConnectionPtr& upstream) {
         const std::string hash = request.path().substr(std::string("/v2/chunks/").size());
-        auto stream = std::make_shared<ChunkUploadStream>(&loop, store, activeWrites, nodeId, gatewayControl,
+        auto stream = std::make_shared<ChunkUploadStream>(&loop, store, writeAdmission, nodeId, gatewayControl,
         gatewayAddress, gatewayPort, clusterSecret, corsPolicy, request.getHeader("Origin"), request, hash);
         stream->startReplica(upstream);
         context->setUserData(stream);
@@ -474,16 +490,18 @@ int main(int argc, char** argv)
         if((request.method() == HttpRequest::kGet || request.method() == HttpRequest::kHead) &&
         beginsWith(path, "/v2/chunks/")) {
             const std::string hash = path.substr(std::string("/v2/chunks/").size());
-            std::string bytes;
-            if(!store.get(hash, bytes)) {
+            FileRegion region;
+            if(!store.getRegion(hash, region)) {
                 json(response, 404, jsonError("chunk not found"));
                 corsPolicy.appendHeaders(*response, origin);
                 return;
             }
             response->setStatusCode(HttpResponse::k200Ok);
-            response->addHeader("Content-Length", std::to_string(bytes.size()));
+            response->addHeader("Content-Length", std::to_string(region.length));
             response->addHeader("X-Chunk-Hash", hash);
-            if(request.method() == HttpRequest::kGet) response->setBody(bytes);
+            if(request.method() == HttpRequest::kGet) {
+                response->setFileBody(store.dataFilePath(), region.offset, region.length);
+            }
             corsPolicy.appendHeaders(*response, origin);
             return;
         }

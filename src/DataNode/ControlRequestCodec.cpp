@@ -40,4 +40,10 @@ EncodedControlRequest makeChunkCommitRequest(const ChunkCommit& request)
             "\",\"uploadToken\":\"" + jsonEscape(request.uploadToken) + "\"}"};
 }
 
+EncodedControlRequest makeLeaseReleaseRequest(const LeaseRelease& request)
+{
+    return {"POST", "/internal/v2/lease-releases",
+            "{\"uploadToken\":\"" + jsonEscape(request.uploadToken) + "\"}"};
+}
+
 }  // namespace miniKV::v2

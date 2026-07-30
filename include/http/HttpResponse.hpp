@@ -4,6 +4,7 @@
 #include <cstddef>
 #include <string>
 #include <map>
+#include <sys/types.h>
 #include "sstream"
 #include "network/Buffer.hpp"
 
@@ -27,6 +28,7 @@ public:
         k413PayloadTooLarge = 413, //请求体过大
         k500InternalServerError = 500, //网络内部错误
         k501NotImplemented = 501, //功能为实现
+        k503ServiceUnavailable = 503, //暂时无可用容量，可稍后重试
     };
     HttpResponse() : statusCode_(kUnknown),closeConnection_(true) {}
 
@@ -46,13 +48,20 @@ public:
 
     void setFileBody(const std::string& filePath, size_t fileSize)
     {
+        setFileBody(filePath, 0, fileSize);
+    }
+
+    void setFileBody(const std::string& filePath, off_t fileOffset, size_t fileSize)
+    {
         bodyFilePath_ = filePath;
+        bodyFileOffset_ = fileOffset;
         bodyFileSize_ = fileSize;
         addHeader("Content-Length", std::to_string(fileSize));
     }
 
     bool isSendFile() { return !bodyFilePath_.empty(); }
     const std::string& bodyFilePath() const { return bodyFilePath_; }
+    off_t bodyFileOffset() const { return bodyFileOffset_; }
     size_t bodyFileSize() const { return bodyFileSize_; }
 
     void addHeader(const std::string& key,  const std::string& value)
@@ -104,6 +113,7 @@ private:
             case 413: return "Payload Too Large";
             case 500: return "Internal Server Error";
             case 501: return "Not Implemented";
+            case 503: return "Service Unavailable";
             default: return "Unknown";
         }
     }
@@ -116,6 +126,7 @@ private:
 
     //零拷贝发送变量
     std::string bodyFilePath_;
+    off_t       bodyFileOffset_ = 0;
     size_t      bodyFileSize_;
 };
     
@@ -123,4 +134,3 @@ private:
 }
     
 }
-

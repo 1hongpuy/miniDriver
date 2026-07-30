@@ -7,6 +7,7 @@
 #include <cstdio>
 #include <cstring>
 #include <mutex>
+#include <memory>
 #include <netinet/in.h>
 #include <sys/socket.h>
 #include <thread>
@@ -19,7 +20,10 @@ public:
     SilentServer()
     {
         fd_ = ::socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
-        if(fd_ < 0) std::abort();
+        if(fd_ < 0) {
+            std::perror("SilentServer socket");
+            std::abort();
+        }
 
         int reuse = 1;
         ::setsockopt(fd_, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
@@ -29,11 +33,15 @@ public:
         address.sin_port = 0;
         if(::bind(fd_, reinterpret_cast<const sockaddr*>(&address), sizeof(address)) != 0 ||
            ::listen(fd_, 1) != 0) {
+            std::perror("SilentServer bind/listen");
             std::abort();
         }
 
         socklen_t length = sizeof(address);
-        if(::getsockname(fd_, reinterpret_cast<sockaddr*>(&address), &length) != 0) std::abort();
+        if(::getsockname(fd_, reinterpret_cast<sockaddr*>(&address), &length) != 0) {
+            std::perror("SilentServer getsockname");
+            std::abort();
+        }
         port_ = ntohs(address.sin_port);
         thread_ = std::thread([this] {
             const int peer = ::accept(fd_, nullptr, nullptr);
@@ -65,13 +73,30 @@ private:
 int main()
 {
     SilentServer server;
-    miniKV::network::EventLoop loop;
     std::mutex mutex;
     std::condition_variable condition;
+    miniKV::network::EventLoop* loop = nullptr;
+    bool loopReady = false;
     bool callbackCalled = false;
+    std::string callbackError;
 
-    std::thread loopThread([&] { loop.loop(); });
-    auto request = miniKV::http::AsyncHttpRequest::create(&loop);
+    std::thread loopThread([&] {
+        miniKV::network::EventLoop localLoop;
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            loop = &localLoop;
+            loopReady = true;
+            condition.notify_one();
+        }
+        localLoop.loop();
+    });
+
+    {
+        std::unique_lock<std::mutex> lock(mutex);
+        condition.wait(lock, [&] { return loopReady; });
+    }
+
+    auto request = miniKV::http::AsyncHttpRequest::create(loop);
     miniKV::http::AsyncHttpRequestOptions options;
     options.address = "127.0.0.1";
     options.port = server.port();
@@ -84,9 +109,10 @@ int main()
         request->write("x", 1);
         // Deliberately do not call finishBody(). The peer cannot reply until
         // the request body is formally complete.
-    }, [&](miniKV::http::HttpClientResponse, std::string) {
+    }, [&](miniKV::http::HttpClientResponse, std::string error) {
         std::lock_guard<std::mutex> lock(mutex);
         callbackCalled = true;
+        callbackError = std::move(error);
         condition.notify_one();
     });
 
@@ -95,12 +121,24 @@ int main()
         condition.wait_for(lock, std::chrono::milliseconds(700), [&] { return callbackCalled; });
     }
 
-    loop.quit();
+    const bool timedOutBeforeFinish = callbackCalled;
+    request->cancel();
+
+    {
+        std::unique_lock<std::mutex> lock(mutex);
+        condition.wait_for(lock, std::chrono::milliseconds(300), [&] { return callbackCalled; });
+    }
+
+    loop->quit();
     loopThread.join();
 
-    if(callbackCalled) {
+    if(timedOutBeforeFinish) {
         std::fprintf(stderr,
                      "FAIL: request timed out before finishBody(); response timeout started at open()\n");
+        return 1;
+    }
+    if(!callbackCalled || callbackError != "async HTTP request cancelled") {
+        std::fprintf(stderr, "FAIL: request did not finish cleanly after cancellation\n");
         return 1;
     }
     std::puts("PASS: request did not start response timeout before finishBody()");

@@ -106,7 +106,17 @@ int main(int argc, char** argv) {
             const std::string id = pathTail(path, "/api/v2/upload/sessions/", "/routes");
             const auto requests = parseRouteRequests(body);
             std::vector<PlacementPlan> plans;
-            if (requests.empty() || !state.planRoutes(id, requests, plans) || plans.size() != requests.size()) { json(response, 400, jsonError("no route available or invalid route request")); return; }
+            const RoutePlanStatus routeStatus = state.planRoutes(id, requests, plans);
+            if (requests.empty() || plans.size() != requests.size() ||
+                routeStatus != RoutePlanStatus::kOk) {
+                if (routeStatus == RoutePlanStatus::kNoCapacity) {
+                    response->addHeader("Retry-After", "1");
+                    json(response, 503, jsonError("no DataNode write capacity available"));
+                } else {
+                    json(response, 400, jsonError("invalid route request"));
+                }
+                return;
+            }
             std::ostringstream out;
             out << "{\"routes\":[";
             for (size_t i = 0; i < plans.size(); ++i) {
@@ -152,7 +162,32 @@ int main(int argc, char** argv) {
                 capability.chunkHash != jsonString(body, "chunkHash") ||
                 capability.chunkSize != jsonUint(body, "size")) { json(response, 400, jsonError("invalid upload capability")); return; }
             const std::vector<std::string> nodes = split(jsonString(body, "successfulNodes"), ',');
-            if (!state.commitChunk(jsonString(body, "sessionId"), static_cast<uint32_t>(jsonUint(body, "chunkIndex")), jsonString(body, "chunkHash"), jsonUint(body, "size"), nodes)) json(response, 400, jsonError("invalid chunk commit")); else json(response, 200, "{\"status\":\"committed\"}");
+            const CommitChunkStatus status = state.commitChunk(
+                jsonString(body, "sessionId"), static_cast<uint32_t>(jsonUint(body, "chunkIndex")),
+                jsonString(body, "chunkHash"), jsonUint(body, "size"), nodes, capability.leaseId);
+            if (status == CommitChunkStatus::kInvalidRequest) {
+                json(response, 400, jsonError("invalid chunk commit"));
+            } else {
+                json(response, 200, status == CommitChunkStatus::kCommitted
+                    ? "{\"status\":\"committed\"}"
+                    : "{\"status\":\"already_committed\"}");
+            }
+            return;
+        }
+        if (request.method() == HttpRequest::kPost && path == "/internal/v2/lease-releases") {
+            if (!constantTimeEquals(request.getHeader("X-Cluster-Internal-Token"), clusterSecret)) {
+                json(response, 403, jsonError("invalid cluster token"));
+                return;
+            }
+            UploadCapability capability;
+            if (!verifyUploadCapability(jsonString(body, "uploadToken"), clusterSecret, capability)) {
+                json(response, 400, jsonError("invalid upload capability"));
+                return;
+            }
+            // Releasing an already-committed or expired lease is a successful
+            // idempotent cleanup operation.
+            state.releaseLease(capability.leaseId);
+            json(response, 200, "{\"status\":\"released\"}");
             return;
         }
         if (request.method() == HttpRequest::kPost && beginsWith(path, "/api/v2/upload/sessions/") && path.size() > 7 && path.rfind("/commit") == path.size() - 7) {
@@ -160,8 +195,34 @@ int main(int argc, char** argv) {
             json(response, 200, "{\"fileHash\":\"" + file.fileHash + "\",\"state\":\"" + (file.state == FileState::kAvailable ? "AVAILABLE" : "PROTECTING") + "\"}"); return;
         }
         if (request.method() == HttpRequest::kGet && beginsWith(path, "/api/v2/files/") && path.size() > 9 && path.rfind("/manifest") == path.size() - 9) {
-            FileMeta file; if (!state.getFile(pathTail(path, "/api/v2/files/", "/manifest"), file)) { json(response, 404, jsonError("file not found")); return; }
-            std::ostringstream out; out << "{\"fileHash\":\"" << file.fileHash << "\",\"fileSize\":" << file.fileSize << ",\"chunkSize\":" << file.chunkSize << ",\"chunks\":["; for (size_t i = 0; i < file.chunkHashes.size(); ++i) { if (i) out << ','; ChunkRoute route; state.getRoute(file.chunkHashes[i], route); out << "{\"index\":" << i << ",\"hash\":\"" << file.chunkHashes[i] << "\",\"replicas\":["; bool first = true; for (const auto& node : state.nodes()) if (std::find(route.replicas.begin(), route.replicas.end(), node.record.nodeId) != route.replicas.end()) { if (!first) out << ','; first = false; out << "{\"nodeId\":\"" << node.record.nodeId << "\",\"address\":\"" << node.record.address << "\",\"httpPort\":" << node.record.httpPort << "}"; } out << "]}"; } out << "]}"; json(response, 200, out.str()); return;
+            ManifestSnapshot snapshot;
+            if (!state.buildManifestSnapshot(pathTail(path, "/api/v2/files/", "/manifest"), snapshot)) {
+                json(response, 404, jsonError("file not found or manifest is incomplete"));
+                return;
+            }
+            std::ostringstream out;
+            out << "{\"fileHash\":\"" << snapshot.file.fileHash
+                << "\",\"fileSize\":" << snapshot.file.fileSize
+                << ",\"chunkSize\":" << snapshot.file.chunkSize << ",\"chunks\":[";
+            for (size_t i = 0; i < snapshot.routes.size(); ++i) {
+                if (i) out << ',';
+                const ChunkRoute& route = snapshot.routes[i];
+                out << "{\"index\":" << i << ",\"hash\":\"" << route.chunkHash << "\",\"replicas\":[";
+                bool first = true;
+                for (const auto& nodeId : route.replicas) {
+                    const auto node = snapshot.nodes.find(nodeId);
+                    if (node == snapshot.nodes.end()) continue;
+                    if (!first) out << ',';
+                    first = false;
+                    out << "{\"nodeId\":\"" << node->second.nodeId
+                        << "\",\"address\":\"" << node->second.address
+                        << "\",\"httpPort\":" << node->second.httpPort << "}";
+                }
+                out << "]}";
+            }
+            out << "]}";
+            json(response, 200, out.str());
+            return;
         }
         if (request.method() == HttpRequest::kGet && path == "/api/v2/admin/nodes") {
             std::ostringstream out; out << "{\"nodes\":["; const auto nodes = state.nodes(); for (size_t i = 0; i < nodes.size(); ++i) { if (i) out << ','; out << "{\"nodeId\":\"" << jsonEscape(nodes[i].record.nodeId) << "\",\"address\":\"" << jsonEscape(nodes[i].record.address) << "\",\"httpPort\":" << nodes[i].record.httpPort << ",\"state\":" << static_cast<int>(nodes[i].runtime.state) << ",\"usedBytes\":" << nodes[i].runtime.usedBytes << ",\"freeBytes\":" << nodes[i].runtime.freeBytes << "}"; } out << "]}"; json(response, 200, out.str()); return;

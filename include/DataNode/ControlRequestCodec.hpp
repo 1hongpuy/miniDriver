@@ -15,5 +15,6 @@ struct EncodedControlRequest {
 EncodedControlRequest makeNodeRegistrationRequest(const NodeRegistration& request);
 EncodedControlRequest makeHeartbeatRequest(const NodeHeartbeat& request);
 EncodedControlRequest makeChunkCommitRequest(const ChunkCommit& request);
+EncodedControlRequest makeLeaseReleaseRequest(const LeaseRelease& request);
 
 }  // namespace miniKV::v2

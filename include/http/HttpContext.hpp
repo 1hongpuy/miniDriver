@@ -270,7 +270,10 @@ private:
             bodyPaused_ = true;
             return false;
         }
-        return false;             
+        // The current Buffer may already contain further body bytes from the
+        // same read(2). Keep parsing until it is empty, the stream pauses, or
+        // the declared Content-Length has been consumed.
+        return true;
     }
 
 private:
@@ -303,7 +306,6 @@ private:
 
 } 
 }
-
 
 
 

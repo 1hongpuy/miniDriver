@@ -32,6 +32,8 @@ public:
                        RpcCallback callback) override;
     void commitChunk(const ChunkCommit& request,
                      RpcCallback callback) override;
+    void releaseLease(const LeaseRelease& request,
+                      RpcCallback callback) override;
 
 private:
     std::shared_ptr<IControlRequestSender> sender_;

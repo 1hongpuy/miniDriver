@@ -62,6 +62,11 @@ struct ChunkRouteRequest { //客户端申请的清单
     uint64_t chunkSize = 0;
 };
 
+// Route planning failures have different client behavior. Invalid input must be
+// corrected; temporary capacity exhaustion should be retried after a delay.
+enum class RoutePlanStatus { kOk, kInvalidRequest, kNoCapacity };
+enum class CommitChunkStatus { kCommitted, kAlreadyCommitted, kInvalidRequest };
+
 struct CompletedChunk { //最后写入的清单,会话层
     uint32_t index;
     std::string chunkHash;
@@ -89,6 +94,16 @@ struct ChunkRoute { //每个chunk的真实副本管理，写入真实的数据
     int64_t  updateAt = 0;
 };
 
+struct WriteLease {
+    std::string leaseId;
+    std::string requestKey;
+    std::string sessionId;
+    uint32_t chunkIndex = 0;
+    std::string chunkHash;
+    uint64_t chunkSize = 0;
+    int64_t expiresAt = 0;
+    PlacementPlan plan;
+};
 
 struct FileMeta {
     std::string fileHash;
@@ -100,6 +115,12 @@ struct FileMeta {
     std::vector<std::string> chunkHashes;
     FileState state = FileState::kProtecting;
     int64_t createdAt = 0;
+};
+
+struct ManifestSnapshot {
+    FileMeta file;
+    std::vector<ChunkRoute> routes;
+    std::map<std::string, NodeRecord> nodes;
 };
 
 class GatewayState {
@@ -117,19 +138,29 @@ public:
     bool createSession(const std::string& fileName, const std::string& dirPath,
         uint64_t fileSize, uint32_t chunkSize, SessionState& out);
     bool getSession(const std::string& sessionId, SessionState& out) const;
-    bool planRoutes(const std::string& sessionId,
-                    const std::vector<ChunkRouteRequest>& requests,
-                    std::vector<PlacementPlan>& out);
-    bool commitChunk(const std::string& sessionId, uint32_t index,
-                     const std::string& chunkHash, uint64_t size,
-                     const std::vector<std::string>& successfulNodes);
+    RoutePlanStatus planRoutes(const std::string& sessionId,
+                               const std::vector<ChunkRouteRequest>& requests,
+                               std::vector<PlacementPlan>& out);
+    CommitChunkStatus commitChunk(const std::string& sessionId, uint32_t index,
+                                  const std::string& chunkHash, uint64_t size,
+                                  const std::vector<std::string>& successfulNodes,
+                                  const std::string& leaseId);
+    bool releaseLease(const std::string& leaseId);
     bool commitFile(const std::string& sessionId, FileMeta& out);
     bool getFile(const std::string& fileHash, FileMeta& out) const;
     bool getRoute(const std::string& chunkHash, ChunkRoute& out) const;
+    bool buildManifestSnapshot(const std::string& fileHash, ManifestSnapshot& out) const;
 
 
 private:
     PlacementPlan selectPlacementLocked(const SessionState& session, uint32_t index);
+    bool reserveLeaseLocked(const SessionState& session,
+                            const ChunkRouteRequest& request,
+                            PlacementPlan& plan,
+                            int64_t now);
+    void releaseLeaseLocked(const std::string& leaseId);
+    void releaseExpiredLeasesLocked(int64_t now);
+    void releaseLeasesForNodeLocked(const std::string& nodeId);
     bool persistSessionLocked(const SessionState& session);
     bool persistFileLocked(const FileMeta& file);
     bool persistRouteLocked(const ChunkRoute& route);
@@ -147,22 +178,16 @@ private:
     std::map<std::string, SessionState> sessions_;
     std::map<std::string, FileMeta>     files_;
     std::map<std::string, ChunkRoute>   routes_;
-    std::map<std::string, std::map<std::string, uint64_t>> sessionInflightBytes_;
-    /*外层 Key (sessionId): 哪个上传任务？
-    内层 Key (nodeId): 分配给了哪台机器？
-    Value (uint64_t): 计划往这台机器写多少字节，但还没写完的数据量。
-    同一个大文件的 Chunk 尽量分散到多个节点
-    */
+    std::map<std::string, WriteLease> leases_;
+    std::map<std::string, std::string> leaseByRequestKey_;
+    std::map<std::string, uint32_t> reservedWritesByNode_;
+    std::map<std::string, uint64_t> reservedBytesByNode_;
 };
 
 
 
 }
 }
-
-
-
-
 
 
 

@@ -169,6 +169,15 @@ bool FastDataStore::get(const std::string& chunkHash, std::string& out) const {
     return sha256Hex(out.data(), out.size()) == chunkHash;
 }
 
+bool FastDataStore::getRegion(const std::string& chunkHash, FileRegion& out) const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    PhysicalExtent extent;
+    if(!findExtentLocked(chunkHash, extent)) return false;
+    out.offset = static_cast<off_t>(extent.offset);
+    out.length = static_cast<size_t>(extent.length);
+    return true;
+}
+
 bool FastDataStore::exists(const std::string& chunkHash) const {
     std::lock_guard<std::mutex> lock(mutex_);
     PhysicalExtent extent;

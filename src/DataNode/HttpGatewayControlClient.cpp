@@ -83,5 +83,11 @@ void HttpGatewayControlClient::commitChunk(const ChunkCommit& request,
     sender_->send(makeChunkCommitRequest(request), internalToken_, std::move(callback));
 }
 
+void HttpGatewayControlClient::releaseLease(const LeaseRelease& request,
+                                            RpcCallback callback)
+{
+    sender_->send(makeLeaseReleaseRequest(request), internalToken_, std::move(callback));
+}
+
 }  // namespace miniKV::v2
 }  // namespace

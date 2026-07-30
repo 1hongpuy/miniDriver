@@ -51,7 +51,8 @@ void DeferredResponse::completeInLoop(HttpResponse response)
     connection->send(output.peek(), output.readableBytes());
     if(response.isSendFile())
     {
-        connection->startSendFile(response.bodyFilePath(), response.bodyFileSize());
+        connection->startSendFile(response.bodyFilePath(), response.bodyFileOffset(),
+                                  response.bodyFileSize());
     }
     if(response.closeConnection()) connection->shutdown();
 }

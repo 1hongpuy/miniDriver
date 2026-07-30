@@ -84,6 +84,7 @@ public:
     void connectEstablished();
     void connectDestroyed();
     void startSendFile(const std::string& filePath, size_t fileSize);
+    void startSendFile(const std::string& filePath, off_t offset, size_t fileSize);
 
 private:
 
@@ -93,6 +94,7 @@ private:
     void handleError();
     void sendInLoop(const std::string& buf);//？
     void startSendFileInLoop(const std::string& filePath, size_t fileSize);
+    void startSendFileInLoop(const std::string& filePath, off_t offset, size_t fileSize);
     void shutdownInLoop();
     void pauseReadInLoop();
     void resumeReadInLoop();
@@ -140,7 +142,6 @@ private:
 }
 
 }
-
 
 
 

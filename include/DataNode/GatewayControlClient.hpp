@@ -44,6 +44,10 @@ struct ChunkCommit {
     std::string uploadToken;
 };
 
+struct LeaseRelease {
+    std::string uploadToken;
+};
+
 class GatewayControlClient {
 public:
     virtual ~GatewayControlClient() = default;
@@ -54,6 +58,8 @@ public:
                                RpcCallback callback) = 0;
     virtual void commitChunk(const ChunkCommit& request,
                              RpcCallback callback) = 0;
+    virtual void releaseLease(const LeaseRelease& request,
+                              RpcCallback callback) = 0;
 };
 
 }  // namespace miniKV::v2

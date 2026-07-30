@@ -41,6 +41,13 @@ bool hasCapability(const NodeRecord& node, const std::string& wanted)
     return std::find(node.capabilities.begin(), node.capabilities.end(), wanted) != node.capabilities.end();
 }
 
+std::string routeRequestKey(const std::string& sessionId,
+                            const ChunkRouteRequest& request)
+{
+    return sessionId + '\n' + std::to_string(request.chunkIndex) + '\n' +
+           request.chunkHash + '\n' + std::to_string(request.chunkSize);
+}
+
 
 /*
 struct NodeRecord { //节点静态数据
@@ -295,35 +302,105 @@ PlacementPlan GatewayState::selectPlacementLocked(const SessionState& session, u
     for(const auto& [id, record] : nodeRecords_)
     {
         const NodeRuntime runtime = nodeRuntime_[id];
-        if(!hasCapability(record, "storage") || runtime.state != NodeLiveState::kOnline || 
-            runtime.activeUploads >= record.maxConcurrentWrites) continue;
-        if (runtime.freeBytes <= bytes + record.reservedBytes)   continue;
+        const uint32_t reservedWrites = reservedWritesByNode_[id];
+        const uint64_t reservedBytes = reservedBytesByNode_[id];
+        if(!hasCapability(record, "storage") || runtime.state != NodeLiveState::kOnline ||
+           reservedWrites >= record.maxConcurrentWrites) continue;
+        if (runtime.freeBytes <= reservedBytes + bytes + record.reservedBytes) continue;
         const double capacity = static_cast<double>(record.maxStorageBytes ? record.maxStorageBytes : runtime.usedBytes + runtime.freeBytes);
-        const double freeRatio = capacity > 0 ? static_cast<double>(runtime.freeBytes) / capacity : 0.0;
+        const double freeRatio = capacity > 0
+            ? static_cast<double>(runtime.freeBytes - reservedBytes) / capacity : 0.0;
         const double idle = (1.0 - runtime.cpuUsage) * .10 + (1.0 - runtime.memoryUsage) * .10 + (1.0 - runtime.diskIoUsage) * .15;
         const double network = 1.0 / (1.0 + runtime.netOutMbps / 100.0) * .15;
-        const double connections = 1.0 / (1.0 + runtime.activeUploads) * .10;
-        const double assignedChunks = static_cast<double>(sessionInflightBytes_[session.sessionId][id]) /
-                                      std::max<uint64_t>(1, session.chunkSize);
-        const double sessionBalancePenalty = assignedChunks * .20;
-        candidates.push_back({{record, runtime}, freeRatio * .35 + idle + network + connections - sessionBalancePenalty});
+        const double connections = 1.0 / (1.0 + runtime.activeUploads + reservedWrites) * .10;
+        candidates.push_back({{record, runtime}, freeRatio * .35 + idle + network + connections});
     }
     std::sort(candidates.begin(), candidates.end(), [](const Candidate& left, const Candidate& right){
         return left.score > right.score;
     });
     PlacementPlan plan;
     plan.chunkIndex = index;
-    plan.leaseId = randomId();
-    if(plan.leaseId.empty()) return {};
-    plan.routeVersion = std::hash<std::string>{}(plan.leaseId);
-    plan.expiresAt = unixSeconds() + 120;
     for(size_t i = 0; i < candidates.size() && i < 2; i++)
     {
         plan.chain.push_back(candidates[i].node);
-        sessionInflightBytes_[session.sessionId][candidates[i].node.record.nodeId] += bytes;
     }
     return plan;
 }   
+
+bool GatewayState::reserveLeaseLocked(const SessionState& session,
+                                      const ChunkRouteRequest& request,
+                                      PlacementPlan& plan,
+                                      int64_t now)
+{
+    if(plan.chain.empty()) return false;
+    plan.leaseId = randomId();
+    if(plan.leaseId.empty()) return false;
+    plan.routeVersion = std::hash<std::string>{}(plan.leaseId);
+    plan.expiresAt = now + 120;
+
+    WriteLease lease;
+    lease.leaseId = plan.leaseId;
+    lease.requestKey = routeRequestKey(session.sessionId, request);
+    lease.sessionId = session.sessionId;
+    lease.chunkIndex = request.chunkIndex;
+    lease.chunkHash = request.chunkHash;
+    lease.chunkSize = request.chunkSize;
+    lease.expiresAt = plan.expiresAt;
+    lease.plan = plan;
+
+    for(const auto& node : plan.chain) {
+        ++reservedWritesByNode_[node.record.nodeId];
+        reservedBytesByNode_[node.record.nodeId] += request.chunkSize;
+    }
+    leaseByRequestKey_[lease.requestKey] = lease.leaseId;
+    leases_[lease.leaseId] = std::move(lease);
+    return true;
+}
+
+void GatewayState::releaseLeaseLocked(const std::string& leaseId)
+{
+    const auto it = leases_.find(leaseId);
+    if(it == leases_.end()) return;
+
+    for(const auto& node : it->second.plan.chain) {
+        const std::string& nodeId = node.record.nodeId;
+        auto writes = reservedWritesByNode_.find(nodeId);
+        if(writes != reservedWritesByNode_.end()) {
+            if(writes->second <= 1) reservedWritesByNode_.erase(writes);
+            else --writes->second;
+        }
+        auto bytes = reservedBytesByNode_.find(nodeId);
+        if(bytes != reservedBytesByNode_.end()) {
+            if(bytes->second <= it->second.chunkSize) reservedBytesByNode_.erase(bytes);
+            else bytes->second -= it->second.chunkSize;
+        }
+    }
+    const auto request = leaseByRequestKey_.find(it->second.requestKey);
+    if(request != leaseByRequestKey_.end() && request->second == leaseId) {
+        leaseByRequestKey_.erase(request);
+    }
+    leases_.erase(it);
+}
+
+void GatewayState::releaseExpiredLeasesLocked(int64_t now)
+{
+    std::vector<std::string> expired;
+    for(const auto& [leaseId, lease] : leases_) {
+        if(lease.expiresAt <= now) expired.push_back(leaseId);
+    }
+    for(const auto& leaseId : expired) releaseLeaseLocked(leaseId);
+}
+
+void GatewayState::releaseLeasesForNodeLocked(const std::string& nodeId)
+{
+    std::vector<std::string> affected;
+    for(const auto& [leaseId, lease] : leases_) {
+        const bool containsNode = std::any_of(lease.plan.chain.begin(), lease.plan.chain.end(),
+            [&nodeId](const NodeSnapshot& node) { return node.record.nodeId == nodeId; });
+        if(containsNode) affected.push_back(leaseId);
+    }
+    for(const auto& leaseId : affected) releaseLeaseLocked(leaseId);
+}
 
 //
 GatewayState::GatewayState(std::string& dbPath) : dbPath_(std::move(dbPath)) { }
@@ -354,6 +431,7 @@ bool GatewayState::heartbeat(const std::string& nodeId, const NodeRuntime& runti
 {
     std::lock_guard<std::mutex> lock(mutex_);
     if(!nodeRecords_.count(nodeId)) return false;
+    releaseExpiredLeasesLocked(unixSeconds());
     NodeRuntime next = runtime;
     next.state = NodeLiveState::kOnline;
     next.lastHeartbeatAt = unixSeconds();
@@ -363,11 +441,13 @@ bool GatewayState::heartbeat(const std::string& nodeId, const NodeRuntime& runti
 void GatewayState::checkNodeTimeouts(int64_t now, int64_t suspectAfterSeconds, int64_t offlineAfterSeconds)
 {
     std::lock_guard<std::mutex> lock(mutex_);
+    releaseExpiredLeasesLocked(now);
     for(auto& [id, runtime] : nodeRuntime_)
     {
         if(runtime.lastHeartbeatAt == 0 || now - runtime.lastHeartbeatAt >= offlineAfterSeconds) 
         {
             runtime.state = NodeLiveState::kOffline;
+            releaseLeasesForNodeLocked(id);
         }
         else if(now - runtime.lastHeartbeatAt >= suspectAfterSeconds)
         {
@@ -414,48 +494,87 @@ bool GatewayState::getSession(const std::string& sessionId, SessionState& out) c
     out = it->second;
     return true;
 }
-bool GatewayState::planRoutes(const std::string& sessionId,
-                    const std::vector<ChunkRouteRequest>& requests,
-                    std::vector<PlacementPlan>& out)
+RoutePlanStatus GatewayState::planRoutes(const std::string& sessionId,
+                                         const std::vector<ChunkRouteRequest>& requests,
+                                         std::vector<PlacementPlan>& out)
 {
     std::lock_guard<std::mutex> lock(mutex_);
     const auto it = sessions_.find(sessionId);
-    if(it == sessions_.end()) return false;
+    if(it == sessions_.end() || requests.empty()) return RoutePlanStatus::kInvalidRequest;
     out.clear();
+    const int64_t now = unixSeconds();
+    releaseExpiredLeasesLocked(now);
+    std::vector<std::string> createdLeaseIds;
     for(const auto& request : requests)
     {
         const uint32_t index = request.chunkIndex;
-        if(index >= it->second.totalChunks) return false;
+        if(index >= it->second.totalChunks) {
+            for(const auto& leaseId : createdLeaseIds) releaseLeaseLocked(leaseId);
+            out.clear();
+            return RoutePlanStatus::kInvalidRequest;
+        }
         const uint64_t expected = index + 1 == it->second.totalChunks
             ? it->second.fileSize - static_cast<uint64_t>(index) * it->second.chunkSize
             : it->second.chunkSize;
-        if(request.chunkHash.empty() || request.chunkSize != expected || 
-        it->second.completed.count(index))
+        if(request.chunkHash.empty() || request.chunkSize != expected ||
+           it->second.completed.count(index))
         {
-            return false;
+            for(const auto& leaseId : createdLeaseIds) releaseLeaseLocked(leaseId);
+            out.clear();
+            return RoutePlanStatus::kInvalidRequest;
         }
+
+        const std::string requestKey = routeRequestKey(sessionId, request);
+        const auto existingId = leaseByRequestKey_.find(requestKey);
+        if(existingId != leaseByRequestKey_.end()) {
+            const auto existingLease = leases_.find(existingId->second);
+            if(existingLease != leases_.end()) {
+                out.push_back(existingLease->second.plan);
+                continue;
+            }
+            leaseByRequestKey_.erase(existingId);
+        }
+
         PlacementPlan plan = selectPlacementLocked(it->second, index);
-        if(plan.chain.empty()) return false;
+        if(plan.chain.empty() || !reserveLeaseLocked(it->second, request, plan, now)) {
+            for(const auto& leaseId : createdLeaseIds) releaseLeaseLocked(leaseId);
+            out.clear();
+            return RoutePlanStatus::kNoCapacity;
+        }
+        createdLeaseIds.push_back(plan.leaseId);
         out.push_back(std::move(plan));
     }
-    return true;
+    return RoutePlanStatus::kOk;
 }
-bool GatewayState::commitChunk(const std::string& sessionId, uint32_t index,
-                     const std::string& chunkHash, uint64_t size,
-                     const std::vector<std::string>& successfulNodes)
+CommitChunkStatus GatewayState::commitChunk(const std::string& sessionId, uint32_t index,
+                                            const std::string& chunkHash, uint64_t size,
+                                            const std::vector<std::string>& successfulNodes,
+                                            const std::string& leaseId)
 {
     //确认单个分片写入成功
-    if(chunkHash.empty() || successfulNodes.empty()) return false;
+    if(chunkHash.empty() || successfulNodes.empty()) return CommitChunkStatus::kInvalidRequest;
     std::lock_guard<std::mutex> lock(mutex_);
+    releaseExpiredLeasesLocked(unixSeconds());
     auto sessionIt = sessions_.find(sessionId);
-    if(sessionIt == sessions_.end() || index >= sessionIt->second.totalChunks) return false;
+    if(sessionIt == sessions_.end() || index >= sessionIt->second.totalChunks) return CommitChunkStatus::kInvalidRequest;
     const uint64_t expected = index + 1 == sessionIt->second.totalChunks ? sessionIt->second.fileSize - static_cast<uint64_t>(index) * sessionIt->second.chunkSize : sessionIt->second.chunkSize;
-    if(size != expected) return false;
-    //幂等性
+    if(size != expected) return CommitChunkStatus::kInvalidRequest;
+
     const auto completed = sessionIt->second.completed.find(index);
-    if(completed != sessionIt->second.completed.end() && completed->second.chunkHash == chunkHash)
-    {
-        return false;
+    if(completed != sessionIt->second.completed.end()) {
+        return completed->second.chunkHash == chunkHash && completed->second.size == size
+            ? CommitChunkStatus::kAlreadyCommitted
+            : CommitChunkStatus::kInvalidRequest;
+    }
+
+    const auto lease = leases_.find(leaseId);
+    if(lease == leases_.end() || lease->second.sessionId != sessionId ||
+       lease->second.chunkIndex != index || lease->second.chunkHash != chunkHash ||
+       lease->second.chunkSize != size) return CommitChunkStatus::kInvalidRequest;
+    for(const auto& nodeId : successfulNodes) {
+        const bool allowed = std::any_of(lease->second.plan.chain.begin(), lease->second.plan.chain.end(),
+            [&nodeId](const NodeSnapshot& node) { return node.record.nodeId == nodeId; });
+        if(!allowed) return CommitChunkStatus::kInvalidRequest;
     }
     sessionIt->second.completed[index] = {index, chunkHash, size};
     sessionIt->second.lastActivityAt = unixSeconds();
@@ -471,7 +590,18 @@ bool GatewayState::commitChunk(const std::string& sessionId, uint32_t index,
             route.replicas.push_back(node);
         }
     }
-    return persistRouteLocked(route) && persistSessionLocked(sessionIt->second);
+    const bool persisted = persistRouteLocked(route) && persistSessionLocked(sessionIt->second);
+    if(persisted) releaseLeaseLocked(leaseId);
+    return persisted ? CommitChunkStatus::kCommitted : CommitChunkStatus::kInvalidRequest;
+}
+
+bool GatewayState::releaseLease(const std::string& leaseId)
+{
+    if(leaseId.empty()) return false;
+    std::lock_guard<std::mutex> lock(mutex_);
+    if(leases_.find(leaseId) == leases_.end()) return false;
+    releaseLeaseLocked(leaseId);
+    return true;
 }
 bool GatewayState::commitFile(const std::string& sessionId, FileMeta& out)
 {
@@ -522,14 +652,34 @@ bool GatewayState::getRoute(const std::string& chunkHash, ChunkRoute& out) const
     return true;
 }
 
+bool GatewayState::buildManifestSnapshot(const std::string& fileHash,
+                                         ManifestSnapshot& out) const
+{
+    std::lock_guard<std::mutex> lock(mutex_);
+    const auto file = files_.find(fileHash);
+    if(file == files_.end()) return false;
+
+    ManifestSnapshot snapshot;
+    snapshot.file = file->second;
+    snapshot.routes.reserve(snapshot.file.chunkHashes.size());
+    for(const auto& chunkHash : snapshot.file.chunkHashes) {
+        const auto route = routes_.find(chunkHash);
+        if(route == routes_.end()) return false;
+        snapshot.routes.push_back(route->second);
+        for(const auto& nodeId : route->second.replicas) {
+            const auto node = nodeRecords_.find(nodeId);
+            if(node == nodeRecords_.end()) return false;
+            snapshot.nodes.emplace(nodeId, node->second);
+        }
+    }
+    out = std::move(snapshot);
+    return true;
+}
+
 
 
 }
 }
-
-
-
-
 
 
 

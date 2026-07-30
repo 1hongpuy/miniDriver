@@ -148,6 +148,7 @@ private:
                             if(resp->isSendFile())
                             {
                                 conn->startSendFile(resp->bodyFilePath(), 
+                                                    resp->bodyFileOffset(),
                                                     resp->bodyFileSize());
                             }
 
@@ -168,6 +169,11 @@ private:
                     network::Buffer outBuf;
                     resp.appendToBuffer(&outBuf);
                     conn->send(std::string(outBuf.peek(), outBuf.readableBytes()));
+                    if(resp.isSendFile())
+                    {
+                        conn->startSendFile(resp.bodyFilePath(), resp.bodyFileOffset(),
+                                            resp.bodyFileSize());
+                    }
                     if(resp.closeConnection())
                     {
                         conn->shutdown();
@@ -218,5 +224,4 @@ private:
 
 
 }
-
 

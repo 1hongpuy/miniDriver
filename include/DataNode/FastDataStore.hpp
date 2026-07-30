@@ -6,6 +6,7 @@
 #include <map>
 #include <mutex>
 #include <string>
+#include <sys/types.h>
 
 namespace leveldb {
 class DB;
@@ -14,6 +15,7 @@ class DB;
 namespace miniKV::datanode {
 
 struct PhysicalExtent { uint64_t offset = 0; uint64_t length = 0; };
+struct FileRegion { off_t offset = 0; size_t length = 0; };
 
 class FastDataStore {
 public:
@@ -50,6 +52,8 @@ public:
                                            uint64_t expectedSize);
     bool put(const std::string& expectedHash, const std::string& bytes, bool& alreadyExists);
     bool get(const std::string& chunkHash, std::string& out) const;
+    bool getRegion(const std::string& chunkHash, FileRegion& out) const;
+    std::string dataFilePath() const { return dataDirectory_ + "/disk0.data"; }
     bool exists(const std::string& chunkHash) const;
     uint64_t usedBytes() const;
 

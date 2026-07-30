@@ -2,7 +2,20 @@ cmake_minimum_required(VERSION 3.10)
 
 project(miniKV VERSION 0.1 LANGUAGES CXX)
 
-set(CMAKE_BUILD_TYPE "Debug")
+include(CTest)
+
+if (NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
+    set(CMAKE_BUILD_TYPE "RelWithDebInfo" CACHE STRING "Build type" FORCE)
+endif()
+set_property(CACHE CMAKE_BUILD_TYPE PROPERTY STRINGS
+    "Debug" "Release" "RelWithDebInfo" "MinSizeRel")
+
+option(MINIKV_ENABLE_FRAME_POINTERS
+    "Keep frame pointers for perf and flame graph profiling" ON)
+if (MINIKV_ENABLE_FRAME_POINTERS)
+    add_compile_options(-fno-omit-frame-pointer)
+endif()
+
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED True)
 
@@ -47,6 +60,16 @@ find_path(LEVELDB_INC leveldb/db.h REQUIRED)
 find_package(OpenSSL REQUIRED)
 find_package(yaml-cpp REQUIRED)
 
+add_library(minikv_benchmark STATIC
+    src/benchmark/BenchmarkCli.cpp
+    src/benchmark/BenchmarkHttpClient.cpp
+    src/benchmark/BenchmarkInput.cpp
+    src/benchmark/BenchmarkRunner.cpp
+    src/benchmark/BenchmarkTypes.cpp
+)
+target_include_directories(minikv_benchmark PUBLIC include)
+target_link_libraries(minikv_benchmark PUBLIC minikv_utils OpenSSL::Crypto pthread)
+
 
 add_executable(minikv_v2_gateway src/gateway/gateway_main.cpp)
 target_include_directories(minikv_v2_gateway PRIVATE ${LEVELDB_INC})
@@ -87,6 +110,13 @@ target_link_libraries(test_async_http_timeout PRIVATE
     pthread
 )
 
+add_executable(test_http_stream_context test/test_http_stream_context.cpp)
+target_link_libraries(test_http_stream_context PRIVATE
+    minikv_http
+    minikv_net
+    pthread
+)
+
 add_executable(test_fast_data_store_read test/test_fast_data_store_read.cpp)
 target_include_directories(test_fast_data_store_read PRIVATE ${LEVELDB_INC})
 target_link_libraries(test_fast_data_store_read PRIVATE
@@ -96,6 +126,80 @@ target_link_libraries(test_fast_data_store_read PRIVATE
     pthread
     OpenSSL::Crypto
 )
+
+add_executable(test_fast_data_store_region test/test_fast_data_store_region.cpp)
+target_include_directories(test_fast_data_store_region PRIVATE ${LEVELDB_INC})
+target_link_libraries(test_fast_data_store_region PRIVATE
+    minikv_datanode
+    minikv_utils
+    ${LEVELDB_LIB}
+    pthread
+    OpenSSL::Crypto
+)
+
+add_executable(test_tcp_sendfile_offset test/test_tcp_sendfile_offset.cpp)
+target_link_libraries(test_tcp_sendfile_offset PRIVATE
+    minikv_net
+    pthread
+)
+
+add_executable(test_gateway_write_lease test/test_gateway_write_lease.cpp)
+target_include_directories(test_gateway_write_lease PRIVATE ${LEVELDB_INC})
+target_link_libraries(test_gateway_write_lease PRIVATE
+    minikv_gateway
+    minikv_utils
+    ${LEVELDB_LIB}
+    pthread
+    OpenSSL::Crypto
+)
+
+add_executable(test_gateway_manifest_snapshot test/test_gateway_manifest_snapshot.cpp)
+target_include_directories(test_gateway_manifest_snapshot PRIVATE ${LEVELDB_INC})
+target_link_libraries(test_gateway_manifest_snapshot PRIVATE
+    minikv_gateway
+    minikv_utils
+    ${LEVELDB_LIB}
+    pthread
+    OpenSSL::Crypto
+)
+
+add_executable(test_write_admission test/test_write_admission.cpp)
+target_include_directories(test_write_admission PRIVATE include)
+target_link_libraries(test_write_admission PRIVATE pthread)
+
+add_executable(test_benchmark_types test/test_benchmark_types.cpp)
+target_include_directories(test_benchmark_types PRIVATE include)
+target_link_libraries(test_benchmark_types PRIVATE minikv_benchmark)
+
+add_executable(test_benchmark_input test/test_benchmark_input.cpp)
+target_include_directories(test_benchmark_input PRIVATE include)
+target_link_libraries(test_benchmark_input PRIVATE minikv_benchmark)
+
+add_executable(test_benchmark_http test/test_benchmark_http.cpp)
+target_include_directories(test_benchmark_http PRIVATE include)
+target_link_libraries(test_benchmark_http PRIVATE minikv_benchmark)
+
+add_executable(test_benchmark_cli test/test_benchmark_cli.cpp)
+target_include_directories(test_benchmark_cli PRIVATE include)
+target_link_libraries(test_benchmark_cli PRIVATE minikv_benchmark)
+
+add_executable(minikv_v2_bench src/benchmark/benchmark_main.cpp)
+target_link_libraries(minikv_v2_bench PRIVATE minikv_benchmark)
+
+if(BUILD_TESTING)
+    add_test(NAME async_http_timeout COMMAND test_async_http_timeout)
+    add_test(NAME http_stream_context COMMAND test_http_stream_context)
+    add_test(NAME fast_data_store_read COMMAND test_fast_data_store_read)
+    add_test(NAME fast_data_store_region COMMAND test_fast_data_store_region)
+    add_test(NAME tcp_sendfile_offset COMMAND test_tcp_sendfile_offset)
+    add_test(NAME gateway_write_lease COMMAND test_gateway_write_lease)
+    add_test(NAME gateway_manifest_snapshot COMMAND test_gateway_manifest_snapshot)
+    add_test(NAME write_admission COMMAND test_write_admission)
+    add_test(NAME benchmark_types COMMAND test_benchmark_types)
+    add_test(NAME benchmark_input COMMAND test_benchmark_input)
+    add_test(NAME benchmark_http COMMAND test_benchmark_http)
+    add_test(NAME benchmark_cli COMMAND test_benchmark_cli)
+endif()
 
 # 链接上面打包好的网络静态库
 # target_link_libraries(minikv PRIVATE minikv_net)
@@ -109,6 +213,3 @@ target_link_libraries(test_fast_data_store_read PRIVATE
 # target_link_libraries(minikv PRIVATE ${LEVELDB_LIB} pthread)
 # target_link_libraries(minikv PRIVATE OpenSSL::Crypto)
 # target_link_libraries(minikv PRIVATE yaml-cpp)
-
-
-

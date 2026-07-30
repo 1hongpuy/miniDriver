@@ -325,13 +325,23 @@ void TcpConnection::handleError(){
 
 void TcpConnection::startSendFile(const std::string &filePath, size_t fileSize)
 {
+    startSendFile(filePath, 0, fileSize);
+}
+
+void TcpConnection::startSendFile(const std::string& filePath, off_t offset, size_t fileSize)
+{
     TcpConnectionPtr self(shared_from_this());
-    loop_->runInLoop([self, filePath, fileSize](){
-        self->startSendFileInLoop(filePath, fileSize);
+    loop_->runInLoop([self, filePath, offset, fileSize](){
+        self->startSendFileInLoop(filePath, offset, fileSize);
     });
 }
 
 void TcpConnection::startSendFileInLoop(const std::string& filePath, size_t fileSize)
+{
+    startSendFileInLoop(filePath, 0, fileSize);
+}
+
+void TcpConnection::startSendFileInLoop(const std::string& filePath, off_t offset, size_t fileSize)
 {
     if(state_ != kConnected)
     {
@@ -346,7 +356,7 @@ void TcpConnection::startSendFileInLoop(const std::string& filePath, size_t file
 
     sendFileCtx_ = std::make_unique<SendFileCtx>();
     sendFileCtx_->fd = fd;
-    sendFileCtx_->offset = 0;
+    sendFileCtx_->offset = offset;
     sendFileCtx_->remaining = fileSize;
 
     // 先注册 EPOLLOUT，再触发第一次发送
@@ -356,7 +366,6 @@ void TcpConnection::startSendFileInLoop(const std::string& filePath, size_t file
 
 }
 }
-
 
 
 

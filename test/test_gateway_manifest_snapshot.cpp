@@ -7,6 +7,7 @@ namespace {
 
 using miniKV::gateway::ChunkRouteRequest;
 using miniKV::gateway::CommitChunkStatus;
+using miniKV::gateway::FileCommitStatus;
 using miniKV::gateway::GatewayState;
 using miniKV::gateway::ManifestSnapshot;
 using miniKV::gateway::NodeRecord;
@@ -77,7 +78,7 @@ int main() {
                                 plans[index].leaseId) == CommitChunkStatus::kCommitted);
     }
     miniKV::gateway::FileMeta file;
-    CHECK(state.commitFile(session.sessionId, file));
+    CHECK(state.commitFile(session.sessionId, file) == FileCommitStatus::kCommitted);
 
     ManifestSnapshot snapshot;
     CHECK(state.buildManifestSnapshot(file.fileHash, snapshot));

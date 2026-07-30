@@ -1,0 +1,112 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <title>MiniKVCine | 摄影素材工作台</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <header class="masthead">
+    <canvas id="contact-sheet" aria-hidden="true"></canvas>
+    <div class="masthead__inner">
+      <div class="brand-lockup">
+        <p class="eyebrow">OBJECT STORAGE / CONTACT SHEET 01</p>
+        <h1>MiniKVCine</h1>
+        <p class="brand-note">摄影素材传输工作台</p>
+      </div>
+      <div class="cluster-summary" aria-live="polite">
+        <span class="cluster-summary__label">集群状态</span>
+        <strong id="cluster-state">正在测光</strong>
+        <span id="cluster-detail">等待 Gateway 返回节点信息</span>
+      </div>
+    </div>
+  </header>
+
+  <main class="workbench">
+    <section class="transfer-panel" aria-labelledby="transfer-title">
+      <div class="section-heading">
+        <div>
+          <p class="eyebrow">INGEST / 01</p>
+          <h2 id="transfer-title">导入胶卷</h2>
+        </div>
+        <button id="refresh-nodes" class="icon-button" type="button" title="刷新节点状态" aria-label="刷新节点状态">↻</button>
+      </div>
+
+      <form id="upload-form" class="upload-form">
+        <div class="active-directory">
+          <span class="field-label">归档目录</span>
+          <strong id="active-directory-path">/</strong>
+          <button id="open-library" class="text-button" type="button">选择目录</button>
+        </div>
+
+        <label class="drop-zone" for="file-input">
+          <span class="drop-zone__symbol">+</span>
+          <span class="drop-zone__title">选择素材</span>
+          <span class="drop-zone__hint">RAW、JPEG、视频，按文件独立建立续传会话</span>
+          <input id="file-input" name="files" type="file" multiple>
+        </label>
+
+        <div class="form-actions">
+          <p id="selection-summary" class="selection-summary">尚未选择素材</p>
+          <button id="start-upload" class="command-button" type="submit" disabled>开始上传</button>
+        </div>
+      </form>
+
+      <div class="queue-heading">
+        <span>传输队列</span>
+        <span id="queue-count">0 项</span>
+      </div>
+      <ol id="transfer-queue" class="transfer-queue" aria-live="polite"></ol>
+    </section>
+
+    <section class="archive-panel" aria-labelledby="archive-title">
+      <div class="section-heading">
+        <div>
+          <p class="eyebrow">CATALOG / 02</p>
+          <h2 id="archive-title">素材目录</h2>
+        </div>
+        <button id="new-directory" class="icon-button" type="button" title="新建目录" aria-label="新建目录">+</button>
+      </div>
+      <div class="catalog-layout">
+        <nav id="directory-tree" class="directory-tree" aria-label="目录树"></nav>
+        <div class="catalog-content">
+          <div id="breadcrumbs" class="breadcrumbs" aria-label="当前路径"></div>
+          <div id="catalog-entries" class="catalog-entries" aria-live="polite"></div>
+          <section id="object-detail" class="object-detail" hidden></section>
+        </div>
+      </div>
+    </section>
+
+    <aside class="node-panel" aria-labelledby="nodes-title">
+      <div class="section-heading">
+        <div>
+          <p class="eyebrow">EXPOSURE / 03</p>
+          <h2 id="nodes-title">存储节点</h2>
+        </div>
+      </div>
+      <div id="node-list" class="node-list" aria-live="polite">
+        <p class="empty-state">正在读取节点状态。</p>
+      </div>
+      <p class="node-note">上传路由由 Gateway 按当前节点状态签发；页面不参与副本选择。</p>
+    </aside>
+  </main>
+
+  <template id="queue-item-template">
+    <li class="queue-item" data-state="queued">
+      <div class="queue-item__meta">
+        <strong class="queue-item__name"></strong>
+        <span class="queue-item__detail"></span>
+      </div>
+      <div class="progress-track" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0">
+        <span class="progress-track__bar"></span>
+      </div>
+      <span class="queue-item__state">等待中</span>
+    </li>
+  </template>
+
+  <script src="contact-sheet.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>

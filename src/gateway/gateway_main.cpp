@@ -57,6 +57,70 @@ std::string nodeTarget(const NodeRecord& node) {
     return node.nodeId + "@" + node.address + ":" + std::to_string(node.httpPort);
 }
 
+const char* fileStateName(FileState state) {
+    switch (state) {
+    case FileState::kAvailable: return "AVAILABLE";
+    case FileState::kDegraded: return "DEGRADED";
+    case FileState::kProtecting: return "PROTECTING";
+    }
+    return "PROTECTING";
+}
+
+std::string manifestJson(const ManifestSnapshot& snapshot) {
+    std::ostringstream out;
+    out << "{\"fileHash\":\"" << jsonEscape(snapshot.file.fileHash)
+        << "\",\"fileSize\":" << snapshot.file.fileSize
+        << ",\"chunkSize\":" << snapshot.file.chunkSize << ",\"chunks\":[";
+    for (size_t i = 0; i < snapshot.routes.size(); ++i) {
+        if (i) out << ',';
+        const ChunkRoute& route = snapshot.routes[i];
+        out << "{\"index\":" << i << ",\"hash\":\"" << jsonEscape(route.chunkHash)
+            << "\",\"replicas\":[";
+        bool first = true;
+        for (const auto& nodeId : route.replicas) {
+            const auto node = snapshot.nodes.find(nodeId);
+            if (node == snapshot.nodes.end()) continue;
+            if (!first) out << ',';
+            first = false;
+            out << "{\"nodeId\":\"" << jsonEscape(node->second.nodeId)
+                << "\",\"address\":\"" << jsonEscape(node->second.address)
+                << "\",\"httpPort\":" << node->second.httpPort << "}";
+        }
+        out << "]}";
+    }
+    out << "]}";
+    return out.str();
+}
+
+std::string catalogJson(const CatalogSnapshot& snapshot) {
+    std::ostringstream out;
+    out << "{\"path\":\"" << jsonEscape(snapshot.path) << "\",\"breadcrumbs\":[";
+    for (size_t i = 0; i < snapshot.breadcrumbs.size(); ++i) {
+        if (i) out << ',';
+        const Breadcrumb& breadcrumb = snapshot.breadcrumbs[i];
+        out << "{\"name\":\"" << jsonEscape(breadcrumb.name) << "\",\"path\":\""
+            << jsonEscape(breadcrumb.path) << "\"}";
+    }
+    out << "],\"directories\":[";
+    for (size_t i = 0; i < snapshot.directories.size(); ++i) {
+        if (i) out << ',';
+        const DirectoryMeta& directory = snapshot.directories[i];
+        out << "{\"path\":\"" << jsonEscape(directory.path) << "\",\"createdAt\":"
+            << directory.createdAt << "}";
+    }
+    out << "],\"files\":[";
+    for (size_t i = 0; i < snapshot.files.size(); ++i) {
+        if (i) out << ',';
+        const ObjectMeta& file = snapshot.files[i];
+        out << "{\"objectId\":\"" << jsonEscape(file.objectId) << "\",\"name\":\""
+            << jsonEscape(file.name) << "\",\"fileHash\":\"" << jsonEscape(file.fileHash)
+            << "\",\"fileSize\":" << file.fileSize << ",\"state\":\""
+            << fileStateName(file.state) << "\",\"createdAt\":" << file.createdAt << "}";
+    }
+    out << "]}";
+    return out.str();
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -90,6 +154,26 @@ int main(int argc, char** argv) {
             if (!constantTimeEquals(request.getHeader("X-Cluster-Internal-Token"), clusterSecret)) { json(response, 403, jsonError("invalid cluster token")); return; }
             const std::string nodeId = pathTail(path, "/api/v2/nodes/", "/heartbeat"); NodeRuntime runtime; runtime.usedBytes = jsonUint(body, "usedBytes"); runtime.freeBytes = jsonUint(body, "freeBytes"); runtime.cpuUsage = static_cast<double>(jsonUint(body, "cpuPermille")) / 1000.0; runtime.memoryUsage = static_cast<double>(jsonUint(body, "memoryPermille")) / 1000.0; runtime.diskIoUsage = static_cast<double>(jsonUint(body, "diskIoPermille")) / 1000.0; runtime.netOutMbps = static_cast<double>(jsonUint(body, "netOutMbps")); runtime.activeUploads = static_cast<uint32_t>(jsonUint(body, "activeUploads"));
             if (!state.heartbeat(nodeId, runtime)) json(response, 404, jsonError("unknown node")); else json(response, 200, "{\"status\":\"ok\"}");
+            return;
+        }
+        if (request.method() == HttpRequest::kGet && path == "/api/v2/catalog") {
+            CatalogSnapshot snapshot;
+            const std::string catalogPath = getQueryValue(request.query(), "path");
+            if (!state.listCatalog(catalogPath.empty() ? "/" : catalogPath, snapshot)) {
+                json(response, 404, jsonError("directory not found"));
+            } else {
+                json(response, 200, catalogJson(snapshot));
+            }
+            return;
+        }
+        if (request.method() == HttpRequest::kPost && path == "/api/v2/directories") {
+            DirectoryMeta directory;
+            if (!state.createDirectory(jsonString(body, "parentPath"), jsonString(body, "name"), &directory)) {
+                json(response, 400, jsonError("invalid parent directory, name, or duplicate path"));
+            } else {
+                json(response, 201, "{\"path\":\"" + jsonEscape(directory.path) + "\",\"createdAt\":" +
+                    std::to_string(directory.createdAt) + "}");
+            }
             return;
         }
         if (request.method() == HttpRequest::kPost && path == "/api/v2/upload/sessions") {
@@ -191,8 +275,44 @@ int main(int argc, char** argv) {
             return;
         }
         if (request.method() == HttpRequest::kPost && beginsWith(path, "/api/v2/upload/sessions/") && path.size() > 7 && path.rfind("/commit") == path.size() - 7) {
-            FileMeta file; if (!state.commitFile(pathTail(path, "/api/v2/upload/sessions/", "/commit"), file)) { json(response, 400, jsonError("all chunks with at least one replica are required")); return; }
-            json(response, 200, "{\"fileHash\":\"" + file.fileHash + "\",\"state\":\"" + (file.state == FileState::kAvailable ? "AVAILABLE" : "PROTECTING") + "\"}"); return;
+            FileMeta file;
+            const FileCommitStatus status = state.commitFile(pathTail(path, "/api/v2/upload/sessions/", "/commit"), file);
+            if (status == FileCommitStatus::kPathConflict) {
+                json(response, 409, jsonError("a file already exists at this path"));
+                return;
+            }
+            if (status != FileCommitStatus::kCommitted) {
+                json(response, 400, jsonError("all chunks with at least one replica are required"));
+                return;
+            }
+            json(response, 200, "{\"objectId\":\"" + jsonEscape(file.objectId) + "\",\"fileHash\":\"" +
+                jsonEscape(file.fileHash) + "\",\"state\":\"" + fileStateName(file.state) + "\"}");
+            return;
+        }
+        if (request.method() == HttpRequest::kGet && beginsWith(path, "/api/v2/objects/") &&
+            path.size() > std::string("/api/v2/objects/").size() + std::string("/manifest").size() &&
+            path.rfind("/manifest") == path.size() - std::string("/manifest").size()) {
+            const std::string objectId = pathTail(path, "/api/v2/objects/", "/manifest");
+            ObjectMeta object;
+            ManifestSnapshot snapshot;
+            if (!state.getObject(objectId, object) || !state.buildManifestSnapshot(object.fileHash, snapshot)) {
+                json(response, 404, jsonError("object not found or manifest is incomplete"));
+            } else {
+                json(response, 200, manifestJson(snapshot));
+            }
+            return;
+        }
+        if (request.method() == HttpRequest::kGet && beginsWith(path, "/api/v2/objects/")) {
+            ObjectMeta object;
+            if (!state.getObject(pathTail(path, "/api/v2/objects/"), object)) {
+                json(response, 404, jsonError("object not found"));
+            } else {
+                json(response, 200, "{\"objectId\":\"" + jsonEscape(object.objectId) + "\",\"parentPath\":\"" +
+                    jsonEscape(object.parentPath) + "\",\"name\":\"" + jsonEscape(object.name) +
+                    "\",\"fileHash\":\"" + jsonEscape(object.fileHash) + "\",\"fileSize\":" +
+                    std::to_string(object.fileSize) + ",\"state\":\"" + fileStateName(object.state) + "\"}");
+            }
+            return;
         }
         if (request.method() == HttpRequest::kGet && beginsWith(path, "/api/v2/files/") && path.size() > 9 && path.rfind("/manifest") == path.size() - 9) {
             ManifestSnapshot snapshot;
@@ -200,28 +320,7 @@ int main(int argc, char** argv) {
                 json(response, 404, jsonError("file not found or manifest is incomplete"));
                 return;
             }
-            std::ostringstream out;
-            out << "{\"fileHash\":\"" << snapshot.file.fileHash
-                << "\",\"fileSize\":" << snapshot.file.fileSize
-                << ",\"chunkSize\":" << snapshot.file.chunkSize << ",\"chunks\":[";
-            for (size_t i = 0; i < snapshot.routes.size(); ++i) {
-                if (i) out << ',';
-                const ChunkRoute& route = snapshot.routes[i];
-                out << "{\"index\":" << i << ",\"hash\":\"" << route.chunkHash << "\",\"replicas\":[";
-                bool first = true;
-                for (const auto& nodeId : route.replicas) {
-                    const auto node = snapshot.nodes.find(nodeId);
-                    if (node == snapshot.nodes.end()) continue;
-                    if (!first) out << ',';
-                    first = false;
-                    out << "{\"nodeId\":\"" << node->second.nodeId
-                        << "\",\"address\":\"" << node->second.address
-                        << "\",\"httpPort\":" << node->second.httpPort << "}";
-                }
-                out << "]}";
-            }
-            out << "]}";
-            json(response, 200, out.str());
+            json(response, 200, manifestJson(snapshot));
             return;
         }
         if (request.method() == HttpRequest::kGet && path == "/api/v2/admin/nodes") {

@@ -66,6 +66,7 @@ struct ChunkRouteRequest { //客户端申请的清单
 // corrected; temporary capacity exhaustion should be retried after a delay.
 enum class RoutePlanStatus { kOk, kInvalidRequest, kNoCapacity };
 enum class CommitChunkStatus { kCommitted, kAlreadyCommitted, kInvalidRequest };
+enum class FileCommitStatus { kCommitted, kPathConflict, kInvalidRequest };
 
 struct CompletedChunk { //最后写入的清单,会话层
     uint32_t index;
@@ -106,6 +107,10 @@ struct WriteLease {
 };
 
 struct FileMeta {
+    // This is populated when a session is committed.  It is deliberately not
+    // stored in f:{fileHash}: a file hash describes content, while objectId
+    // describes one logical entry in the user's directory tree.
+    std::string objectId;
     std::string fileHash;
     std::string ownerId = "admin";
     std::string fileName;
@@ -117,6 +122,36 @@ struct FileMeta {
     int64_t createdAt = 0;
 };
 
+struct DirectoryMeta {
+    std::string ownerId = "admin";
+    std::string path;
+    int64_t createdAt = 0;
+};
+
+struct ObjectMeta {
+    std::string objectId;
+    std::string ownerId = "admin";
+    std::string parentPath;
+    std::string name;
+    std::string fileHash;
+    uint64_t fileSize = 0;
+    std::string contentType;
+    FileState state = FileState::kProtecting;
+    int64_t createdAt = 0;
+};
+
+struct Breadcrumb {
+    std::string name;
+    std::string path;
+};
+
+struct CatalogSnapshot {
+    std::string path;
+    std::vector<Breadcrumb> breadcrumbs;
+    std::vector<DirectoryMeta> directories;
+    std::vector<ObjectMeta> files;
+};
+
 struct ManifestSnapshot {
     FileMeta file;
     std::vector<ChunkRoute> routes;
@@ -125,7 +160,7 @@ struct ManifestSnapshot {
 
 class GatewayState {
 public:
-    explicit GatewayState(std::string& dbPath);
+    explicit GatewayState(const std::string& dbPath);
     ~GatewayState();
     bool open();
 
@@ -146,10 +181,14 @@ public:
                                   const std::vector<std::string>& successfulNodes,
                                   const std::string& leaseId);
     bool releaseLease(const std::string& leaseId);
-    bool commitFile(const std::string& sessionId, FileMeta& out);
+    FileCommitStatus commitFile(const std::string& sessionId, FileMeta& out);
     bool getFile(const std::string& fileHash, FileMeta& out) const;
     bool getRoute(const std::string& chunkHash, ChunkRoute& out) const;
     bool buildManifestSnapshot(const std::string& fileHash, ManifestSnapshot& out) const;
+    bool createDirectory(const std::string& parentPath, const std::string& name,
+                         DirectoryMeta* out = nullptr);
+    bool listCatalog(const std::string& path, CatalogSnapshot& out) const;
+    bool getObject(const std::string& objectId, ObjectMeta& out) const;
 
 
 private:
@@ -164,10 +203,15 @@ private:
     bool persistSessionLocked(const SessionState& session);
     bool persistFileLocked(const FileMeta& file);
     bool persistRouteLocked(const ChunkRoute& route);
+    bool persistDirectoryLocked(const DirectoryMeta& directory);
+    bool persistObjectLocked(const ObjectMeta& object);
     bool loadSessionsLocked();
     bool loadFilesLocked();
     bool loadRoutesLocked();
     bool loadNodesLocked();
+    bool loadDirectoriesLocked();
+    bool loadObjectsLocked();
+    bool backfillLegacyCatalogLocked();
 
     std::string dbPath_;
     std::unique_ptr<leveldb::DB> db_;
@@ -178,6 +222,9 @@ private:
     std::map<std::string, SessionState> sessions_;
     std::map<std::string, FileMeta>     files_;
     std::map<std::string, ChunkRoute>   routes_;
+    std::map<std::string, DirectoryMeta> directories_;
+    std::map<std::string, ObjectMeta> objects_;
+    std::map<std::string, std::string> objectByPath_;
     std::map<std::string, WriteLease> leases_;
     std::map<std::string, std::string> leaseByRequestKey_;
     std::map<std::string, uint32_t> reservedWritesByNode_;
@@ -188,8 +235,6 @@ private:
 
 }
 }
-
-
 
 
 

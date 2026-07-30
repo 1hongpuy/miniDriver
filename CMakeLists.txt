@@ -163,6 +163,16 @@ target_link_libraries(test_gateway_manifest_snapshot PRIVATE
     OpenSSL::Crypto
 )
 
+add_executable(test_gateway_catalog test/test_gateway_catalog.cpp)
+target_include_directories(test_gateway_catalog PRIVATE ${LEVELDB_INC})
+target_link_libraries(test_gateway_catalog PRIVATE
+    minikv_gateway
+    minikv_utils
+    ${LEVELDB_LIB}
+    pthread
+    OpenSSL::Crypto
+)
+
 add_executable(test_write_admission test/test_write_admission.cpp)
 target_include_directories(test_write_admission PRIVATE include)
 target_link_libraries(test_write_admission PRIVATE pthread)
@@ -194,6 +204,7 @@ if(BUILD_TESTING)
     add_test(NAME tcp_sendfile_offset COMMAND test_tcp_sendfile_offset)
     add_test(NAME gateway_write_lease COMMAND test_gateway_write_lease)
     add_test(NAME gateway_manifest_snapshot COMMAND test_gateway_manifest_snapshot)
+    add_test(NAME gateway_catalog COMMAND test_gateway_catalog)
     add_test(NAME write_admission COMMAND test_write_admission)
     add_test(NAME benchmark_types COMMAND test_benchmark_types)
     add_test(NAME benchmark_input COMMAND test_benchmark_input)

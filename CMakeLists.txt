@@ -230,6 +230,8 @@ if(BUILD_TESTING)
     add_test(NAME datanode_delete
              COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/test/test_v2_datanode_delete.sh
                           ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/minikv_v2_datanode)
+    add_test(NAME v2_blob_download_fallback
+             COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/test/test_v2_blob_download_fallback.sh)
     add_test(NAME write_admission COMMAND test_write_admission)
     add_test(NAME benchmark_types COMMAND test_benchmark_types)
     add_test(NAME benchmark_input COMMAND test_benchmark_input)

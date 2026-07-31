@@ -3,6 +3,7 @@
 
   const API = "/api/v2";
   const SESSION_PREFIX = "minikv-v2:session:";
+  const MAX_PARALLEL_FILES = 2;
   const nodeStates = ["RECOVERING", "ONLINE", "SUSPECT", "OFFLINE", "DRAINING"];
   const $ = (selector) => document.querySelector(selector);
   const fileInput = $("#file-input");
@@ -19,8 +20,16 @@
   const breadcrumbs = $("#breadcrumbs");
   const catalogEntries = $("#catalog-entries");
   const objectDetail = $("#object-detail");
+  const deleteDirectoryButton = $("#delete-directory");
+  const preview = $("#object-preview");
+  const previewTitle = $("#preview-title");
+  const previewMeta = $("#preview-meta");
+  const previewStage = $("#preview-stage");
+  const previewStatus = $("#preview-status");
+  const previewDownload = $("#preview-download");
   const entries = new Map();
   const catalogState = { activeDirectory: "/", catalog: null, selectedObject: null };
+  const previewState = { object: null, url: null, scale: 1, image: null, requestId: 0 };
 
   function formatBytes(bytes) {
     if (!Number.isFinite(bytes)) return "未知容量";
@@ -175,7 +184,23 @@
     localStorage.removeItem(sessionKey(file, dir));
     setEntry(entry, "completed", result.state || "AVAILABLE", 100, `${formatBytes(file.size)} / ${result.fileHash.slice(0, 16)}...`);
     await loadCatalog(dir);
-    await selectObject(result.objectId);
+  }
+
+  async function uploadFiles(files) {
+    let nextIndex = 0;
+    async function worker() {
+      while (nextIndex < files.length) {
+        const file = files[nextIndex++];
+        try {
+          await uploadFile(file);
+        } catch (error) {
+          const entry = entries.get(file);
+          setEntry(entry, "failed", "失败", null, error.message);
+        }
+      }
+    }
+    const workerCount = Math.min(MAX_PARALLEL_FILES, files.length);
+    await Promise.all(Array.from({ length: workerCount }, worker));
   }
 
   async function fetchVerifiedChunk(chunk) {
@@ -186,6 +211,10 @@
     const blob = await response.blob();
     if (await sha256(blob) !== chunk.hash) throw new Error(`Chunk ${chunk.index} SHA-256 校验失败`);
     return blob;
+  }
+
+  function downloadName(item) {
+    return item.name || item.fileName || "minikv-download.bin";
   }
 
   function saveBlob(fileName, chunkBlobs) {
@@ -202,8 +231,9 @@
 
   async function downloadFile(item) {
     const manifest = await request(`/objects/${item.objectId}/manifest`, { method: "GET" });
+    const fileName = downloadName(item);
     if (window.isSecureContext && window.showSaveFilePicker) {
-      const handle = await window.showSaveFilePicker({ suggestedName: item.fileName });
+      const handle = await window.showSaveFilePicker({ suggestedName: fileName });
       const writable = await handle.createWritable();
       try {
         for (const chunk of manifest.chunks) await writable.write(await fetchVerifiedChunk(chunk));
@@ -217,7 +247,7 @@
 
     const chunkBlobs = [];
     for (const chunk of manifest.chunks) chunkBlobs.push(await fetchVerifiedChunk(chunk));
-    saveBlob(item.fileName, chunkBlobs);
+    saveBlob(fileName, chunkBlobs);
   }
 
   function emptyState(message) {
@@ -231,6 +261,12 @@
     if (path === "/") return "根目录";
     const parts = path.split("/").filter(Boolean);
     return parts[parts.length - 1] || path;
+  }
+
+  function parentPath(path) {
+    const parts = path.split("/").filter(Boolean);
+    parts.pop();
+    return parts.length ? `/${parts.join("/")}` : "/";
   }
 
   function renderDirectoryTree() {
@@ -282,32 +318,113 @@
       catalogEntries.append(row);
     }
     for (const file of catalog.files || []) {
-      const row = document.createElement("button");
-      row.type = "button"; row.className = "catalog-row";
+      const row = document.createElement("article");
+      row.className = "catalog-row";
       const name = document.createElement("strong"); name.textContent = file.name;
       const meta = document.createElement("span"); meta.textContent = `${formatBytes(file.fileSize)} · ${file.state}`;
-      row.append(name, meta);
-      row.addEventListener("click", () => selectObject(file.objectId));
+      const previewButton = document.createElement("button");
+      previewButton.type = "button"; previewButton.className = "catalog-row__command"; previewButton.textContent = "预览";
+      previewButton.addEventListener("click", () => selectObject(file.objectId));
+      const downloadButton = document.createElement("button");
+      downloadButton.type = "button"; downloadButton.className = "catalog-row__command"; downloadButton.textContent = "下载";
+      downloadButton.addEventListener("click", async () => {
+        downloadButton.disabled = true; downloadButton.textContent = "读取中";
+        try { await downloadFile(file); downloadButton.textContent = "已开始"; }
+        catch (error) { downloadButton.textContent = "失败"; window.alert(error.message); }
+        finally { window.setTimeout(() => { downloadButton.disabled = false; downloadButton.textContent = "下载"; }, 1000); }
+      });
+      const deleteButton = document.createElement("button");
+      deleteButton.type = "button"; deleteButton.className = "catalog-row__command catalog-row__command--danger";
+      deleteButton.textContent = "删除"; deleteButton.setAttribute("aria-label", `删除 ${file.name}`);
+      deleteButton.addEventListener("click", () => deleteObject(file, deleteButton));
+      const actions = document.createElement("div"); actions.className = "catalog-row__actions";
+      actions.append(previewButton, downloadButton, deleteButton);
+      row.append(name, meta, actions);
       catalogEntries.append(row);
     }
   }
 
-  async function selectObject(objectId) {
+  function previewableImage(name) {
+    return /\.(avif|gif|jpe?g|png|webp)$/i.test(name);
+  }
+
+  function previewMimeType(name) {
+    const extension = name.split(".").pop().toLowerCase();
+    const types = {
+      avif: "image/avif",
+      gif: "image/gif",
+      jpg: "image/jpeg",
+      jpeg: "image/jpeg",
+      png: "image/png",
+      webp: "image/webp",
+    };
+    return types[extension] || "application/octet-stream";
+  }
+
+  function releasePreviewUrl() {
+    if (previewState.url) URL.revokeObjectURL(previewState.url);
+    previewState.url = null; previewState.image = null;
+  }
+
+  function updatePreviewScale() {
+    if (previewState.image) previewState.image.style.transform = `scale(${previewState.scale})`;
+  }
+
+  function closePreview() {
+    previewState.requestId += 1;
+    preview.hidden = true;
+    releasePreviewUrl();
+    previewState.object = null;
+  }
+
+  async function openObjectPreview(objectId) {
+    const requestId = previewState.requestId + 1;
+    previewState.requestId = requestId;
     const object = await request(`/objects/${encodeURIComponent(objectId)}`, { method: "GET" });
+    if (requestId !== previewState.requestId) return;
     catalogState.selectedObject = object;
-    objectDetail.hidden = false;
-    objectDetail.replaceChildren();
-    const title = document.createElement("strong"); title.textContent = object.name;
-    const meta = document.createElement("p"); meta.textContent = `${formatBytes(object.fileSize)} · ${object.state}`;
-    const button = document.createElement("button");
-    button.type = "button"; button.className = "download-button"; button.textContent = "下载原始文件";
-    button.addEventListener("click", async () => {
-      button.disabled = true; button.textContent = "正在读取";
-      try { await downloadFile(object); button.textContent = "下载已开始"; }
-      catch (error) { button.textContent = error.message; }
-      finally { button.disabled = false; }
+    releasePreviewUrl();
+    previewState.object = object; previewState.scale = 1;
+    preview.hidden = false;
+    previewTitle.textContent = object.name;
+    previewMeta.textContent = `${formatBytes(object.fileSize)} · ${object.state}`;
+    previewStatus.textContent = previewableImage(object.name) ? "正在读取预览。" : "此格式不能在浏览器中直接预览，可下载原始文件。";
+    previewStage.replaceChildren(previewStatus);
+    previewDownload.disabled = false; previewDownload.textContent = "下载原始文件";
+    if (!previewableImage(object.name)) return;
+
+    const manifest = await request(`/objects/${object.objectId}/manifest`, { method: "GET" });
+    if (requestId !== previewState.requestId) return;
+    const blobs = [];
+    for (const chunk of manifest.chunks) {
+      blobs.push(await fetchVerifiedChunk(chunk));
+      if (requestId !== previewState.requestId) return;
+    }
+    const image = document.createElement("img");
+    image.className = "preview-stage__image";
+    image.alt = object.name;
+    const objectUrl = URL.createObjectURL(new Blob(blobs, { type: previewMimeType(object.name) }));
+    if (requestId !== previewState.requestId) {
+      URL.revokeObjectURL(objectUrl);
+      return;
+    }
+    previewState.url = objectUrl;
+    previewState.image = image;
+    image.src = previewState.url;
+    image.addEventListener("load", () => {
+      if (requestId !== previewState.requestId || previewState.image !== image) return;
+      previewStatus.remove(); updatePreviewScale();
     });
-    objectDetail.append(title, meta, button);
+    image.addEventListener("error", () => {
+      if (requestId !== previewState.requestId || previewState.image !== image) return;
+      previewStatus.textContent = "浏览器无法解码此图片，可下载原始文件。";
+      previewStage.append(previewStatus);
+    });
+    previewStage.append(image);
+  }
+
+  async function selectObject(objectId) {
+    await openObjectPreview(objectId);
   }
 
   async function loadCatalog(path = catalogState.activeDirectory) {
@@ -316,6 +433,8 @@
     catalogState.catalog = catalog;
     catalogState.selectedObject = null;
     activeDirectoryPath.textContent = catalog.path;
+    deleteDirectoryButton.hidden = catalog.path === "/";
+    deleteDirectoryButton.disabled = false;
     objectDetail.hidden = true;
     renderDirectoryTree(); renderBreadcrumbs(); renderCatalogEntries();
   }
@@ -325,6 +444,34 @@
     if (name === null) return;
     await request("/directories", { method: "POST", body: JSON.stringify({ parentPath: catalogState.activeDirectory, name }) });
     await loadCatalog(catalogState.activeDirectory);
+  }
+
+  async function deleteObject(file, button) {
+    if (!window.confirm(`删除“${file.name}”吗？此操作会立即从素材目录移除。`)) return;
+    button.disabled = true; button.textContent = "删除中";
+    try {
+      await request(`/objects/${encodeURIComponent(file.objectId)}`, { method: "DELETE" });
+      if (previewState.object?.objectId === file.objectId) closePreview();
+      await loadCatalog(catalogState.activeDirectory);
+    } catch (error) {
+      button.disabled = false; button.textContent = "删除";
+      window.alert(error.message);
+    }
+  }
+
+  async function deleteActiveDirectory() {
+    const path = catalogState.activeDirectory;
+    if (path === "/") return;
+    if (!window.confirm(`删除目录“${path}”及其全部内容吗？此操作不能从页面恢复。`)) return;
+    deleteDirectoryButton.disabled = true;
+    try {
+      await request(`/directories?path=${encodeURIComponent(path)}`, { method: "DELETE" });
+      closePreview();
+      await loadCatalog(parentPath(path));
+    } catch (error) {
+      deleteDirectoryButton.disabled = false;
+      window.alert(error.message);
+    }
   }
 
 
@@ -354,10 +501,24 @@
   $("#refresh-nodes").addEventListener("click", refreshNodes);
   $("#open-library").addEventListener("click", () => document.querySelector(".archive-panel").scrollIntoView({ behavior: "smooth", block: "start" }));
   $("#new-directory").addEventListener("click", () => createDirectory().catch((error) => window.alert(error.message)));
+  deleteDirectoryButton.addEventListener("click", () => deleteActiveDirectory());
+  $("#preview-close").addEventListener("click", closePreview);
+  preview.querySelector("[data-preview-close]").addEventListener("click", closePreview);
+  $("#preview-zoom-out").addEventListener("click", () => { previewState.scale = Math.max(.25, previewState.scale - .25); updatePreviewScale(); });
+  $("#preview-fit").addEventListener("click", () => { previewState.scale = 1; updatePreviewScale(); });
+  $("#preview-zoom-in").addEventListener("click", () => { previewState.scale = Math.min(4, previewState.scale + .25); updatePreviewScale(); });
+  previewDownload.addEventListener("click", async () => {
+    if (!previewState.object) return;
+    previewDownload.disabled = true; previewDownload.textContent = "正在读取";
+    try { await downloadFile(previewState.object); previewDownload.textContent = "下载已开始"; }
+    catch (error) { previewDownload.textContent = "下载失败"; window.alert(error.message); }
+    finally { previewDownload.disabled = false; }
+  });
+  document.addEventListener("keydown", (event) => { if (event.key === "Escape" && !preview.hidden) closePreview(); });
   uploadForm.addEventListener("submit", async (event) => {
     event.preventDefault(); const files = [...fileInput.files]; if (!files.length) return;
     startButton.disabled = true;
-    for (const file of files) { try { await uploadFile(file); } catch (error) { const entry = entries.get(file); setEntry(entry, "failed", "失败", null, error.message); } }
+    await uploadFiles(files);
     startButton.disabled = false; refreshNodes();
   });
   loadCatalog().catch((error) => { catalogEntries.replaceChildren(emptyState(`无法读取素材目录：${error.message}`)); });

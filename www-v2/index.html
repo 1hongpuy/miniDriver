@@ -67,7 +67,10 @@
           <p class="eyebrow">CATALOG / 02</p>
           <h2 id="archive-title">素材目录</h2>
         </div>
-        <button id="new-directory" class="icon-button" type="button" title="新建目录" aria-label="新建目录">+</button>
+        <div class="section-heading__actions">
+          <button id="delete-directory" class="icon-button icon-button--danger" type="button" title="删除当前目录" aria-label="删除当前目录" hidden>×</button>
+          <button id="new-directory" class="icon-button" type="button" title="新建目录" aria-label="新建目录">+</button>
+        </div>
       </div>
       <div class="catalog-layout">
         <nav id="directory-tree" class="directory-tree" aria-label="目录树"></nav>
@@ -92,6 +95,31 @@
       <p class="node-note">上传路由由 Gateway 按当前节点状态签发；页面不参与副本选择。</p>
     </aside>
   </main>
+
+  <section id="object-preview" class="object-preview" role="dialog" aria-modal="true" aria-labelledby="preview-title" hidden>
+    <div class="object-preview__backdrop" data-preview-close></div>
+    <div class="object-preview__surface">
+      <header class="object-preview__header">
+        <div>
+          <p class="eyebrow">MATERIAL INSPECTOR</p>
+          <h2 id="preview-title">素材预览</h2>
+          <p id="preview-meta" class="caption"></p>
+        </div>
+        <button id="preview-close" class="icon-button" type="button" title="关闭预览" aria-label="关闭预览">×</button>
+      </header>
+      <div id="preview-stage" class="preview-stage">
+        <p id="preview-status" class="empty-state">正在准备预览。</p>
+      </div>
+      <footer class="object-preview__footer">
+        <div class="preview-controls" aria-label="缩放控制">
+          <button id="preview-zoom-out" class="icon-button" type="button" title="缩小" aria-label="缩小">−</button>
+          <button id="preview-fit" class="text-button" type="button">适应窗口</button>
+          <button id="preview-zoom-in" class="icon-button" type="button" title="放大" aria-label="放大">+</button>
+        </div>
+        <button id="preview-download" class="command-button" type="button">下载原始文件</button>
+      </footer>
+    </div>
+  </section>
 
   <template id="queue-item-template">
     <li class="queue-item" data-state="queued">

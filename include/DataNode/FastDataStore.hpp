@@ -55,11 +55,16 @@ public:
     bool getRegion(const std::string& chunkHash, FileRegion& out) const;
     std::string dataFilePath() const { return dataDirectory_ + "/disk0.data"; }
     bool exists(const std::string& chunkHash) const;
+    bool remove(const std::string& chunkHash, bool& removed);
     uint64_t usedBytes() const;
+    uint64_t reusableBytes() const;
 
 private:
     bool findExtentLocked(const std::string& chunkHash, PhysicalExtent& extent) const;
     bool putExtentLocked(const std::string& chunkHash, const PhysicalExtent& extent);
+    bool loadFreeExtentsLocked();
+    bool allocateExtentLocked(uint64_t length, PhysicalExtent& extent);
+    bool addFreeExtentLocked(const PhysicalExtent& extent);
 
     std::string dataDirectory_;
     int dataFd_ = -1;
@@ -68,6 +73,7 @@ private:
     // of truth for files and replica routes.
     std::unique_ptr<leveldb::DB> indexDb_;
     mutable std::mutex mutex_;
+    std::map<uint64_t, uint64_t> freeExtents_;
 };
 
 }  // namespace miniKV::v2

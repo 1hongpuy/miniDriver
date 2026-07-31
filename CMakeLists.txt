@@ -137,6 +137,16 @@ target_link_libraries(test_fast_data_store_region PRIVATE
     OpenSSL::Crypto
 )
 
+add_executable(test_fast_data_store_delete test/test_fast_data_store_delete.cpp)
+target_include_directories(test_fast_data_store_delete PRIVATE ${LEVELDB_INC})
+target_link_libraries(test_fast_data_store_delete PRIVATE
+    minikv_datanode
+    minikv_utils
+    ${LEVELDB_LIB}
+    pthread
+    OpenSSL::Crypto
+)
+
 add_executable(test_tcp_sendfile_offset test/test_tcp_sendfile_offset.cpp)
 target_link_libraries(test_tcp_sendfile_offset PRIVATE
     minikv_net
@@ -201,6 +211,7 @@ if(BUILD_TESTING)
     add_test(NAME http_stream_context COMMAND test_http_stream_context)
     add_test(NAME fast_data_store_read COMMAND test_fast_data_store_read)
     add_test(NAME fast_data_store_region COMMAND test_fast_data_store_region)
+    add_test(NAME fast_data_store_delete COMMAND test_fast_data_store_delete)
     add_test(NAME tcp_sendfile_offset COMMAND test_tcp_sendfile_offset)
     add_test(NAME gateway_write_lease COMMAND test_gateway_write_lease)
     add_test(NAME gateway_manifest_snapshot COMMAND test_gateway_manifest_snapshot)

@@ -13,6 +13,7 @@
 #include <memory>
 #include <mutex>
 #include <ratio>
+#include <set>
 #include <sstream>
 #include <streambuf>
 #include <string>
@@ -139,6 +140,37 @@ bool parseObject(const std::string& value, ObjectMeta& object)
         object.state = static_cast<FileState>(std::stoi(fields[7]));
         object.createdAt = std::stoll(fields[8]);
         return true;
+    } catch (...) {
+        return false;
+    }
+}
+
+std::string deleteTaskValue(const DeleteTask& task)
+{
+    std::vector<std::string> nodes;
+    for (const auto& nodeId : task.pendingNodeIds) nodes.push_back(hexEncode(nodeId));
+    return hexEncode(task.chunkHash) + "|" + std::to_string(task.createdAt) + "|" +
+           std::to_string(task.updatedAt) + "|" + join(nodes, ',');
+}
+
+bool parseDeleteTask(const std::string& value, DeleteTask& task)
+{
+    const auto fields = split(value, '|');
+    if (fields.size() != 4) return false;
+    try {
+        if (!hexDecode(fields[0], task.chunkHash)) return false;
+        task.createdAt = std::stoll(fields[1]);
+        task.updatedAt = std::stoll(fields[2]);
+        for (const auto& node : split(fields[3], ',')) {
+            if (node.empty()) continue;
+            std::string nodeId;
+            if (!hexDecode(node, nodeId) || nodeId.empty()) return false;
+            task.pendingNodeIds.push_back(std::move(nodeId));
+        }
+        std::sort(task.pendingNodeIds.begin(), task.pendingNodeIds.end());
+        task.pendingNodeIds.erase(std::unique(task.pendingNodeIds.begin(), task.pendingNodeIds.end()),
+                                  task.pendingNodeIds.end());
+        return !task.chunkHash.empty() && !task.pendingNodeIds.empty();
     } catch (...) {
         return false;
     }
@@ -334,6 +366,18 @@ bool GatewayState::persistObjectLocked(const ObjectMeta& object)
     batch.Put("path:" + catalogPathKey(object.ownerId, childPath(object.parentPath, object.name)),
               object.objectId);
     return db_->Write(leveldb::WriteOptions(), &batch).ok();
+}
+
+bool GatewayState::loadDeleteTasksLocked()
+{
+    auto it = std::unique_ptr<leveldb::Iterator>(db_->NewIterator(leveldb::ReadOptions()));
+    for (it->Seek("del:"); it->Valid() && it->key().ToString().rfind("del:", 0) == 0; it->Next()) {
+        DeleteTask task;
+        if (!parseDeleteTask(it->value().ToString(), task)) return false;
+        if (it->key().ToString() != "del:" + task.chunkHash) return false;
+        deleteTasks_[task.chunkHash] = std::move(task);
+    }
+    return it->status().ok();
 }
 bool GatewayState::loadSessionsLocked()
 {
@@ -591,7 +635,8 @@ bool GatewayState::open()
     if(!leveldb::DB::Open(options, dbPath_, &raw).ok()) return false;
     db_.reset(raw);
     return loadNodesLocked() && loadSessionsLocked() && loadFilesLocked() && loadRoutesLocked() &&
-           loadDirectoriesLocked() && loadObjectsLocked() && backfillLegacyCatalogLocked();
+           loadDeleteTasksLocked() && loadDirectoriesLocked() && loadObjectsLocked() &&
+           backfillLegacyCatalogLocked();
 }
 
 //节点管理
@@ -958,13 +1003,172 @@ bool GatewayState::getObject(const std::string& objectId, ObjectMeta& out) const
     return true;
 }
 
+DeleteStatus GatewayState::deleteObject(const std::string& objectId)
+{
+    if (objectId.empty()) return DeleteStatus::kInvalidRequest;
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (objects_.count(objectId) == 0) return DeleteStatus::kNotFound;
+    return deleteCatalogEntriesLocked({objectId}, {});
+}
+
+DeleteStatus GatewayState::deleteDirectory(const std::string& path)
+{
+    std::string normalized;
+    if (!normalizeDirectoryPath(path, normalized) || normalized == "/") {
+        return DeleteStatus::kInvalidRequest;
+    }
+
+    std::lock_guard<std::mutex> lock(mutex_);
+    const std::string rootKey = catalogPathKey("admin", normalized);
+    if (directories_.count(rootKey) == 0) return DeleteStatus::kNotFound;
+
+    std::vector<std::string> objectIds;
+    std::vector<std::string> directoryKeys;
+    const std::string prefix = normalized + "/";
+    for (const auto& [objectId, object] : objects_) {
+        if (object.ownerId == "admin" &&
+            (object.parentPath == normalized || object.parentPath.rfind(prefix, 0) == 0)) {
+            objectIds.push_back(objectId);
+        }
+    }
+    for (const auto& [key, directory] : directories_) {
+        if (directory.ownerId == "admin" &&
+            (directory.path == normalized || directory.path.rfind(prefix, 0) == 0)) {
+            directoryKeys.push_back(key);
+        }
+    }
+    return deleteCatalogEntriesLocked(objectIds, directoryKeys);
+}
+
+std::vector<DeleteTaskSnapshot> GatewayState::pendingDeletesForNode(const std::string& nodeId) const
+{
+    std::lock_guard<std::mutex> lock(mutex_);
+    std::vector<DeleteTaskSnapshot> pending;
+    for (const auto& [chunkHash, task] : deleteTasks_) {
+        if (std::find(task.pendingNodeIds.begin(), task.pendingNodeIds.end(), nodeId) !=
+            task.pendingNodeIds.end()) {
+            pending.push_back({chunkHash, task.pendingNodeIds});
+        }
+    }
+    return pending;
+}
+
+bool GatewayState::acknowledgeDelete(const std::string& chunkHash, const std::string& nodeId)
+{
+    if (chunkHash.empty() || nodeId.empty()) return false;
+    std::lock_guard<std::mutex> lock(mutex_);
+    const auto taskIt = deleteTasks_.find(chunkHash);
+    if (taskIt == deleteTasks_.end()) return true;
+
+    DeleteTask next = taskIt->second;
+    const auto node = std::find(next.pendingNodeIds.begin(), next.pendingNodeIds.end(), nodeId);
+    if (node == next.pendingNodeIds.end()) return true;
+    next.pendingNodeIds.erase(node);
+    next.updatedAt = unixSeconds();
+
+    leveldb::WriteBatch batch;
+    if (next.pendingNodeIds.empty()) {
+        batch.Delete("del:" + chunkHash);
+        batch.Delete("c:" + chunkHash);
+    } else {
+        batch.Put("del:" + chunkHash, deleteTaskValue(next));
+    }
+    if (!db_->Write(leveldb::WriteOptions(), &batch).ok()) return false;
+    if (next.pendingNodeIds.empty()) {
+        deleteTasks_.erase(taskIt);
+        routes_.erase(chunkHash);
+    } else {
+        taskIt->second = std::move(next);
+    }
+    return true;
+}
+
+DeleteStatus GatewayState::deleteCatalogEntriesLocked(const std::vector<std::string>& objectIds,
+                                                      const std::vector<std::string>& directoryKeys)
+{
+    std::map<std::string, ObjectMeta> targets;
+    for (const auto& objectId : objectIds) {
+        const auto object = objects_.find(objectId);
+        if (object == objects_.end()) return DeleteStatus::kNotFound;
+        targets.emplace(objectId, object->second);
+    }
+
+    std::set<std::string> targetFileHashes;
+    for (const auto& [objectId, object] : targets) {
+        (void)objectId;
+        targetFileHashes.insert(object.fileHash);
+    }
+
+    std::set<std::string> survivingFileHashes;
+    for (const auto& [objectId, object] : objects_) {
+        if (targets.count(objectId) == 0) survivingFileHashes.insert(object.fileHash);
+    }
+
+    std::set<std::string> survivingChunks;
+    for (const auto& fileHash : survivingFileHashes) {
+        const auto file = files_.find(fileHash);
+        if (file == files_.end()) return DeleteStatus::kInvalidRequest;
+        survivingChunks.insert(file->second.chunkHashes.begin(), file->second.chunkHashes.end());
+    }
+
+    std::set<std::string> removableFiles;
+    std::set<std::string> removableChunks;
+    for (const auto& fileHash : targetFileHashes) {
+        if (survivingFileHashes.count(fileHash) != 0) continue;
+        const auto file = files_.find(fileHash);
+        if (file == files_.end()) return DeleteStatus::kInvalidRequest;
+        removableFiles.insert(fileHash);
+        for (const auto& chunkHash : file->second.chunkHashes) {
+            if (survivingChunks.count(chunkHash) == 0) removableChunks.insert(chunkHash);
+        }
+    }
+
+    std::map<std::string, DeleteTask> newTasks;
+    const int64_t now = unixSeconds();
+    for (const auto& chunkHash : removableChunks) {
+        if (deleteTasks_.count(chunkHash) != 0) continue;
+        const auto route = routes_.find(chunkHash);
+        if (route == routes_.end() || route->second.replicas.empty()) {
+            return DeleteStatus::kInvalidRequest;
+        }
+        DeleteTask task;
+        task.chunkHash = chunkHash;
+        task.pendingNodeIds = route->second.replicas;
+        std::sort(task.pendingNodeIds.begin(), task.pendingNodeIds.end());
+        task.pendingNodeIds.erase(std::unique(task.pendingNodeIds.begin(), task.pendingNodeIds.end()),
+                                  task.pendingNodeIds.end());
+        if (task.pendingNodeIds.empty()) return DeleteStatus::kInvalidRequest;
+        task.createdAt = now;
+        task.updatedAt = now;
+        newTasks.emplace(chunkHash, std::move(task));
+    }
+
+    leveldb::WriteBatch batch;
+    for (const auto& [objectId, object] : targets) {
+        batch.Delete("obj:" + objectId);
+        batch.Delete("path:" + catalogPathKey(object.ownerId, childPath(object.parentPath, object.name)));
+    }
+    for (const auto& directoryKey : directoryKeys) batch.Delete("dir:" + directoryKey);
+    for (const auto& fileHash : removableFiles) batch.Delete("f:" + fileHash);
+    for (const auto& [chunkHash, task] : newTasks) {
+        batch.Put("del:" + chunkHash, deleteTaskValue(task));
+    }
+    if (!db_->Write(leveldb::WriteOptions(), &batch).ok()) return DeleteStatus::kInvalidRequest;
+
+    for (const auto& [objectId, object] : targets) {
+        objects_.erase(objectId);
+        objectByPath_.erase(catalogPathKey(object.ownerId, childPath(object.parentPath, object.name)));
+    }
+    for (const auto& directoryKey : directoryKeys) directories_.erase(directoryKey);
+    for (const auto& fileHash : removableFiles) files_.erase(fileHash);
+    for (const auto& [chunkHash, task] : newTasks) deleteTasks_[chunkHash] = task;
+    return DeleteStatus::kDeleted;
+}
+
 
 
 }
 }
-
-
-
 
 
 

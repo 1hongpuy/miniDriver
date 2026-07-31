@@ -67,6 +67,7 @@ struct ChunkRouteRequest { //客户端申请的清单
 enum class RoutePlanStatus { kOk, kInvalidRequest, kNoCapacity };
 enum class CommitChunkStatus { kCommitted, kAlreadyCommitted, kInvalidRequest };
 enum class FileCommitStatus { kCommitted, kPathConflict, kInvalidRequest };
+enum class DeleteStatus { kDeleted, kNotFound, kInvalidRequest };
 
 struct CompletedChunk { //最后写入的清单,会话层
     uint32_t index;
@@ -158,6 +159,18 @@ struct ManifestSnapshot {
     std::map<std::string, NodeRecord> nodes;
 };
 
+struct DeleteTaskSnapshot {
+    std::string chunkHash;
+    std::vector<std::string> pendingNodeIds;
+};
+
+struct DeleteTask {
+    std::string chunkHash;
+    std::vector<std::string> pendingNodeIds;
+    int64_t createdAt = 0;
+    int64_t updatedAt = 0;
+};
+
 class GatewayState {
 public:
     explicit GatewayState(const std::string& dbPath);
@@ -189,6 +202,10 @@ public:
                          DirectoryMeta* out = nullptr);
     bool listCatalog(const std::string& path, CatalogSnapshot& out) const;
     bool getObject(const std::string& objectId, ObjectMeta& out) const;
+    DeleteStatus deleteObject(const std::string& objectId);
+    DeleteStatus deleteDirectory(const std::string& path);
+    std::vector<DeleteTaskSnapshot> pendingDeletesForNode(const std::string& nodeId) const;
+    bool acknowledgeDelete(const std::string& chunkHash, const std::string& nodeId);
 
 
 private:
@@ -205,6 +222,9 @@ private:
     bool persistRouteLocked(const ChunkRoute& route);
     bool persistDirectoryLocked(const DirectoryMeta& directory);
     bool persistObjectLocked(const ObjectMeta& object);
+    bool loadDeleteTasksLocked();
+    DeleteStatus deleteCatalogEntriesLocked(const std::vector<std::string>& objectIds,
+                                            const std::vector<std::string>& directoryKeys);
     bool loadSessionsLocked();
     bool loadFilesLocked();
     bool loadRoutesLocked();
@@ -225,6 +245,7 @@ private:
     std::map<std::string, DirectoryMeta> directories_;
     std::map<std::string, ObjectMeta> objects_;
     std::map<std::string, std::string> objectByPath_;
+    std::map<std::string, DeleteTask> deleteTasks_;
     std::map<std::string, WriteLease> leases_;
     std::map<std::string, std::string> leaseByRequestKey_;
     std::map<std::string, uint32_t> reservedWritesByNode_;
@@ -235,8 +256,6 @@ private:
 
 }
 }
-
-
 
 
 

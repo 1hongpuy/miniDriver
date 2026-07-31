@@ -183,6 +183,16 @@ target_link_libraries(test_gateway_catalog PRIVATE
     OpenSSL::Crypto
 )
 
+add_executable(test_gateway_delete test/test_gateway_delete.cpp)
+target_include_directories(test_gateway_delete PRIVATE ${LEVELDB_INC})
+target_link_libraries(test_gateway_delete PRIVATE
+    minikv_gateway
+    minikv_utils
+    ${LEVELDB_LIB}
+    pthread
+    OpenSSL::Crypto
+)
+
 add_executable(test_write_admission test/test_write_admission.cpp)
 target_include_directories(test_write_admission PRIVATE include)
 target_link_libraries(test_write_admission PRIVATE pthread)
@@ -216,6 +226,7 @@ if(BUILD_TESTING)
     add_test(NAME gateway_write_lease COMMAND test_gateway_write_lease)
     add_test(NAME gateway_manifest_snapshot COMMAND test_gateway_manifest_snapshot)
     add_test(NAME gateway_catalog COMMAND test_gateway_catalog)
+    add_test(NAME gateway_delete COMMAND test_gateway_delete)
     add_test(NAME write_admission COMMAND test_write_admission)
     add_test(NAME benchmark_types COMMAND test_benchmark_types)
     add_test(NAME benchmark_input COMMAND test_benchmark_input)

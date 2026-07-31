@@ -39,6 +39,16 @@
     return `${value >= 10 || unit === 0 ? value.toFixed(0) : value.toFixed(1)} ${units[unit]}`;
   }
 
+  function formatDuration(seconds) {
+    if (!Number.isFinite(seconds) || seconds < 1) return "不足 1 秒";
+    if (seconds < 60) return `${Math.round(seconds)} 秒`;
+    return `${Math.floor(seconds / 60)} 分 ${Math.round(seconds % 60)} 秒`;
+  }
+
+  function formatRate(bytesPerSecond) {
+    return Number.isFinite(bytesPerSecond) && bytesPerSecond > 0 ? `${formatBytes(bytesPerSecond)}/s` : "";
+  }
+
   function fingerprint(file, dir) { return `${file.name}:${file.size}:${file.lastModified}:${dir}`; }
   function sessionKey(file, dir) { return `${SESSION_PREFIX}${fingerprint(file, dir)}`; }
 
@@ -63,6 +73,7 @@
       state: element.querySelector(".queue-item__state"),
       track: element.querySelector(".progress-track"),
       bar: element.querySelector(".progress-track__bar"),
+      transfer: { startedAt: 0, lastSampleAt: 0, lastBytes: 0, smoothedBytesPerSecond: 0 },
     };
     entry.name.textContent = file.name;
     entry.detail.textContent = formatBytes(file.size);
@@ -80,6 +91,38 @@
       entry.bar.style.width = `${bounded}%`;
       entry.track.setAttribute("aria-valuenow", String(Math.round(bounded)));
     }
+  }
+
+  function observeTransfer(entry, uploadedBytes, totalBytes) {
+    const now = performance.now();
+    const metrics = entry.transfer;
+    if (!metrics.startedAt) {
+      metrics.startedAt = now;
+      metrics.lastSampleAt = now;
+      metrics.lastBytes = uploadedBytes;
+      return { rate: 0, eta: null };
+    }
+
+    const elapsedSeconds = (now - metrics.lastSampleAt) / 1000;
+    const byteDelta = Math.max(0, uploadedBytes - metrics.lastBytes);
+    if (elapsedSeconds > 0 && byteDelta > 0) {
+      const instantRate = byteDelta / elapsedSeconds;
+      metrics.smoothedBytesPerSecond = metrics.smoothedBytesPerSecond
+        ? metrics.smoothedBytesPerSecond * 0.75 + instantRate * 0.25
+        : instantRate;
+      metrics.lastSampleAt = now;
+      metrics.lastBytes = uploadedBytes;
+    }
+
+    const rate = metrics.smoothedBytesPerSecond;
+    return { rate, eta: rate > 0 ? Math.max(0, totalBytes - uploadedBytes) / rate : null };
+  }
+
+  function finishTransfer(entry, totalBytes) {
+    const metrics = entry.transfer;
+    if (!metrics.startedAt) return { elapsed: null, averageRate: 0 };
+    const elapsed = Math.max(0.001, (performance.now() - metrics.startedAt) / 1000);
+    return { elapsed, averageRate: totalBytes / elapsed };
   }
 
   function refreshSelection() {
@@ -136,7 +179,7 @@
       xhr.setRequestHeader("X-Replica-Chain", routeChain(route));
       xhr.setRequestHeader("X-Replica-Position", "0");
       xhr.setRequestHeader("X-Upload-Token", route.uploadToken);
-      xhr.upload.onprogress = (event) => { if (event.lengthComputable) onProgress(event.loaded / event.total); };
+      xhr.upload.onprogress = (event) => { if (event.lengthComputable) onProgress(event.loaded); };
       xhr.onerror = () => reject(new Error("DataNode 网络请求失败；请检查 CORS、Tailscale 地址和节点状态"));
       xhr.onload = () => {
         if (xhr.status >= 200 && xhr.status < 300) resolve();
@@ -168,7 +211,6 @@
     for (let index = 0; index < session.totalChunks; index += 1) {
       const start = index * session.chunkSize;
       const chunk = file.slice(start, Math.min(file.size, start + session.chunkSize));
-      const chunkWeight = chunk.size / file.size;
       if (session.completed.has(index)) { setEntry(entry, "uploading", `续传 ${index + 1}/${session.totalChunks}`, ((start + chunk.size) / file.size) * 100); continue; }
       setEntry(entry, "uploading", `测光 ${index + 1}/${session.totalChunks}`, (start / file.size) * 100);
       const hash = await sha256(chunk);
@@ -177,12 +219,27 @@
       const route = routes.routes && routes.routes[0];
       if (!route) throw new Error("Gateway 未返回 Chunk 路由");
       route.sessionId = session.sessionId;
-      await uploadChunk(route, chunk, index, (fraction) => setEntry(entry, "uploading", `写入 ${index + 1}/${session.totalChunks}`, ((start / file.size) + fraction * chunkWeight) * 100));
+      await uploadChunk(route, chunk, index, (loaded) => {
+        const uploadedBytes = start + loaded;
+        const transfer = observeTransfer(entry, uploadedBytes, file.size);
+        const detail = [`${formatBytes(file.size)} / ${dir}`];
+        const rate = formatRate(transfer.rate);
+        if (rate) detail.push(rate);
+        if (transfer.eta !== null) detail.push(`剩余约 ${formatDuration(transfer.eta)}`);
+        setEntry(entry, "uploading", `写入 ${index + 1}/${session.totalChunks}`,
+          (uploadedBytes / file.size) * 100, detail.join(" · "));
+      });
       setEntry(entry, "uploading", `已确认 ${index + 1}/${session.totalChunks}`, ((start + chunk.size) / file.size) * 100);
     }
     const result = await request(`/upload/sessions/${session.sessionId}/commit`, { method: "POST", body: "{}" });
     localStorage.removeItem(sessionKey(file, dir));
-    setEntry(entry, "completed", result.state || "AVAILABLE", 100, `${formatBytes(file.size)} / ${result.fileHash.slice(0, 16)}...`);
+    const completion = finishTransfer(entry, file.size);
+    const detail = [`${formatBytes(file.size)} / ${result.fileHash.slice(0, 16)}...`];
+    if (completion.elapsed !== null) {
+      detail.push(formatDuration(completion.elapsed));
+      detail.push(`平均 ${formatRate(completion.averageRate)}`);
+    }
+    setEntry(entry, "completed", result.state || "AVAILABLE", 100, detail.join(" · "));
     await loadCatalog(dir);
   }
 

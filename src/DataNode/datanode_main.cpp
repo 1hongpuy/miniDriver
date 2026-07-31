@@ -120,6 +120,20 @@ uint64_t availableBytes(const std::string& path)
         ? static_cast<uint64_t>(fs.f_bavail) * fs.f_frsize : 0;
 }
 
+uint64_t effectiveFreeBytes(const FastDataStore& store, const std::string& path)
+{
+    const uint64_t filesystemFree = availableBytes(path);
+    const uint64_t reusable = store.reusableBytes();
+    return UINT64_MAX - filesystemFree < reusable ? UINT64_MAX : filesystemFree + reusable;
+}
+
+uint64_t logicalUsedBytes(const FastDataStore& store)
+{
+    const uint64_t physicalHighWater = store.usedBytes();
+    const uint64_t reusable = store.reusableBytes();
+    return reusable >= physicalHighWater ? 0 : physicalHighWater - reusable;
+}
+
 class ChunkUploadStream : public std::enable_shared_from_this<ChunkUploadStream> {
 public:
     ChunkUploadStream(EventLoop* loop, FastDataStore& store, WriteAdmission& writeAdmission,
@@ -435,7 +449,7 @@ int main(int argc, char** argv)
             });
     };
     heartbeat = [&] {
-        gatewayControl.sendHeartbeat({nodeId, store.usedBytes(), availableBytes(dataDir),
+        gatewayControl.sendHeartbeat({nodeId, logicalUsedBytes(store), effectiveFreeBytes(store, dataDir),
                                       0, 0, 0, 0, writeAdmission.active()},
             [&](RpcResult result) {
                 if(!result.ok) {
@@ -468,6 +482,23 @@ int main(int argc, char** argv)
         const std::string& path = request.path();
         const std::string origin = request.getHeader("Origin");
         const bool chunkRequest = beginsWith(path, "/v2/chunks/");
+        const bool internalDelete = request.method() == HttpRequest::kDelete &&
+            beginsWith(path, "/internal/v2/chunks/");
+        if(internalDelete) {
+            if(!constantTimeEquals(request.getHeader("X-Cluster-Internal-Token"), clusterSecret)) {
+                json(response, 403, jsonError("invalid cluster token"));
+                return;
+            }
+            const std::string hash = path.substr(std::string("/internal/v2/chunks/").size());
+            bool removed = false;
+            if(hash.empty() || !store.remove(hash, removed)) {
+                json(response, 500, jsonError("cannot delete local chunk"));
+                return;
+            }
+            json(response, 200, std::string("{\"status\":\"deleted\",\"removed\":") +
+                (removed ? "true}" : "false}"));
+            return;
+        }
         if(chunkRequest && !corsPolicy.allows(origin)) {
             json(response, 403, jsonError("origin is not allowed"));
             return;

@@ -6,11 +6,13 @@
 #include "gateway/GatewayState.hpp"
 #include "utils/Util.hpp"
 #include "http/DeferredResponse.hpp"
+#include "http/AsyncHttpClient.hpp"
 
 #include <algorithm>
 #include <cstdlib>
 #include <filesystem>
 #include <iostream>
+#include <set>
 #include <sstream>
 
 using miniKV::http::HttpRequest;
@@ -139,6 +141,43 @@ int main(int argc, char** argv) {
     ThreadPool workers(4);
     EventLoop loop;
     miniKV::http::HttpServer server(&loop, &workers, port);
+    std::set<std::string> deleteRequestsInFlight;
+    std::function<void()> dispatchPendingDeletes;
+    dispatchPendingDeletes = [&] {
+        for(const NodeSnapshot& node : state.nodes()) {
+            if(node.runtime.state != NodeLiveState::kOnline) continue;
+            for(const DeleteTaskSnapshot& task : state.pendingDeletesForNode(node.record.nodeId)) {
+                const std::string requestKey = node.record.nodeId + "\n" + task.chunkHash;
+                if(!deleteRequestsInFlight.insert(requestKey).second) continue;
+
+                auto request = miniKV::http::AsyncHttpRequest::create(&loop);
+                miniKV::http::AsyncHttpRequestOptions options;
+                options.address = node.record.address;
+                options.port = node.record.httpPort;
+                options.method = "DELETE";
+                options.path = "/internal/v2/chunks/" + task.chunkHash;
+                options.timeoutMs = 10000;
+                options.headers = {{"X-Cluster-Internal-Token", clusterSecret}};
+                request->open(std::move(options), [request] {
+                    request->finishBody();
+                }, [&, requestKey, nodeId = node.record.nodeId, chunkHash = task.chunkHash]
+                    (miniKV::http::HttpClientResponse response, std::string error) {
+                    deleteRequestsInFlight.erase(requestKey);
+                    if(!error.empty() || response.status < 200 || response.status >= 300) {
+                        std::cerr << "delete dispatch " << chunkHash << " to " << nodeId
+                                  << " failed: "
+                                  << (error.empty() ? "HTTP " + std::to_string(response.status) : error)
+                                  << '\n';
+                        return;
+                    }
+                    if(!state.acknowledgeDelete(chunkHash, nodeId)) {
+                        std::cerr << "delete dispatch " << chunkHash << " to " << nodeId
+                                  << " could not persist ACK\n";
+                    }
+                });
+            }
+        }
+    };
     server.setHttpCallback([&](const HttpRequest& request, HttpResponse* response,
                                const miniKV::network::TcpConnectionPtr&,
                                const miniKV::http::DeferredResponse::Ptr&) {
@@ -153,7 +192,12 @@ int main(int argc, char** argv) {
         if (request.method() == HttpRequest::kPost && beginsWith(path, "/api/v2/nodes/") && path.find("/heartbeat") != std::string::npos) {
             if (!constantTimeEquals(request.getHeader("X-Cluster-Internal-Token"), clusterSecret)) { json(response, 403, jsonError("invalid cluster token")); return; }
             const std::string nodeId = pathTail(path, "/api/v2/nodes/", "/heartbeat"); NodeRuntime runtime; runtime.usedBytes = jsonUint(body, "usedBytes"); runtime.freeBytes = jsonUint(body, "freeBytes"); runtime.cpuUsage = static_cast<double>(jsonUint(body, "cpuPermille")) / 1000.0; runtime.memoryUsage = static_cast<double>(jsonUint(body, "memoryPermille")) / 1000.0; runtime.diskIoUsage = static_cast<double>(jsonUint(body, "diskIoPermille")) / 1000.0; runtime.netOutMbps = static_cast<double>(jsonUint(body, "netOutMbps")); runtime.activeUploads = static_cast<uint32_t>(jsonUint(body, "activeUploads"));
-            if (!state.heartbeat(nodeId, runtime)) json(response, 404, jsonError("unknown node")); else json(response, 200, "{\"status\":\"ok\"}");
+            if (!state.heartbeat(nodeId, runtime)) {
+                json(response, 404, jsonError("unknown node"));
+            } else {
+                dispatchPendingDeletes();
+                json(response, 200, "{\"status\":\"ok\"}");
+            }
             return;
         }
         if (request.method() == HttpRequest::kGet && path == "/api/v2/catalog") {
@@ -314,6 +358,30 @@ int main(int argc, char** argv) {
             }
             return;
         }
+        if (request.method() == HttpRequest::kDelete && beginsWith(path, "/api/v2/objects/")) {
+            const DeleteStatus status = state.deleteObject(pathTail(path, "/api/v2/objects/"));
+            if(status == DeleteStatus::kDeleted) {
+                dispatchPendingDeletes();
+                json(response, 200, "{\"status\":\"deleted\"}");
+            } else if(status == DeleteStatus::kNotFound) {
+                json(response, 404, jsonError("object not found"));
+            } else {
+                json(response, 400, jsonError("invalid object delete request"));
+            }
+            return;
+        }
+        if (request.method() == HttpRequest::kDelete && path == "/api/v2/directories") {
+            const DeleteStatus status = state.deleteDirectory(getQueryValue(request.query(), "path"));
+            if(status == DeleteStatus::kDeleted) {
+                dispatchPendingDeletes();
+                json(response, 200, "{\"status\":\"deleted\"}");
+            } else if(status == DeleteStatus::kNotFound) {
+                json(response, 404, jsonError("directory not found"));
+            } else {
+                json(response, 400, jsonError("invalid directory delete request"));
+            }
+            return;
+        }
         if (request.method() == HttpRequest::kGet && beginsWith(path, "/api/v2/files/") && path.size() > 9 && path.rfind("/manifest") == path.size() - 9) {
             ManifestSnapshot snapshot;
             if (!state.buildManifestSnapshot(pathTail(path, "/api/v2/files/", "/manifest"), snapshot)) {
@@ -328,7 +396,11 @@ int main(int argc, char** argv) {
         }
         json(response, 404, jsonError("route not found"));
     });
-    loop.runEvery(5000, [&] { state.checkNodeTimeouts(unixSeconds()); });
+    loop.runEvery(5000, [&] {
+        state.checkNodeTimeouts(unixSeconds());
+        dispatchPendingDeletes();
+    });
+    loop.runAfter(0, dispatchPendingDeletes);
     server.start();
     std::cout << "V2 Gateway listening on :" << port << "\n";
     loop.loop();

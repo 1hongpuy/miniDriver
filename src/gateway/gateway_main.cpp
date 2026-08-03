@@ -123,6 +123,34 @@ std::string catalogJson(const CatalogSnapshot& snapshot) {
     return out.str();
 }
 
+std::string objectJson(const ObjectMeta& object) {
+    return "{\"objectId\":\"" + jsonEscape(object.objectId) + "\",\"parentPath\":\"" +
+           jsonEscape(object.parentPath) + "\",\"name\":\"" + jsonEscape(object.name) +
+           "\",\"fileHash\":\"" + jsonEscape(object.fileHash) + "\",\"fileSize\":" +
+           std::to_string(object.fileSize) + ",\"state\":\"" + fileStateName(object.state) + "\"}";
+}
+
+std::string uploadPreflightJson(const UploadPreflightResult& result) {
+    std::ostringstream out;
+    out << "{\"status\":\"UPLOAD_REQUIRED\",\"sessionId\":\"" << jsonEscape(result.session.sessionId)
+        << "\",\"manifestHash\":\"" << jsonEscape(result.session.manifestHash)
+        << "\",\"chunkSize\":" << result.session.chunkSize
+        << ",\"totalChunks\":" << result.session.totalChunks << ",\"completed\":[";
+    bool first = true;
+    for (const auto& [index, chunk] : result.session.completed) {
+        if (!first) out << ',';
+        first = false;
+        out << index;
+    }
+    out << "],\"missingIndices\":[";
+    for (size_t i = 0; i < result.missingChunks.size(); ++i) {
+        if (i) out << ',';
+        out << result.missingChunks[i].chunkIndex;
+    }
+    out << "]}";
+    return out.str();
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -220,6 +248,29 @@ int main(int argc, char** argv) {
             }
             return;
         }
+        if (request.method() == HttpRequest::kPost && path == "/api/v2/upload/preflight") {
+            UploadPreflightRequest preflight;
+            preflight.fileName = jsonString(body, "fileName");
+            preflight.dirPath = jsonString(body, "dirPath");
+            preflight.fileSize = jsonUint(body, "fileSize");
+            preflight.chunkSize = static_cast<uint32_t>(jsonUint(body, "chunkSize"));
+            preflight.manifestHash = jsonString(body, "manifestHash");
+            preflight.chunks = parseRouteRequests(body);
+
+            UploadPreflightResult result;
+            const PreflightStatus status = state.preflightUpload(preflight, result);
+            if (status == PreflightStatus::kPathConflict) {
+                json(response, 409, jsonError("a file already exists at this path"));
+            } else if (status == PreflightStatus::kContentExists) {
+                json(response, 200, "{\"status\":\"CONTENT_EXISTS\",\"object\":" +
+                    objectJson(result.object) + "}");
+            } else if (status == PreflightStatus::kUploadRequired) {
+                json(response, 200, uploadPreflightJson(result));
+            } else {
+                json(response, 400, jsonError("invalid upload manifest"));
+            }
+            return;
+        }
         if (request.method() == HttpRequest::kPost && path == "/api/v2/upload/sessions") {
             SessionState session;
             if (!state.createSession(jsonString(body, "fileName"), jsonString(body, "dirPath"), jsonUint(body, "fileSize"), static_cast<uint32_t>(jsonUint(body, "chunkSize")), session)) { json(response, 400, jsonError("fileName and positive fileSize are required")); return; }
@@ -228,7 +279,7 @@ int main(int argc, char** argv) {
         if (request.method() == HttpRequest::kGet && beginsWith(path, "/api/v2/upload/sessions/")) {
             SessionState session; const std::string id = pathTail(path, "/api/v2/upload/sessions/");
             if (!state.getSession(id, session)) { json(response, 404, jsonError("session not found")); return; }
-            std::ostringstream out; out << "{\"sessionId\":\"" << session.sessionId << "\",\"fileSize\":" << session.fileSize << ",\"chunkSize\":" << session.chunkSize << ",\"totalChunks\":" << session.totalChunks << ",\"completed\":["; bool first = true; for (const auto& [index, chunk] : session.completed) { if (!first) out << ','; first = false; out << index; } out << "]}"; json(response, 200, out.str()); return;
+            std::ostringstream out; out << "{\"sessionId\":\"" << session.sessionId << "\",\"fileSize\":" << session.fileSize << ",\"chunkSize\":" << session.chunkSize << ",\"totalChunks\":" << session.totalChunks << ",\"manifestHash\":\"" << jsonEscape(session.manifestHash) << "\",\"completed\":["; bool first = true; for (const auto& [index, chunk] : session.completed) { if (!first) out << ','; first = false; out << index; } out << "]}"; json(response, 200, out.str()); return;
         }
         if (request.method() == HttpRequest::kPost && beginsWith(path, "/api/v2/upload/sessions/") && path.size() > 7 && path.rfind("/routes") == path.size() - 7) {
             const std::string id = pathTail(path, "/api/v2/upload/sessions/", "/routes");

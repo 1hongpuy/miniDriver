@@ -3,6 +3,7 @@
 
   const API = "/api/v2";
   const SESSION_PREFIX = "minikv-v2:session:";
+  const UPLOAD_CHUNK_SIZE = 4 * 1024 * 1024;
   const MAX_PARALLEL_FILES = 2;
   const nodeStates = ["RECOVERING", "ONLINE", "SUSPECT", "OFFLINE", "DRAINING"];
   const $ = (selector) => document.querySelector(selector);
@@ -144,7 +145,8 @@
   }
 
   // HTTP over a Tailnet IP is not a secure browser context, so retain a compact fallback.
-  // DataNode independently hashes every chunk; this only creates the route request hash.
+  // DataNode independently hashes every uploaded chunk; this also identifies
+  // the manifest sent to the Gateway before any data-plane transfer starts.
   function sha256Fallback(bytes) {
     const rightRotate = (value, amount) => (value >>> amount) | (value << (32 - amount));
     const constants = [1116352408,1899447441,3049323471,3921009573,961987163,1508970993,2453635748,2870763221,3624381080,310598401,607225278,1426881987,1925078388,2162078206,2614888103,3248222580,3835390401,4022224774,264347078,604807628,770255983,1249150122,1555081692,1996064986,2554220882,2821834349,2952996808,3210313671,3336571891,3584528711,113926993,338241895,666307205,773529912,1294757372,1396182291,1695183700,1986661051,2177026350,2456956037,2730485921,2820302411,3259730800,3345764771,3516065817,3600352804,4094571909,275423344,430227734,506948616,659060556,883997877,958139571,1322822218,1537002063,1747873779,1955562222,2024104815,2227730452,2361852424,2428436474,2756734187,3204031479,3329325298];
@@ -189,55 +191,112 @@
     });
   }
 
-  async function resumeOrCreate(file, dir) {
+  function manifestCanonicalText(fileSize, chunkSize, chunks) {
+    let value = `minikv-manifest-v1\n${fileSize}\n${chunkSize}\n`;
+    for (const chunk of chunks) value += `${chunk.index}:${chunk.hash}:${chunk.size}\n`;
+    return value;
+  }
+
+  async function buildUploadManifest(file, entry, dir) {
+    const chunkSize = UPLOAD_CHUNK_SIZE;
+    const totalChunks = Math.ceil(file.size / chunkSize);
+    const chunks = [];
+    for (let index = 0; index < totalChunks; index += 1) {
+      const start = index * chunkSize;
+      const chunk = file.slice(start, Math.min(file.size, start + chunkSize));
+      setEntry(entry, "uploading", `校验 ${index + 1}/${totalChunks}`,
+        (start / file.size) * 100, `${formatBytes(file.size)} / ${dir}`);
+      chunks.push({ index, hash: await sha256(chunk), size: chunk.size });
+    }
+    const manifestHash = await sha256(new Blob([
+      manifestCanonicalText(file.size, chunkSize, chunks),
+    ], { type: "text/plain" }));
+    return { fileName: file.name, dirPath: dir, fileSize: file.size, chunkSize, manifestHash, chunks };
+  }
+
+  async function resumeOrPreflight(file, dir, manifest) {
     const key = sessionKey(file, dir);
     const existing = localStorage.getItem(key);
     if (existing) {
       try {
         const saved = JSON.parse(existing);
         const session = await request(`/upload/sessions/${saved.sessionId}`, { method: "GET" });
-        return { ...session, sessionId: saved.sessionId, completed: new Set(session.completed || []) };
+        if (saved.manifestHash === manifest.manifestHash &&
+            session.manifestHash === manifest.manifestHash) {
+          return { ...session, sessionId: saved.sessionId, completed: new Set(session.completed || []) };
+        }
+        localStorage.removeItem(key);
       } catch (_) { localStorage.removeItem(key); }
     }
-    const session = await request("/upload/sessions", { method: "POST", body: JSON.stringify({ fileName: file.name, dirPath: dir, fileSize: file.size }) });
-    localStorage.setItem(key, JSON.stringify({ sessionId: session.sessionId }));
-    return { ...session, completed: new Set() };
+    const preflight = await request("/upload/preflight", {
+      method: "POST", body: JSON.stringify(manifest),
+    });
+    if (preflight.status === "CONTENT_EXISTS") return { contentExists: true, object: preflight.object };
+    if (preflight.status !== "UPLOAD_REQUIRED" || !preflight.sessionId) {
+      throw new Error("Gateway 返回了无效的上传预检结果");
+    }
+    localStorage.setItem(key, JSON.stringify({
+      sessionId: preflight.sessionId,
+      manifestHash: manifest.manifestHash,
+    }));
+    return { ...preflight, completed: new Set(preflight.completed || []) };
   }
 
   async function uploadFile(file) {
     const entry = entries.get(file); const dir = catalogState.activeDirectory;
-    setEntry(entry, "uploading", "建立会话", 0, `${formatBytes(file.size)} / ${dir}`);
-    const session = await resumeOrCreate(file, dir);
-    for (let index = 0; index < session.totalChunks; index += 1) {
-      const start = index * session.chunkSize;
-      const chunk = file.slice(start, Math.min(file.size, start + session.chunkSize));
-      if (session.completed.has(index)) { setEntry(entry, "uploading", `续传 ${index + 1}/${session.totalChunks}`, ((start + chunk.size) / file.size) * 100); continue; }
-      setEntry(entry, "uploading", `测光 ${index + 1}/${session.totalChunks}`, (start / file.size) * 100);
-      const hash = await sha256(chunk);
-      const routeBody = { chunks: [{ index, hash, size: chunk.size }] };
+    setEntry(entry, "uploading", "建立内容清单", 0, `${formatBytes(file.size)} / ${dir}`);
+    const manifest = await buildUploadManifest(file, entry, dir);
+    const session = await resumeOrPreflight(file, dir, manifest);
+    if (session.contentExists) {
+      setEntry(entry, "completed", "已复用", 100,
+        `${formatBytes(file.size)} / 内容已存在，未传输数据`);
+      await loadCatalog(dir);
+      return;
+    }
+
+    let confirmedBytes = 0;
+    let sentBytes = 0;
+    for (const descriptor of manifest.chunks) {
+      const index = descriptor.index;
+      const chunk = file.slice(index * session.chunkSize,
+        Math.min(file.size, (index + 1) * session.chunkSize));
+      if (session.completed.has(index)) {
+        confirmedBytes += chunk.size;
+        setEntry(entry, "uploading", `复用 ${index + 1}/${session.totalChunks}`,
+          (confirmedBytes / file.size) * 100);
+        continue;
+      }
+      setEntry(entry, "uploading", `分配 ${index + 1}/${session.totalChunks}`,
+        (confirmedBytes / file.size) * 100);
+      const routeBody = { chunks: [{ index, hash: descriptor.hash, size: descriptor.size }] };
       const routes = await request(`/upload/sessions/${session.sessionId}/routes`, { method: "POST", body: JSON.stringify(routeBody) });
       const route = routes.routes && routes.routes[0];
       if (!route) throw new Error("Gateway 未返回 Chunk 路由");
       route.sessionId = session.sessionId;
+      const sentBefore = sentBytes;
+      const confirmedBefore = confirmedBytes;
       await uploadChunk(route, chunk, index, (loaded) => {
-        const uploadedBytes = start + loaded;
-        const transfer = observeTransfer(entry, uploadedBytes, file.size);
+        const transfer = observeTransfer(entry, sentBefore + loaded, sentBefore + chunk.size);
         const detail = [`${formatBytes(file.size)} / ${dir}`];
         const rate = formatRate(transfer.rate);
         if (rate) detail.push(rate);
-        if (transfer.eta !== null) detail.push(`剩余约 ${formatDuration(transfer.eta)}`);
+        if (transfer.eta !== null) detail.push(`本块剩余约 ${formatDuration(transfer.eta)}`);
         setEntry(entry, "uploading", `写入 ${index + 1}/${session.totalChunks}`,
-          (uploadedBytes / file.size) * 100, detail.join(" · "));
+          ((confirmedBefore + loaded) / file.size) * 100, detail.join(" · "));
       });
-      setEntry(entry, "uploading", `已确认 ${index + 1}/${session.totalChunks}`, ((start + chunk.size) / file.size) * 100);
+      sentBytes += chunk.size;
+      confirmedBytes += chunk.size;
+      setEntry(entry, "uploading", `已确认 ${index + 1}/${session.totalChunks}`,
+        (confirmedBytes / file.size) * 100);
     }
     const result = await request(`/upload/sessions/${session.sessionId}/commit`, { method: "POST", body: "{}" });
     localStorage.removeItem(sessionKey(file, dir));
-    const completion = finishTransfer(entry, file.size);
+    const completion = finishTransfer(entry, sentBytes);
     const detail = [`${formatBytes(file.size)} / ${result.fileHash.slice(0, 16)}...`];
     if (completion.elapsed !== null) {
       detail.push(formatDuration(completion.elapsed));
-      detail.push(`平均 ${formatRate(completion.averageRate)}`);
+      detail.push(`实际传输 ${formatBytes(sentBytes)}`);
+      if (sentBytes) detail.push(`平均 ${formatRate(completion.averageRate)}`);
     }
     setEntry(entry, "completed", result.state || "AVAILABLE", 100, detail.join(" · "));
     await loadCatalog(dir);

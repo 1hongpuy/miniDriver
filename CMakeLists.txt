@@ -233,6 +233,16 @@ target_link_libraries(test_gateway_metadata_lazy_load PRIVATE
     OpenSSL::Crypto
 )
 
+add_executable(test_gateway_upload_preflight test/test_gateway_upload_preflight.cpp)
+target_include_directories(test_gateway_upload_preflight PRIVATE ${LEVELDB_INC})
+target_link_libraries(test_gateway_upload_preflight PRIVATE
+    minikv_gateway
+    minikv_utils
+    ${LEVELDB_LIB}
+    pthread
+    OpenSSL::Crypto
+)
+
 add_executable(test_lru_cache test/test_lru_cache.cpp)
 target_include_directories(test_lru_cache PRIVATE include)
 target_link_libraries(test_lru_cache PRIVATE pthread)
@@ -275,6 +285,7 @@ if(BUILD_TESTING)
     add_test(NAME gateway_catalog_cache COMMAND test_gateway_catalog_cache)
     add_test(NAME gateway_manifest_cache COMMAND test_gateway_manifest_cache)
     add_test(NAME gateway_metadata_lazy_load COMMAND test_gateway_metadata_lazy_load)
+    add_test(NAME gateway_upload_preflight COMMAND test_gateway_upload_preflight)
     add_test(NAME lru_cache COMMAND test_lru_cache)
     add_test(NAME datanode_delete
              COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/test/test_v2_datanode_delete.sh

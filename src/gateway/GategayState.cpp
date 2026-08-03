@@ -385,16 +385,18 @@ std::string sessionValue(const SessionState& session) {
     for (const auto& [index, chunk] : session.completed) chunks.push_back(std::to_string(index) + "," + hexEncode(chunk.chunkHash) + "," + std::to_string(chunk.size));
     return hexEncode(session.sessionId) + "|" + hexEncode(session.ownerId) + "|" + hexEncode(session.fileName) + "|" +
            hexEncode(session.dirPath) + "|" + std::to_string(session.fileSize) + "|" + std::to_string(session.chunkSize) + "|" +
-           std::to_string(session.totalChunks) + "|" + std::to_string(session.createdAt) + "|" + std::to_string(session.lastActivityAt) + "|" + join(chunks, ';');
+           std::to_string(session.totalChunks) + "|" + std::to_string(session.createdAt) + "|" + std::to_string(session.lastActivityAt) + "|" + join(chunks, ';') + "|" +
+           hexEncode(session.manifestHash);
 }
 bool parseSession(const std::string& value, SessionState& session) {
     const auto f = split(value, '|'); 
-    if (f.size() != 10) return false;
+    if (f.size() != 10 && f.size() != 11) return false;
     try {
         if (!hexDecode(f[0], session.sessionId) || !hexDecode(f[1], session.ownerId) || !hexDecode(f[2], session.fileName) || !hexDecode(f[3], session.dirPath)) return false;
         session.fileSize = std::stoull(f[4]); session.chunkSize = static_cast<uint32_t>(std::stoul(f[5])); session.totalChunks = static_cast<uint32_t>(std::stoul(f[6]));
         session.createdAt = std::stoll(f[7]); session.lastActivityAt = std::stoll(f[8]);
         for (const auto& item : split(f[9], ';')) { if (item.empty()) continue; const auto chunk = split(item, ','); if (chunk.size() != 3) return false; CompletedChunk completed; completed.index = static_cast<uint32_t>(std::stoul(chunk[0])); if (!hexDecode(chunk[1], completed.chunkHash)) return false; completed.size = std::stoull(chunk[2]); session.completed[completed.index] = completed; }
+        if (f.size() == 11 && !hexDecode(f[10], session.manifestHash)) return false;
         return true;
     } catch (...) { return false; }
 }
@@ -766,6 +768,19 @@ std::vector<NodeSnapshot> GatewayState::nodes() const
 }
 
 //会话管理  
+std::string GatewayState::manifestHash(uint64_t fileSize, uint32_t chunkSize,
+                                       const std::vector<ChunkRouteRequest>& chunks)
+{
+    if (fileSize == 0 || chunkSize == 0 || chunks.empty()) return {};
+    std::string canonical = "minikv-manifest-v1\n" + std::to_string(fileSize) + "\n" +
+                            std::to_string(chunkSize) + "\n";
+    for (const auto& chunk : chunks) {
+        canonical += std::to_string(chunk.chunkIndex) + ":" + chunk.chunkHash + ":" +
+                     std::to_string(chunk.chunkSize) + "\n";
+    }
+    return sha256Hex(canonical.data(), canonical.size());
+}
+
 bool GatewayState::createSession(const std::string& fileName, const std::string& dirPath,
         uint64_t fileSize, uint32_t chunkSize, SessionState& out)
 {
@@ -784,6 +799,141 @@ bool GatewayState::createSession(const std::string& fileName, const std::string&
     sessions_[out.sessionId] = out;
     return persistSessionLocked(out);
 }
+
+FileCommitStatus GatewayState::createObjectLinkLocked(const std::string& fileName,
+                                                      const std::string& dirPath,
+                                                      const FileMeta& file,
+                                                      ObjectMeta& out)
+{
+    std::string parentPath;
+    std::string name;
+    if (!normalizeDirectoryPath(dirPath, parentPath) || !normalizeEntryName(fileName, name)) {
+        return FileCommitStatus::kInvalidRequest;
+    }
+
+    const std::string pathKey = catalogPathKey(file.ownerId, childPath(parentPath, name));
+    std::string existingObjectId;
+    const leveldb::Status pathStatus = db_->Get(leveldb::ReadOptions(), "path:" + pathKey, &existingObjectId);
+    if (pathStatus.ok()) return FileCommitStatus::kPathConflict;
+    if (!pathStatus.IsNotFound()) return FileCommitStatus::kInvalidRequest;
+
+    ObjectMeta object;
+    object.objectId = randomId();
+    if (object.objectId.empty()) return FileCommitStatus::kInvalidRequest;
+    object.ownerId = file.ownerId;
+    object.parentPath = parentPath;
+    object.name = name;
+    object.fileHash = file.fileHash;
+    object.fileSize = file.fileSize;
+    object.state = file.state;
+    object.createdAt = unixSeconds();
+
+    leveldb::WriteBatch batch;
+    std::string current = "/";
+    for (const auto& component : split(parentPath.substr(1), '/')) {
+        if (component.empty()) continue;
+        current = childPath(current, component);
+        const std::string directoryKey = catalogPathKey(object.ownerId, current);
+        std::string existingDirectory;
+        const leveldb::Status directoryStatus = db_->Get(
+            leveldb::ReadOptions(), "dir:" + directoryKey, &existingDirectory);
+        if (!directoryStatus.ok() && !directoryStatus.IsNotFound()) {
+            return FileCommitStatus::kInvalidRequest;
+        }
+        if (directoryStatus.IsNotFound()) {
+            batch.Put("dir:" + directoryKey,
+                      directoryValue({object.ownerId, current, object.createdAt}));
+        }
+    }
+    batch.Put("obj:" + object.objectId, objectValue(object));
+    batch.Put("path:" + pathKey, object.objectId);
+    if (!db_->Write(leveldb::WriteOptions(), &batch).ok()) return FileCommitStatus::kInvalidRequest;
+
+    objectCache_.erase(object.objectId);
+    catalogCache_.clear();
+    out = std::move(object);
+    return FileCommitStatus::kCommitted;
+}
+
+PreflightStatus GatewayState::preflightUpload(const UploadPreflightRequest& request,
+                                              UploadPreflightResult& out)
+{
+    out = {};
+    std::string parentPath;
+    std::string name;
+    if (request.fileSize == 0 || request.chunkSize == 0 || request.manifestHash.empty() ||
+        !normalizeDirectoryPath(request.dirPath, parentPath) ||
+        !normalizeEntryName(request.fileName, name)) {
+        return PreflightStatus::kInvalidRequest;
+    }
+
+    const uint64_t calculatedChunks =
+        1 + (request.fileSize - 1) / request.chunkSize;
+    if (calculatedChunks == 0 || calculatedChunks > UINT32_MAX ||
+        request.chunks.size() != calculatedChunks) {
+        return PreflightStatus::kInvalidRequest;
+    }
+    for (size_t index = 0; index < request.chunks.size(); ++index) {
+        const auto& chunk = request.chunks[index];
+        const uint64_t expected = index + 1 == request.chunks.size()
+            ? request.fileSize - static_cast<uint64_t>(index) * request.chunkSize
+            : request.chunkSize;
+        if (chunk.chunkIndex != index || chunk.chunkHash.empty() || chunk.chunkSize != expected) {
+            return PreflightStatus::kInvalidRequest;
+        }
+    }
+    if (manifestHash(request.fileSize, request.chunkSize, request.chunks) != request.manifestHash) {
+        return PreflightStatus::kInvalidRequest;
+    }
+
+    std::lock_guard<std::mutex> lock(mutex_);
+    const std::string pathKey = catalogPathKey("admin", childPath(parentPath, name));
+    std::string existingObjectId;
+    const leveldb::Status pathStatus = db_->Get(leveldb::ReadOptions(), "path:" + pathKey, &existingObjectId);
+    if (pathStatus.ok()) return PreflightStatus::kPathConflict;
+    if (!pathStatus.IsNotFound()) return PreflightStatus::kInvalidRequest;
+
+    FileMeta existingFile;
+    if (getFileLocked(request.manifestHash, existingFile)) {
+        const FileCommitStatus linkStatus =
+            createObjectLinkLocked(name, parentPath, existingFile, out.object);
+        if (linkStatus == FileCommitStatus::kCommitted) return PreflightStatus::kContentExists;
+        return linkStatus == FileCommitStatus::kPathConflict
+            ? PreflightStatus::kPathConflict
+            : PreflightStatus::kInvalidRequest;
+    }
+
+    SessionState session;
+    session.sessionId = randomId();
+    if (session.sessionId.empty()) return PreflightStatus::kInvalidRequest;
+    session.fileName = name;
+    session.dirPath = parentPath;
+    session.fileSize = request.fileSize;
+    session.chunkSize = request.chunkSize;
+    session.totalChunks = static_cast<uint32_t>(calculatedChunks);
+    session.manifestHash = request.manifestHash;
+    session.createdAt = session.lastActivityAt = unixSeconds();
+
+    for (const auto& chunk : request.chunks) {
+        ChunkRoute route;
+        if (getRouteLocked(chunk.chunkHash, route) && route.size == chunk.chunkSize &&
+            !route.replicas.empty()) {
+            session.completed[chunk.chunkIndex] =
+                {chunk.chunkIndex, chunk.chunkHash, chunk.chunkSize};
+            out.presentChunks.push_back(chunk);
+        } else {
+            out.missingChunks.push_back(chunk);
+        }
+    }
+    sessions_[session.sessionId] = session;
+    if (!persistSessionLocked(session)) {
+        sessions_.erase(session.sessionId);
+        return PreflightStatus::kInvalidRequest;
+    }
+    out.session = std::move(session);
+    return PreflightStatus::kUploadRequired;
+}
+
 bool GatewayState::getSession(const std::string& sessionId, SessionState& out) const
 {
     std::lock_guard<std::mutex> lock(mutex_);
@@ -915,7 +1065,8 @@ FileCommitStatus GatewayState::commitFile(const std::string& sessionId, FileMeta
     {
         return FileCommitStatus::kInvalidRequest;
     }
-    std::string manifest;
+    std::string legacyManifest;
+    std::vector<ChunkRouteRequest> manifestChunks;
     out = {};
     out.ownerId = sessionIt->second.ownerId; 
     out.fileName = sessionIt->second.fileName; 
@@ -929,13 +1080,25 @@ FileCommitStatus GatewayState::commitFile(const std::string& sessionId, FileMeta
         auto chunk = sessionIt->second.completed.find(i);
         if(chunk == sessionIt->second.completed.end()) return FileCommitStatus::kInvalidRequest;
         out.chunkHashes.push_back(chunk->second.chunkHash);
-        manifest += chunk->second.chunkHash + ":" + std::to_string(chunk->second.size) + ";";
+        legacyManifest += chunk->second.chunkHash + ":" + std::to_string(chunk->second.size) + ";";
+        manifestChunks.push_back({static_cast<uint32_t>(i), chunk->second.chunkHash, chunk->second.size});
         ChunkRoute route;
         if (!getRouteLocked(chunk->second.chunkHash, route) || route.replicas.size() < 2) {
             out.state = FileState::kProtecting;
         }
     }
-    out.fileHash = sha256Hex(manifest.data(), manifest.size());
+    // Sessions created by the preflight API have a browser-provided canonical
+    // manifest. Older saved sessions keep their original V2 identity so they
+    // remain resumable after this upgrade.
+    if (!sessionIt->second.manifestHash.empty()) {
+        const std::string calculated = manifestHash(out.fileSize, out.chunkSize, manifestChunks);
+        if (calculated.empty() || calculated != sessionIt->second.manifestHash) {
+            return FileCommitStatus::kInvalidRequest;
+        }
+        out.fileHash = calculated;
+    } else {
+        out.fileHash = sha256Hex(legacyManifest.data(), legacyManifest.size());
+    }
     std::string parentPath;
     std::string name;
     if (!normalizeDirectoryPath(out.dirPath, parentPath) || !normalizeEntryName(out.fileName, name)) {
@@ -1337,6 +1500,3 @@ DeleteStatus GatewayState::deleteCatalogEntriesLocked(const std::vector<std::str
 
 }
 }
-
-
-

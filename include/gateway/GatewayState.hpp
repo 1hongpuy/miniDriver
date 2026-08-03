@@ -68,6 +68,7 @@ enum class RoutePlanStatus { kOk, kInvalidRequest, kNoCapacity };
 enum class CommitChunkStatus { kCommitted, kAlreadyCommitted, kInvalidRequest };
 enum class FileCommitStatus { kCommitted, kPathConflict, kInvalidRequest };
 enum class DeleteStatus { kDeleted, kNotFound, kInvalidRequest };
+enum class PreflightStatus { kUploadRequired, kContentExists, kPathConflict, kInvalidRequest };
 
 struct CompletedChunk { //最后写入的清单,会话层
     uint32_t index;
@@ -83,6 +84,9 @@ struct SessionState {
     uint64_t fileSize  = 0;
     uint32_t chunkSize = 4 * 1024 * 1024;
     uint32_t totalChunks = 0;
+    // New sessions bind this canonical content identity before any bytes are sent.
+    // Empty means a legacy session created by the original V2 API.
+    std::string manifestHash;
     std::map<uint32_t, CompletedChunk>   completed;
     int64_t createdAt = 0;
     int64_t lastActivityAt = 0;
@@ -139,6 +143,22 @@ struct ObjectMeta {
     std::string contentType;
     FileState state = FileState::kProtecting;
     int64_t createdAt = 0;
+};
+
+struct UploadPreflightRequest {
+    std::string fileName;
+    std::string dirPath;
+    uint64_t fileSize = 0;
+    uint32_t chunkSize = 0;
+    std::string manifestHash;
+    std::vector<ChunkRouteRequest> chunks;
+};
+
+struct UploadPreflightResult {
+    SessionState session;
+    ObjectMeta object;
+    std::vector<ChunkRouteRequest> presentChunks;
+    std::vector<ChunkRouteRequest> missingChunks;
 };
 
 using ObjectMetaCache = LruCache<std::string, ObjectMeta>;
@@ -200,6 +220,13 @@ public:
 
     bool createSession(const std::string& fileName, const std::string& dirPath,
         uint64_t fileSize, uint32_t chunkSize, SessionState& out);
+    // The browser calls this after hashing its fixed-size chunks. It either
+    // rejects the logical path, links an existing content object, or creates a
+    // resumable session containing only the chunks that still need transfer.
+    PreflightStatus preflightUpload(const UploadPreflightRequest& request,
+                                    UploadPreflightResult& out);
+    static std::string manifestHash(uint64_t fileSize, uint32_t chunkSize,
+                                    const std::vector<ChunkRouteRequest>& chunks);
     bool getSession(const std::string& sessionId, SessionState& out) const;
     RoutePlanStatus planRoutes(const std::string& sessionId,
                                const std::vector<ChunkRouteRequest>& requests,
@@ -252,6 +279,10 @@ private:
     bool loadSessionsLocked();
     bool loadNodesLocked();
     bool backfillLegacyCatalogLocked();
+    FileCommitStatus createObjectLinkLocked(const std::string& fileName,
+                                            const std::string& dirPath,
+                                            const FileMeta& file,
+                                            ObjectMeta& out);
 
     std::string dbPath_;
     std::unique_ptr<leveldb::DB> db_;
@@ -276,7 +307,6 @@ private:
 
 }
 }
-
 
 
 

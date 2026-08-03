@@ -1,6 +1,6 @@
 #pragma once
 
-
+#include "gateway/LruCache.hpp"
 
 #include <cstdint>
 #include <string>
@@ -141,6 +141,8 @@ struct ObjectMeta {
     int64_t createdAt = 0;
 };
 
+using ObjectMetaCache = LruCache<std::string, ObjectMeta>;
+
 struct Breadcrumb {
     std::string name;
     std::string path;
@@ -202,6 +204,7 @@ public:
                          DirectoryMeta* out = nullptr);
     bool listCatalog(const std::string& path, CatalogSnapshot& out) const;
     bool getObject(const std::string& objectId, ObjectMeta& out) const;
+    ObjectMetaCache::Stats objectCacheStats() const;
     DeleteStatus deleteObject(const std::string& objectId);
     DeleteStatus deleteDirectory(const std::string& path);
     std::vector<DeleteTaskSnapshot> pendingDeletesForNode(const std::string& nodeId) const;
@@ -236,6 +239,7 @@ private:
     std::string dbPath_;
     std::unique_ptr<leveldb::DB> db_;
     mutable std::mutex mutex_; //可以再静态函数里面修改
+    mutable ObjectMetaCache objectCache_;
     //内存索引，加速，不用一直查询leveldb，leveldb备份
     std::map<std::string, NodeRecord>   nodeRecords_;
     std::map<std::string, NodeRuntime>  nodeRuntime_;
@@ -256,7 +260,6 @@ private:
 
 }
 }
-
 
 
 

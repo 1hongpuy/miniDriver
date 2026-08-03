@@ -145,6 +145,17 @@ bool parseObject(const std::string& value, ObjectMeta& object)
     }
 }
 
+size_t estimatedObjectBytes(const ObjectMeta& object)
+{
+    return sizeof(ObjectMeta) + object.objectId.size() + object.ownerId.size() +
+           object.parentPath.size() + object.name.size() + object.fileHash.size() +
+           object.contentType.size();
+}
+
+constexpr size_t kObjectCacheMaxEntries = 4096;
+constexpr size_t kObjectCacheMaxBytes = 4 * 1024 * 1024;
+constexpr int64_t kObjectCacheTtlSeconds = 10 * 60;
+
 std::string deleteTaskValue(const DeleteTask& task)
 {
     std::vector<std::string> nodes;
@@ -623,7 +634,11 @@ void GatewayState::releaseLeasesForNodeLocked(const std::string& nodeId)
 }
 
 //
-GatewayState::GatewayState(const std::string& dbPath) : dbPath_(dbPath) { }
+GatewayState::GatewayState(const std::string& dbPath)
+    : dbPath_(dbPath),
+      objectCache_(ObjectMetaCache::Config{kObjectCacheMaxEntries, kObjectCacheMaxBytes})
+{
+}
 GatewayState::~GatewayState() = default;
 
 bool GatewayState::open()
@@ -898,6 +913,7 @@ FileCommitStatus GatewayState::commitFile(const std::string& sessionId, FileMeta
 
     objects_[object.objectId] = object;
     objectByPath_[pathKey] = object.objectId;
+    objectCache_.erase(object.objectId);
     return FileCommitStatus::kCommitted;
 }
 bool GatewayState::getFile(const std::string& fileHash, FileMeta& out) const
@@ -997,10 +1013,28 @@ bool GatewayState::listCatalog(const std::string& path, CatalogSnapshot& out) co
 bool GatewayState::getObject(const std::string& objectId, ObjectMeta& out) const
 {
     std::lock_guard<std::mutex> lock(mutex_);
-    const auto it = objects_.find(objectId);
-    if (it == objects_.end()) return false;
-    out = it->second;
+    const auto cached = objectCache_.get(objectId);
+    if (cached) {
+        out = *cached;
+        return true;
+    }
+
+    if (!db_) return false;
+    std::string value;
+    if (!db_->Get(leveldb::ReadOptions(), "obj:" + objectId, &value).ok()) return false;
+
+    ObjectMeta object;
+    if (!parseObject(value, object) || object.objectId != objectId) return false;
+    objectCache_.put(objectId, std::make_shared<const ObjectMeta>(object),
+                     estimatedObjectBytes(object), kObjectCacheTtlSeconds);
+    out = std::move(object);
     return true;
+}
+
+ObjectMetaCache::Stats GatewayState::objectCacheStats() const
+{
+    std::lock_guard<std::mutex> lock(mutex_);
+    return objectCache_.stats();
 }
 
 DeleteStatus GatewayState::deleteObject(const std::string& objectId)
@@ -1156,6 +1190,7 @@ DeleteStatus GatewayState::deleteCatalogEntriesLocked(const std::vector<std::str
     if (!db_->Write(leveldb::WriteOptions(), &batch).ok()) return DeleteStatus::kInvalidRequest;
 
     for (const auto& [objectId, object] : targets) {
+        objectCache_.erase(objectId);
         objects_.erase(objectId);
         objectByPath_.erase(catalogPathKey(object.ownerId, childPath(object.parentPath, object.name)));
     }
@@ -1169,7 +1204,6 @@ DeleteStatus GatewayState::deleteCatalogEntriesLocked(const std::vector<std::str
 
 }
 }
-
 
 
 

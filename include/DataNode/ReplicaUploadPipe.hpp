@@ -4,6 +4,7 @@
 #include "http/AsyncHttpClient.hpp"
 
 #include <cstddef>
+#include <chrono>
 #include <functional>
 #include <memory>
 #include <string>
@@ -18,6 +19,34 @@ class EventLoop;
 namespace miniKV::datanode {
 
 using namespace http;
+struct ReplicaUploadMetrics {
+    using Clock = std::chrono::steady_clock;
+
+    uint64_t pauseCount = 0;
+    uint64_t pauseNanoseconds = 0;
+    size_t maxPendingBytes = 0;
+
+    void recordPaused(size_t pendingBytes, Clock::time_point now)
+    {
+        if(pendingBytes > maxPendingBytes) maxPendingBytes = pendingBytes;
+        if(paused_) return;
+        paused_ = true;
+        pausedAt_ = now;
+        ++pauseCount;
+    }
+
+    void recordResumed(Clock::time_point now)
+    {
+        if(!paused_) return;
+        const auto elapsed = std::chrono::duration_cast<std::chrono::nanoseconds>(now - pausedAt_).count();
+        if(elapsed > 0) pauseNanoseconds += static_cast<uint64_t>(elapsed);
+        paused_ = false;
+    }
+
+private:
+    bool paused_ = false;
+    Clock::time_point pausedAt_{};
+};
 // Bridges one Primary -> Replica HTTP request with the upstream streaming
 // HTTP body callback. It owns only a bounded amount of data that could not
 // yet be accepted by AsyncHttpRequest; TcpConnection owns normal socket
@@ -60,6 +89,7 @@ public:
     bool paused() const { return upstreamPaused_; }
     bool finished() const { return finished_; }
     size_t pendingBytes() const { return pendingBytes_; }
+    const ReplicaUploadMetrics& metrics() const { return metrics_; }
 
 private:
     enum class State { kIdle, kOpening, kStreaming, kWaitingResponse, kFinished };
@@ -77,6 +107,7 @@ private:
     void completeInLoop(HttpClientResponse response, std::string error);
     void holdLifetimeInLoop();
     void releaseLifetimeInLoop();
+    void markPausedInLoop();
 
     network::EventLoop* loop_;
     AsyncHttpRequest::Ptr request_;
@@ -84,6 +115,7 @@ private:
     CompletionCallback completionCallback_;
     std::vector<std::string> pendingBlocks_;
     size_t pendingBytes_ = 0;
+    ReplicaUploadMetrics metrics_;
     bool requestReady_ = false;
     bool downstreamBlocked_ = false;
     bool upstreamPaused_ = false;

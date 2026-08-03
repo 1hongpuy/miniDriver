@@ -1,10 +1,13 @@
 #include "agent/ProcessSupervisor.hpp"
+#include "utils/AsyncLogger.hpp"
 
 #include <algorithm>
 #include <cerrno>
 #include <climits>
+#include <cstring>
 #include <cstdlib>
 #include <fcntl.h>
+#include <spawn.h>
 #include <stdexcept>
 #include <sys/types.h>
 #include <sys/wait.h>
@@ -15,10 +18,20 @@ extern char** environ;
 namespace miniKV {
 namespace agent {
 
-int openLog(const std::string& path)
+std::vector<std::string> childEnvironment(const ChildSpec& spec, const std::string& clusterSecret)
 {
-    const char* target = path.empty() ? "/dev/null" : path.c_str();
-    return ::open(target, O_CREAT | O_APPEND | O_WRONLY, 0644);
+    std::map<std::string, std::string> overrides = spec.environment;
+    overrides["MINIKV_V2_CLUSTER_SECRET"] = clusterSecret;
+
+    std::vector<std::string> values;
+    for(char** entry = environ; entry != nullptr && *entry != nullptr; ++entry) {
+        const std::string value(*entry);
+        const size_t equals = value.find('=');
+        const std::string name = value.substr(0, equals);
+        if(overrides.erase(name) == 0) values.push_back(value);
+    }
+    for(const auto& [name, value] : overrides) values.push_back(name + "=" + value);
+    return values;
 }
 
 
@@ -49,39 +62,52 @@ void ProcessSupervisor::start(const ChildSpec& spec)
 
 void ProcessSupervisor::spawn(ChildState& state)
 {
-    const pid_t pid = ::fork();
-    if(pid < 0) throw std::runtime_error("fork failed");
-    if(pid == 0) {
-        //子进程
-        sigset_t unblockedSignals;
-        ::sigemptyset(&unblockedSignals);
-        ::sigprocmask(SIG_SETMASK, &unblockedSignals, nullptr);
-        //用了个空信号集来修改之前空的信号就行
-        const int stdoutFd = openLog(state.spec.stdoutPath);
-        const int stderrFd = openLog(state.spec.stderrPath);
-        if(stdoutFd < 0 || stderrFd < 0 ||
-           ::dup2(stdoutFd, STDOUT_FILENO) < 0 || ::dup2(stderrFd, STDERR_FILENO) < 0 ||
-           ::setenv("MINIKV_V2_CLUSTER_SECRET", clusterSecret_.c_str(), 1) != 0) 
-            //设置环境变量
-        {
-            _exit(127);
-        }
-        if(stdoutFd != STDOUT_FILENO) ::close(stdoutFd);
-        if(stderrFd != STDERR_FILENO) ::close(stderrFd);
-
-        for(const auto& [name, value] : state.spec.environment) {
-            if(::setenv(name.c_str(), value.c_str(), 1) != 0) _exit(127);
-        }
-
-        std::vector<char*> argv;
-        argv.reserve(state.spec.argv.size() + 1);
-        for(std::string& value : state.spec.argv) argv.push_back(value.data());
-        argv.push_back(nullptr);
-        ::execve(state.spec.executable.c_str(), argv.data(), environ);
-        //只有这个函数运行失败才会执行
-        _exit(127);
+    posix_spawn_file_actions_t actions;
+    posix_spawnattr_t attributes;
+    if(::posix_spawn_file_actions_init(&actions) != 0) {
+        throw std::runtime_error("cannot initialize posix_spawn state");
     }
+    if(::posix_spawnattr_init(&attributes) != 0) {
+        ::posix_spawn_file_actions_destroy(&actions);
+        throw std::runtime_error("cannot initialize posix_spawn state");
+    }
+
+    const char* stdoutPath = state.spec.stdoutPath.empty() ? "/dev/null" : state.spec.stdoutPath.c_str();
+    const char* stderrPath = state.spec.stderrPath.empty() ? "/dev/null" : state.spec.stderrPath.c_str();
+    int result = ::posix_spawn_file_actions_addopen(&actions, STDOUT_FILENO, stdoutPath,
+                                                     O_CREAT | O_APPEND | O_WRONLY, 0644);
+    if(result == 0) result = ::posix_spawn_file_actions_addopen(&actions, STDERR_FILENO, stderrPath,
+                                                                  O_CREAT | O_APPEND | O_WRONLY, 0644);
+
+    sigset_t unblockedSignals;
+    ::sigemptyset(&unblockedSignals);
+    if(result == 0) result = ::posix_spawnattr_setsigmask(&attributes, &unblockedSignals);
+    if(result == 0) result = ::posix_spawnattr_setflags(&attributes, POSIX_SPAWN_SETSIGMASK);
+
+    std::vector<std::string> argvStorage = state.spec.argv;
+    std::vector<char*> argv;
+    argv.reserve(argvStorage.size() + 1);
+    for(std::string& value : argvStorage) argv.push_back(value.data());
+    argv.push_back(nullptr);
+
+    std::vector<std::string> environmentStorage = childEnvironment(state.spec, clusterSecret_);
+    std::vector<char*> environment;
+    environment.reserve(environmentStorage.size() + 1);
+    for(std::string& value : environmentStorage) environment.push_back(value.data());
+    environment.push_back(nullptr);
+
+    pid_t pid = -1;
+    if(result == 0) {
+        result = ::posix_spawn(&pid, state.spec.executable.c_str(), &actions, &attributes,
+                               argv.data(), environment.data());
+    }
+    ::posix_spawn_file_actions_destroy(&actions);
+    ::posix_spawnattr_destroy(&attributes);
+    if(result != 0) throw std::runtime_error("posix_spawn failed: " + std::string(std::strerror(result)));
+
     state.pid = static_cast<int>(pid);
+    miniKV::utils::logInfo("event=service_spawn service=" + state.spec.id +
+                           " pid=" + std::to_string(state.pid));
 }
 
 std::chrono::seconds ProcessSupervisor::restartDelay(const ChildState& state) const
@@ -113,11 +139,16 @@ void ProcessSupervisor::reapExitedChildren(std::chrono::steady_clock::time_point
         ChildState& state = found->second;
         state.pid = -1;
         const bool failed = !WIFEXITED(status) || WEXITSTATUS(status) != 0;
+        miniKV::utils::logWarn("event=service_exit service=" + state.spec.id +
+                               " pid=" + std::to_string(pid) + " status=" +
+                               std::to_string(status) + " failed=" + (failed ? "true" : "false"));
         //WIFEXITED true就是正常退出，而WEXITSTATUS表示是退出的返回值，是0就是正常的
         if(failed && restartsEnabled_ && state.spec.restart.onFailure) {
             ++state.restarts;
             state.restartAt = now + restartDelay(state);
             state.restartPending = true;
+            miniKV::utils::logInfo("event=service_restart_scheduled service=" + state.spec.id +
+                                   " restart_count=" + std::to_string(state.restarts));
         }
     }
 }
@@ -128,6 +159,7 @@ void ProcessSupervisor::startDueRestarts(std::chrono::steady_clock::time_point n
     for(auto& [id, state] : children_) {
         if(state.restartPending && state.pid < 0 && state.restartAt <= now) {
             state.restartPending = false;
+            miniKV::utils::logInfo("event=service_restart service=" + state.spec.id);
             spawn(state);
         }
     }
@@ -137,6 +169,7 @@ void ProcessSupervisor::beginShutdown()
 {
     if(!restartsEnabled_) return;
     restartsEnabled_ = false;
+    miniKV::utils::logInfo("event=agent_shutdown");
     for(auto& [id, state] : children_) {
         state.restartPending = false;
         if(state.pid > 0) ::kill(static_cast<pid_t>(state.pid), SIGTERM);

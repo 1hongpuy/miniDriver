@@ -11,9 +11,11 @@
 #include "DataNode/HttpGatewayControlClient.hpp"
 #include "DataNode/ReplicaUploadPipe.hpp"
 #include "DataNode/WriteAdmission.hpp"
+#include "utils/AsyncLogger.hpp"
 #include "utils/Util.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <cstdlib>
 #include <filesystem>
 #include <functional>
@@ -67,6 +69,12 @@ std::string configuredAllowedOrigin()
 {
     if(const char* value = std::getenv("MINIKV_V2_ALLOWED_ORIGIN")) return value;
     return {};
+}
+
+std::string configuredNodeId(const std::string& fallback)
+{
+    if(const char* value = std::getenv("MINIKV_V2_NODE_ID")) return value;
+    return fallback;
 }
 
 
@@ -136,6 +144,8 @@ uint64_t logicalUsedBytes(const FastDataStore& store)
 
 class ChunkUploadStream : public std::enable_shared_from_this<ChunkUploadStream> {
 public:
+    using Clock = std::chrono::steady_clock;
+
     ChunkUploadStream(EventLoop* loop, FastDataStore& store, WriteAdmission& writeAdmission,
                       std::string nodeId, GatewayControlClient& gatewayControl,
                       std::string gatewayAddress, uint16_t gatewayPort,
@@ -145,7 +155,8 @@ public:
             gatewayControl_(gatewayControl),
             gatewayAddress_(std::move(gatewayAddress)), gatewayPort_(gatewayPort),
             clusterSecret_(std::move(clusterSecret)), corsPolicy_(std::move(corsPolicy)),
-            requestOrigin_(std::move(requestOrigin)), chunkHash_(std::move(chunkHash))
+            requestOrigin_(std::move(requestOrigin)), chunkHash_(std::move(chunkHash)),
+            acceptedAt_(Clock::now())
     {
         setup(request);
     }
@@ -189,6 +200,7 @@ public:
 
     HttpContext::BodyConsumeResult consume(const char* bytes, size_t size)
     {
+        if(firstBodyAt_ == Clock::time_point{}) firstBodyAt_ = Clock::now();
         if(admissionRejected_) return HttpContext::BodyConsumeResult::kContinue;
         if(!error_.empty() || writer_ == nullptr) return HttpContext::BodyConsumeResult::kAbort;
         if(!writer_->append(bytes, size)) {
@@ -200,9 +212,9 @@ public:
         const auto result = replicaPipe_->push(bytes, size);
         if(result == HttpContext::BodyConsumeResult::kAbort) {
             error_ = "replica stream rejected body bytes";
-            std::cerr << "chunk upload " << chunkHash_ << " replica body rejected\n";
+            miniKV::utils::logError("event=chunk_replica_body_rejected chunk=" + chunkHash_);
         } else if(result == HttpContext::BodyConsumeResult::kPause) {
-            std::cerr << "chunk upload " << chunkHash_ << " paused for replica backpressure\n";
+            miniKV::utils::logDebug("event=chunk_replica_backpressure chunk=" + chunkHash_);
         }
         return result;
     }
@@ -225,13 +237,15 @@ public:
 
         bool alreadyExists = false;
         if(!writer_->finish(alreadyExists)) {
-            std::cerr << "chunk upload " << chunkHash_
-                      << " local finish failed after " << writer_->writtenBytes() << " bytes\n";
+            miniKV::utils::logError("event=chunk_local_finish_failed chunk=" + chunkHash_ +
+                                    " bytes=" + std::to_string(writer_->writtenBytes()));
             completeClient(400, "chunk length or SHA-256 verification failed");
             return;
         }
-        std::cerr << "chunk upload " << chunkHash_ << " local finish succeeded"
-                  << (replicaPipe_ == nullptr ? " without replica\n" : ", waiting for replica\n");
+        localFinishedAt_ = Clock::now();
+        miniKV::utils::logDebug("event=chunk_local_finish chunk=" + chunkHash_ +
+                                " bytes=" + std::to_string(writer_->writtenBytes()) +
+                                " replica=" + (replicaPipe_ == nullptr ? "false" : "true"));
         alreadyExists_ = alreadyExists;
         successfulNodes_.push_back(nodeId_);
 
@@ -281,9 +295,12 @@ private:
     void onReplicaComplete(HttpClientResponse response, std::string error)
     {
         if(response_ == nullptr) return;
+        replicaFinishedAt_ = Clock::now();
+        if(replicaPipe_ != nullptr) replicaMetrics_ = replicaPipe_->metrics();
         replicaPipe_.reset();
-        std::cerr << "chunk upload " << chunkHash_ << " replica completed: HTTP "
-                  << response.status << ", error=" << (error.empty() ? "<none>" : error) << '\n';
+        miniKV::utils::logInfo("event=chunk_replica_complete chunk=" + chunkHash_ +
+                               " http_status=" + std::to_string(response.status) +
+                               " error=" + (error.empty() ? "-" : error));
         if(!error.empty() || response.status != 200) {
             replicaError_ = error.empty() ? "replica returned HTTP " + std::to_string(response.status)
                                           : std::move(error);
@@ -300,20 +317,22 @@ private:
     void afterReplica()
     {
         if(position_ != 0) {
-            std::cerr << "chunk upload " << chunkHash_ << " replica node replying to primary\n";
+            miniKV::utils::logDebug("event=replica_chunk_reply chunk=" + chunkHash_);
             completeClient(200, "");
             return;
         }
-        std::cerr << "chunk upload " << chunkHash_ << " sending Gateway commit with "
-                  << successfulNodes_.size() << " successful node(s)\n";
+        miniKV::utils::logDebug("event=chunk_gateway_commit_start chunk=" + chunkHash_ +
+                                " successful_nodes=" + std::to_string(successfulNodes_.size()));
+        gatewayCommitStartedAt_ = Clock::now();
         std::weak_ptr<ChunkUploadStream> weakSelf(shared_from_this());
         gatewayControl_.commitChunk({capability_.sessionId, capability_.chunkIndex, chunkHash_,
                                     capability_.chunkSize, successfulNodes_, uploadToken_},
             [weakSelf](RpcResult result) {
             if(auto self = weakSelf.lock()) {
-                std::cerr << "chunk upload " << self->chunkHash_ << " Gateway commit result: HTTP "
-                          << result.httpStatus << ", error="
-                          << (result.error.empty() ? "<none>" : result.error) << '\n';
+                self->gatewayCommitFinishedAt_ = Clock::now();
+                miniKV::utils::logInfo("event=chunk_gateway_commit_result chunk=" + self->chunkHash_ +
+                                       " http_status=" + std::to_string(result.httpStatus) +
+                                       " error=" + (result.error.empty() ? "-" : result.error));
                 if(!result.ok) {
                     self->completeClient(500, result.error.empty() ? "Gateway commit failed" : std::move(result.error));
                     return;
@@ -326,9 +345,24 @@ private:
     void completeClient(int status, const std::string& error)
     {
         if(response_ == nullptr) return;
-        std::cerr << "chunk upload " << chunkHash_ << " responding to client: HTTP " << status;
-        if(!error.empty()) std::cerr << ", error=" << error;
-        std::cerr << '\n';
+        const auto completedAt = Clock::now();
+        if(replicaPipe_ != nullptr) replicaMetrics_ = replicaPipe_->metrics();
+        const std::string line = std::string(status == 200 ? "event=chunk_complete" : "event=chunk_failed") +
+            " chunk=" + chunkHash_ + " session=" + capability_.sessionId +
+            " index=" + std::to_string(capability_.chunkIndex) + " http_status=" +
+            std::to_string(status) + " bytes=" + std::to_string(capability_.chunkSize) +
+            " replicas=" + std::to_string(successfulNodes_.size()) +
+            " total_ms=" + std::to_string(elapsedMilliseconds(acceptedAt_, completedAt)) +
+            " local_write_ms=" + std::to_string(elapsedMilliseconds(firstBodyAt_, localFinishedAt_)) +
+            " replica_ms=" + std::to_string(elapsedMilliseconds(localFinishedAt_, replicaFinishedAt_)) +
+            " gateway_commit_ms=" + std::to_string(elapsedMilliseconds(
+                gatewayCommitStartedAt_, gatewayCommitFinishedAt_)) +
+            " pauses=" + std::to_string(replicaMetrics_.pauseCount) +
+            " pause_ms=" + std::to_string(replicaMetrics_.pauseNanoseconds / 1000000ULL) +
+            " max_pending_bytes=" + std::to_string(replicaMetrics_.maxPendingBytes) +
+            " error=" + (error.empty() ? "-" : error);
+        if(status == 200) miniKV::utils::logInfo(line);
+        else miniKV::utils::logError(line);
         HttpResponse response;
         if(status != 200) {
             json(&response, status, jsonError(error));
@@ -365,6 +399,13 @@ private:
         }
     }
 
+    static uint64_t elapsedMilliseconds(Clock::time_point started, Clock::time_point finished)
+    {
+        if(started == Clock::time_point{} || finished == Clock::time_point{} || finished < started) return 0;
+        return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
+            finished - started).count());
+    }
+
     EventLoop* loop_;
     FastDataStore& store_;
     WriteAdmission& writeAdmission_;
@@ -389,6 +430,13 @@ private:
     bool alreadyExists_ = false;
     bool activeWriteCounted_ = false;
     bool admissionRejected_ = false;
+    Clock::time_point acceptedAt_{};
+    Clock::time_point firstBodyAt_{};
+    Clock::time_point localFinishedAt_{};
+    Clock::time_point replicaFinishedAt_{};
+    Clock::time_point gatewayCommitStartedAt_{};
+    Clock::time_point gatewayCommitFinishedAt_{};
+    ReplicaUploadMetrics replicaMetrics_;
     std::shared_ptr<ChunkUploadStream> selfHold_;
 };
 
@@ -421,8 +469,14 @@ int main(int argc, char** argv)
         return 2;
     }
 
+    if(!miniKV::utils::initAsyncLogger(miniKV::utils::asyncLoggerConfigFromEnvironment(
+           "datanode", configuredNodeId(nodeId), dataDir + "/logs/datanode-" + nodeId + ".log"))) {
+        std::cerr << "cannot initialize DataNode async logger\n";
+    }
+
     FastDataStore store(dataDir);
     if(!store.open()) {
+        miniKV::utils::logError("event=datanode_store_open_failed data_dir=" + dataDir);
         std::cerr << "cannot open DataNode store\n";
         return 1;
     }
@@ -442,9 +496,13 @@ int main(int argc, char** argv)
                 registrationInFlight = false;
                 if(result.ok) {
                     registered = true;
+                    miniKV::utils::logInfo("event=datanode_registered node=" + nodeId +
+                                           " gateway=" + gatewayAddress + ":" +
+                                           std::to_string(gatewayPort));
                     return;
                 }
-                std::cerr << "DataNode registration failed: " << result.error << '\n';
+                miniKV::utils::logWarn("event=datanode_registration_failed node=" + nodeId +
+                                       " error=" + result.error);
                 loop.runAfter(1, registerNode);
             });
     };
@@ -453,6 +511,8 @@ int main(int argc, char** argv)
                                       0, 0, 0, 0, writeAdmission.active()},
             [&](RpcResult result) {
                 if(!result.ok) {
+                    miniKV::utils::logDebug("event=datanode_heartbeat_failed node=" + nodeId +
+                                            " error=" + result.error);
                     registered = false;
                     registerNode();
                 }
@@ -541,6 +601,8 @@ int main(int argc, char** argv)
     loop.runAfter(0, [&] { registerNode(); heartbeat(); });
     loop.runEvery(8000, heartbeat);
     server.start();
-    std::cout << "V2 DataNode " << nodeId << " listening on :" << port << '\n';
+    miniKV::utils::logInfo("event=datanode_started node=" + nodeId + " port=" +
+                           std::to_string(port) + " data_dir=" + dataDir +
+                           " max_writes=" + std::to_string(kMaxConcurrentWrites));
     loop.loop();
 }

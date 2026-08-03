@@ -23,6 +23,14 @@ struct ServiceLogs {
     std::string stderrPath;
 };
 
+struct ServiceLoggingConfig {
+    std::string filePath;
+    std::string level = "info";
+    uint32_t queueSize = 8192;
+    uint64_t rotateBytes = 20ULL * 1024ULL * 1024ULL;
+    uint32_t rotateFiles = 5;
+};
+
 struct ManagedServiceConfig {
     std::string id;
     ServiceType type = ServiceType::kDataNode;
@@ -31,6 +39,7 @@ struct ManagedServiceConfig {
     std::string dataDir;
     RestartPolicy restart;
     ServiceLogs logs;
+    ServiceLoggingConfig logging;
 };
 
 //advertiseAddress：其他节点访问本机服务时使用的 Tailscale IP。
@@ -52,7 +61,6 @@ std::string readClusterSecret(const std::string& path);
 
 
 }  // namespace miniKV::v2
-
 
 
 

@@ -2,11 +2,11 @@
 
 #include "http/HttpRequest.hpp"
 #include "network/Buffer.hpp"
+#include "utils/AsyncLogger.hpp"
 #include <algorithm>
 #include <cstddef>
 #include <cstring>
 #include <functional>
-#include <iostream>
 #include <memory>
 
 
@@ -173,7 +173,8 @@ private:
         buf->retrieve((crlf - start) + 2);
         
         state_ = kExpectHeaders;
-        std::cout << "【调试】正在解析请求行: " << request_.path() << "|" << request_.query() << std::endl;
+        miniKV::utils::logDebug("event=http_request_parsed path=" + request_.path() +
+                                " query=" + request_.query());
         return true;
     }
 
@@ -306,7 +307,6 @@ private:
 
 } 
 }
-
 
 
 

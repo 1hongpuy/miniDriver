@@ -1,9 +1,9 @@
 #include "DataNode/ReplicaUploadPipe.hpp"
 
 #include "network/EventLoop.hpp"
+#include "utils/AsyncLogger.hpp"
 
 #include <cassert>
-#include <iostream>
 #include <utility>
 
 namespace miniKV::datanode {
@@ -47,6 +47,7 @@ void ReplicaUploadPipe::startInLoop(ReplicaUploadPipeOptions options, Completion
         if(Ptr self = weakSelf.lock())
         {
             self->downstreamBlocked_ = true;
+            self->markPausedInLoop();
             self->upstreamPaused_ = true;
         }
     });
@@ -66,8 +67,8 @@ void ReplicaUploadPipe::startInLoop(ReplicaUploadPipeOptions options, Completion
                 if(self->finished_) return;
                 self->requestReady_ = true;
                 self->state_ = State::kStreaming;
-                std::cerr << "replica pipe connected; flushing " << self->pendingBytes_
-                          << " pending bytes\n";
+                miniKV::utils::logDebug("event=replica_connected pending_bytes=" +
+                                        std::to_string(self->pendingBytes_));
                 self->flushPendingInLoop();
                 self->tryResumeUpstreamInLoop();
             }
@@ -97,6 +98,7 @@ miniKV::http::HttpContext::BodyConsumeResult ReplicaUploadPipe::pushInLoop(const
     {
         if(!enqueuePendingInLoop(data, size)) return Result::kAbort;
         flushPendingInLoop();
+        markPausedInLoop();
         upstreamPaused_ = true;
         return Result::kPause;
     }
@@ -114,8 +116,10 @@ miniKV::http::HttpContext::BodyConsumeResult ReplicaUploadPipe::pushInLoop(const
     if(writeResult == AsyncWriteResult::kWouldBlock)
     {
         if(!enqueuePendingInLoop(data, size)) return Result::kAbort;
+        markPausedInLoop();
         upstreamPaused_ = true;
-        std::cerr << "replica pipe paused upstream with " << pendingBytes_ << " pending bytes\n";
+        miniKV::utils::logDebug("event=replica_pause pending_bytes=" +
+                                std::to_string(pendingBytes_));
         return Result::kPause;
     }
 
@@ -172,6 +176,7 @@ bool ReplicaUploadPipe::enqueuePendingInLoop(const char* data, size_t size)
     }
     pendingBlocks_.emplace_back(data, size);
     pendingBytes_ += size;
+    if(pendingBytes_ > metrics_.maxPendingBytes) metrics_.maxPendingBytes = pendingBytes_;
     return true;
 }
 
@@ -211,7 +216,8 @@ void ReplicaUploadPipe::tryResumeUpstreamInLoop()
     if(finished_ || downstreamBlocked_ || !pendingBlocks_.empty()) return;
     if(!upstreamPaused_) return;
     upstreamPaused_ = false;
-    std::cerr << "replica pipe resuming upstream\n";
+    metrics_.recordResumed(ReplicaUploadMetrics::Clock::now());
+    miniKV::utils::logDebug("event=replica_resume");
     if(options_.resumeUpstream) options_.resumeUpstream();
 }
 
@@ -230,10 +236,12 @@ void ReplicaUploadPipe::failInLoop(std::string error)
 void ReplicaUploadPipe::completeInLoop(HttpClientResponse response, std::string error)
 {
     if(finished_) return;
-    std::cerr << "replica pipe completed: HTTP " << response.status
-              << ", error=" << (error.empty() ? "<none>" : error) << '\n';
+    miniKV::utils::logInfo("event=replica_complete http_status=" +
+                           std::to_string(response.status) + " error=" +
+                           (error.empty() ? "-" : error));
     finished_ = true;
     state_ = State::kFinished;
+    metrics_.recordResumed(ReplicaUploadMetrics::Clock::now());
     pendingBlocks_.clear();
     pendingBytes_ = 0;
     request_.reset();
@@ -251,6 +259,11 @@ void ReplicaUploadPipe::holdLifetimeInLoop()
 void ReplicaUploadPipe::releaseLifetimeInLoop()
 {
     lifetimeGuard_.reset();
+}
+
+void ReplicaUploadPipe::markPausedInLoop()
+{
+    metrics_.recordPaused(pendingBytes_, ReplicaUploadMetrics::Clock::now());
 }
 
 }  // namespace miniKV::v2

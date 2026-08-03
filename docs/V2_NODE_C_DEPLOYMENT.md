@@ -133,6 +133,12 @@ services:
     logs:
       stdout: /home/<NODE_C_USER>/minikv-v2/logs/datanode.out.log
       stderr: /home/<NODE_C_USER>/minikv-v2/logs/datanode.err.log
+    logging:
+      file: /home/<NODE_C_USER>/minikv-v2/logs/datanode-node-c.log
+      level: info
+      queueSize: 8192
+      rotateBytes: 20971520
+      rotateFiles: 5
 ```
 
 `allowedOrigin` is for the planned HTTP V2 frontend at port `8082`. If the
@@ -172,8 +178,7 @@ terminal running for the first deployment.
 In a second terminal, inspect the child process logs:
 
 ```bash
-tail -f ~/minikv-v2/logs/datanode.out.log \
-        ~/minikv-v2/logs/datanode.err.log
+tail -F ~/minikv-v2/logs/datanode-node-c.log
 ```
 
 The DataNode listens on `9002`, then registers itself with the Gateway. If the

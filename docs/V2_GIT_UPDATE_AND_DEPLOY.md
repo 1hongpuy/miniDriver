@@ -188,6 +188,24 @@ web:
 `allowedOrigin` 是协议、主机和端口的组合，不带末尾 `/`。前端地址改变时，两台
 DataNode 的该配置也必须同步更新，并重启 Agent。
 
+## 6.1 异步结构化日志
+
+每个 `services` 条目可单独配置异步日志。日志追加写入，达到 `rotateBytes` 后轮转；
+日志队列满时丢弃最旧的诊断消息，不阻塞 EventLoop：
+
+```yaml
+logging:
+  file: /home/ubuntu/minikv-v2/logs/datanode-node-a.log
+  level: info
+  queueSize: 8192
+  rotateBytes: 20971520
+  rotateFiles: 5
+```
+
+未设置 `logging` 时，默认路径为 `<dataDir>/logs/<service-id>.log`。Gateway 与
+DataNode 必须使用不同的 `file`。NodeAgent 自己记录到配置文件同级的
+`logs/node-agent.log`。
+
 ## 7. 启动 Node C
 
 Node C 的 YAML 只管理它本机的 DataNode：
@@ -213,32 +231,29 @@ Gateway 机器：
 
 ```bash
 curl http://127.0.0.1:18081/api/v2/admin/nodes
-tail -n 50 -F ~/minikv-v2/logs/gateway.out.log
+tail -n 50 -F ~/minikv-v2/logs/gateway.log
 ```
 
 Node A 和 Node C：
 
 ```bash
-tail -n 50 -F ~/minikv-v2/logs/datanode.out.log
-tail -n 50 -F ~/minikv-v2/logs/datanode.err.log
+tail -n 50 -F ~/minikv-v2/logs/datanode-<node-id>.log
 ```
 
 `-F` 比 `-f` 更适合调试：日志文件被重新创建时，它会自动重新打开。
 
-一次两副本 Chunk 上传成功时，DataNode 日志应依次出现近似内容：
+一次两副本 Chunk 上传成功时，DataNode 日志最终应出现一条 `chunk_complete`：
 
 ```text
-local finish succeeded
-replica pipe completed: HTTP 200, error=<none>
-sending Gateway commit with 2 successful node(s)
-Gateway commit result: HTTP 200, error=<none>
-responding to client: HTTP 200
+event=chunk_complete chunk=<sha256> session=<id> index=0 http_status=200 \
+  total_ms=... local_write_ms=... replica_ms=... gateway_commit_ms=... \
+  pauses=... pause_ms=... max_pending_bytes=...
 ```
 
-Gateway 日志应出现：
+用下面的命令查看慢路径：
 
 ```text
-/internal/v2/chunk-commits
+grep 'event=chunk_complete\|event=chunk_failed' ~/minikv-v2/logs/datanode-<node-id>.log
 ```
 
 ## 9. 前端单独部署

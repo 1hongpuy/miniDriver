@@ -155,6 +155,53 @@ size_t estimatedObjectBytes(const ObjectMeta& object)
 constexpr size_t kObjectCacheMaxEntries = 4096;
 constexpr size_t kObjectCacheMaxBytes = 4 * 1024 * 1024;
 constexpr int64_t kObjectCacheTtlSeconds = 10 * 60;
+constexpr size_t kFileCacheMaxEntries = 2048;
+constexpr size_t kFileCacheMaxBytes = 8 * 1024 * 1024;
+constexpr int64_t kFileCacheTtlSeconds = 10 * 60;
+constexpr size_t kRouteCacheMaxEntries = 8192;
+constexpr size_t kRouteCacheMaxBytes = 8 * 1024 * 1024;
+constexpr int64_t kRouteCacheTtlSeconds = 10 * 60;
+constexpr size_t kCatalogCacheMaxEntries = 512;
+constexpr size_t kCatalogCacheMaxBytes = 8 * 1024 * 1024;
+constexpr int64_t kCatalogCacheTtlSeconds = 30;
+constexpr size_t kManifestCacheMaxEntries = 256;
+constexpr size_t kManifestCacheMaxBytes = 16 * 1024 * 1024;
+constexpr int64_t kManifestCacheTtlSeconds = 60;
+
+size_t estimatedFileBytes(const FileMeta& file)
+{
+    size_t bytes = sizeof(FileMeta) + file.objectId.size() + file.fileHash.size() +
+                   file.ownerId.size() + file.fileName.size() + file.dirPath.size();
+    for (const auto& hash : file.chunkHashes) bytes += hash.size();
+    return bytes;
+}
+
+size_t estimatedRouteBytes(const ChunkRoute& route)
+{
+    size_t bytes = sizeof(ChunkRoute) + route.chunkHash.size();
+    for (const auto& replica : route.replicas) bytes += replica.size();
+    return bytes;
+}
+
+size_t estimatedCatalogBytes(const CatalogSnapshot& catalog)
+{
+    size_t bytes = sizeof(CatalogSnapshot) + catalog.path.size();
+    for (const auto& breadcrumb : catalog.breadcrumbs) bytes += sizeof(Breadcrumb) + breadcrumb.name.size() + breadcrumb.path.size();
+    for (const auto& directory : catalog.directories) bytes += sizeof(DirectoryMeta) + directory.ownerId.size() + directory.path.size();
+    for (const auto& object : catalog.files) bytes += estimatedObjectBytes(object);
+    return bytes;
+}
+
+size_t estimatedManifestBytes(const ManifestSnapshot& manifest)
+{
+    size_t bytes = sizeof(ManifestSnapshot) + estimatedFileBytes(manifest.file);
+    for (const auto& route : manifest.routes) bytes += estimatedRouteBytes(route);
+    for (const auto& [nodeId, node] : manifest.nodes) {
+        bytes += nodeId.size() + sizeof(NodeRecord) + node.nodeId.size() + node.address.size();
+        for (const auto& capability : node.capabilities) bytes += capability.size();
+    }
+    return bytes;
+}
 
 std::string deleteTaskValue(const DeleteTask& task)
 {
@@ -356,10 +403,6 @@ bool GatewayState::persistSessionLocked(const SessionState& session)
 {
     return db_->Put(leveldb::WriteOptions(), "s:" + session.sessionId, sessionValue(session)).ok();
 }
-bool GatewayState::persistFileLocked(const FileMeta& file)
-{
-    return db_->Put(leveldb::WriteOptions(), "f:" + file.fileHash, fileValue(file)).ok();
-}
 bool GatewayState::persistRouteLocked(const ChunkRoute& route)
 {
     return db_->Put(leveldb::WriteOptions(), "c:" + route.chunkHash, routeValue(route)).ok();
@@ -370,13 +413,71 @@ bool GatewayState::persistDirectoryLocked(const DirectoryMeta& directory)
                     "dir:" + catalogPathKey(directory.ownerId, directory.path),
                     directoryValue(directory)).ok();
 }
-bool GatewayState::persistObjectLocked(const ObjectMeta& object)
+bool GatewayState::getFileLocked(const std::string& fileHash, FileMeta& out) const
 {
-    leveldb::WriteBatch batch;
-    batch.Put("obj:" + object.objectId, objectValue(object));
-    batch.Put("path:" + catalogPathKey(object.ownerId, childPath(object.parentPath, object.name)),
-              object.objectId);
-    return db_->Write(leveldb::WriteOptions(), &batch).ok();
+    if (const auto cached = fileCache_.get(fileHash)) {
+        out = *cached;
+        return true;
+    }
+    if (!db_) return false;
+    std::string value;
+    if (!db_->Get(leveldb::ReadOptions(), "f:" + fileHash, &value).ok()) return false;
+    FileMeta file;
+    if (!parseFile(value, file) || file.fileHash != fileHash) return false;
+    fileCache_.put(fileHash, std::make_shared<const FileMeta>(file),
+                   estimatedFileBytes(file), kFileCacheTtlSeconds);
+    out = std::move(file);
+    return true;
+}
+
+bool GatewayState::getRouteLocked(const std::string& chunkHash, ChunkRoute& out) const
+{
+    if (const auto cached = routeCache_.get(chunkHash)) {
+        out = *cached;
+        return true;
+    }
+    if (!db_) return false;
+    std::string value;
+    if (!db_->Get(leveldb::ReadOptions(), "c:" + chunkHash, &value).ok()) return false;
+    ChunkRoute route;
+    if (!parseRoute(value, route) || route.chunkHash != chunkHash) return false;
+    routeCache_.put(chunkHash, std::make_shared<const ChunkRoute>(route),
+                    estimatedRouteBytes(route), kRouteCacheTtlSeconds);
+    out = std::move(route);
+    return true;
+}
+
+bool GatewayState::getDirectoryLocked(const std::string& ownerId, const std::string& path,
+                                      DirectoryMeta& out) const
+{
+    if (!db_) return false;
+    std::string value;
+    if (!db_->Get(leveldb::ReadOptions(), "dir:" + catalogPathKey(ownerId, path), &value).ok()) return false;
+    return parseDirectory(value, out) && out.ownerId == ownerId && out.path == path;
+}
+
+bool GatewayState::getObjectLocked(const std::string& objectId, ObjectMeta& out) const
+{
+    if (const auto cached = objectCache_.get(objectId)) {
+        out = *cached;
+        return true;
+    }
+    if (!db_) return false;
+    std::string value;
+    if (!db_->Get(leveldb::ReadOptions(), "obj:" + objectId, &value).ok()) return false;
+
+    ObjectMeta object;
+    if (!parseObject(value, object) || object.objectId != objectId) return false;
+    objectCache_.put(objectId, std::make_shared<const ObjectMeta>(object),
+                     estimatedObjectBytes(object), kObjectCacheTtlSeconds);
+    out = std::move(object);
+    return true;
+}
+
+bool GatewayState::objectIdAtPathLocked(const std::string& pathKey, std::string& objectId) const
+{
+    if (!db_) return false;
+    return db_->Get(leveldb::ReadOptions(), "path:" + pathKey, &objectId).ok() && !objectId.empty();
 }
 
 bool GatewayState::loadDeleteTasksLocked()
@@ -404,34 +505,6 @@ bool GatewayState::loadSessionsLocked()
     }
     return it->status().ok();
 }
-bool GatewayState::loadFilesLocked()
-{
-    auto it =  std::unique_ptr<leveldb::Iterator>(db_->NewIterator(leveldb::ReadOptions()));
-
-    for(it->Seek("f:"); it->Valid() && it->key().ToString().rfind("f:", 0) == 0; it->Next())
-    {
-        FileMeta file;
-        if(parseFile(it->value().ToString(), file))
-        {
-            files_[file.fileHash] = file;
-        }
-    }
-    return it->status().ok();
-}
-bool GatewayState::loadRoutesLocked()
-{
-    auto it =  std::unique_ptr<leveldb::Iterator>(db_->NewIterator(leveldb::ReadOptions()));
-
-    for(it->Seek("c:"); it->Valid() && it->key().ToString().rfind("c:", 0) == 0; it->Next())
-    {
-        ChunkRoute route;
-        if(parseRoute(it->value().ToString(), route))
-        {
-            routes_[route.chunkHash] = route;
-        }
-    }
-    return it->status().ok();
-}
 bool GatewayState::loadNodesLocked()
 {
     auto it = std::unique_ptr<leveldb::Iterator>(db_->NewIterator(leveldb::ReadOptions()));
@@ -447,36 +520,16 @@ bool GatewayState::loadNodesLocked()
     }
     return it->status().ok();
 }
-bool GatewayState::loadDirectoriesLocked()
-{
-    auto it = std::unique_ptr<leveldb::Iterator>(db_->NewIterator(leveldb::ReadOptions()));
-    for (it->Seek("dir:"); it->Valid() && it->key().ToString().rfind("dir:", 0) == 0; it->Next()) {
-        DirectoryMeta directory;
-        if (parseDirectory(it->value().ToString(), directory)) {
-            directories_[catalogPathKey(directory.ownerId, directory.path)] = directory;
-        }
-    }
-    return it->status().ok();
-}
-bool GatewayState::loadObjectsLocked()
-{
-    auto it = std::unique_ptr<leveldb::Iterator>(db_->NewIterator(leveldb::ReadOptions()));
-    for (it->Seek("obj:"); it->Valid() && it->key().ToString().rfind("obj:", 0) == 0; it->Next()) {
-        ObjectMeta object;
-        if (parseObject(it->value().ToString(), object)) {
-            objects_[object.objectId] = object;
-            objectByPath_[catalogPathKey(object.ownerId, childPath(object.parentPath, object.name))] = object.objectId;
-        }
-    }
-    return it->status().ok();
-}
-
 bool GatewayState::backfillLegacyCatalogLocked()
 {
     leveldb::WriteBatch batch;
     bool changed = false;
     const int64_t now = unixSeconds();
-    for (const auto& [fileHash, file] : files_) {
+    auto it = std::unique_ptr<leveldb::Iterator>(db_->NewIterator(leveldb::ReadOptions()));
+    for (it->Seek("f:"); it->Valid() && it->key().ToString().rfind("f:", 0) == 0; it->Next()) {
+        FileMeta file;
+        if (!parseFile(it->value().ToString(), file)) return false;
+        const std::string fileHash = file.fileHash;
         std::string parent;
         std::string name;
         if (!normalizeDirectoryPath(file.dirPath, parent) || !normalizeEntryName(file.fileName, name)) continue;
@@ -486,16 +539,21 @@ bool GatewayState::backfillLegacyCatalogLocked()
             if (component.empty()) continue;
             current = childPath(current, component);
             const std::string key = catalogPathKey(file.ownerId, current);
-            if (directories_.count(key) == 0) {
+            std::string existing;
+            const leveldb::Status status = db_->Get(leveldb::ReadOptions(), "dir:" + key, &existing);
+            if (!status.ok() && !status.IsNotFound()) return false;
+            if (status.IsNotFound()) {
                 DirectoryMeta directory{file.ownerId, current, now};
-                directories_[key] = directory;
                 batch.Put("dir:" + key, directoryValue(directory));
                 changed = true;
             }
         }
 
         const std::string pathKey = catalogPathKey(file.ownerId, childPath(parent, name));
-        if (objectByPath_.count(pathKey) != 0) continue;
+        std::string existing;
+        const leveldb::Status status = db_->Get(leveldb::ReadOptions(), "path:" + pathKey, &existing);
+        if (!status.ok() && !status.IsNotFound()) return false;
+        if (status.ok()) continue;
         ObjectMeta object;
         object.objectId = "legacy-" + fileHash;
         object.ownerId = file.ownerId;
@@ -505,13 +563,11 @@ bool GatewayState::backfillLegacyCatalogLocked()
         object.fileSize = file.fileSize;
         object.state = file.state;
         object.createdAt = file.createdAt;
-        objects_[object.objectId] = object;
-        objectByPath_[pathKey] = object.objectId;
         batch.Put("obj:" + object.objectId, objectValue(object));
         batch.Put("path:" + pathKey, object.objectId);
         changed = true;
     }
-    return !changed || db_->Write(leveldb::WriteOptions(), &batch).ok();
+    return it->status().ok() && (!changed || db_->Write(leveldb::WriteOptions(), &batch).ok());
 }
 
 //调度算法
@@ -636,7 +692,11 @@ void GatewayState::releaseLeasesForNodeLocked(const std::string& nodeId)
 //
 GatewayState::GatewayState(const std::string& dbPath)
     : dbPath_(dbPath),
-      objectCache_(ObjectMetaCache::Config{kObjectCacheMaxEntries, kObjectCacheMaxBytes})
+      objectCache_(ObjectMetaCache::Config{kObjectCacheMaxEntries, kObjectCacheMaxBytes}),
+      fileCache_(FileMetaCache::Config{kFileCacheMaxEntries, kFileCacheMaxBytes}),
+      routeCache_(ChunkRouteCache::Config{kRouteCacheMaxEntries, kRouteCacheMaxBytes}),
+      catalogCache_(CatalogCache::Config{kCatalogCacheMaxEntries, kCatalogCacheMaxBytes}),
+      manifestCache_(ManifestCache::Config{kManifestCacheMaxEntries, kManifestCacheMaxBytes})
 {
 }
 GatewayState::~GatewayState() = default;
@@ -649,8 +709,7 @@ bool GatewayState::open()
     leveldb::DB* raw = nullptr;
     if(!leveldb::DB::Open(options, dbPath_, &raw).ok()) return false;
     db_.reset(raw);
-    return loadNodesLocked() && loadSessionsLocked() && loadFilesLocked() && loadRoutesLocked() &&
-           loadDeleteTasksLocked() && loadDirectoriesLocked() && loadObjectsLocked() &&
+    return loadNodesLocked() && loadSessionsLocked() && loadDeleteTasksLocked() &&
            backfillLegacyCatalogLocked();
 }
 
@@ -660,9 +719,11 @@ bool GatewayState::registerNode(const NodeRecord& node)
     if(node.nodeId.empty() || node.address.empty() || !hasCapability(node, "storage")) return false;
     std::lock_guard<std::mutex> lock(mutex_);
     const bool firstRegistration = nodeRecords_.find(node.nodeId) == nodeRecords_.end();
+    if (!db_->Put(leveldb::WriteOptions(), "n:"+node.nodeId, nodeValue(node)).ok()) return false;
     nodeRecords_[node.nodeId] = node;
     if(firstRegistration) nodeRuntime_[node.nodeId].state = NodeLiveState::kRecovering;
-    return db_->Put(leveldb::WriteOptions(), "n:"+node.nodeId, nodeValue(node)).ok();
+    manifestCache_.clear();
+    return true;
 }
 bool GatewayState::heartbeat(const std::string& nodeId, const NodeRuntime& runtime)
 {
@@ -816,7 +877,8 @@ CommitChunkStatus GatewayState::commitChunk(const std::string& sessionId, uint32
     sessionIt->second.completed[index] = {index, chunkHash, size};
     sessionIt->second.lastActivityAt = unixSeconds();
     //真实chunk元数据落盘
-    ChunkRoute& route = routes_[chunkHash];
+    ChunkRoute route;
+    if (!getRouteLocked(chunkHash, route)) route = {};
     route.chunkHash = chunkHash;
     route.size = size;
     route.updateAt = unixSeconds();
@@ -828,6 +890,11 @@ CommitChunkStatus GatewayState::commitChunk(const std::string& sessionId, uint32
         }
     }
     const bool persisted = persistRouteLocked(route) && persistSessionLocked(sessionIt->second);
+    if (persisted) {
+        routeCache_.put(chunkHash, std::make_shared<const ChunkRoute>(route),
+                        estimatedRouteBytes(route), kRouteCacheTtlSeconds);
+        manifestCache_.clear();
+    }
     if(persisted) releaseLeaseLocked(leaseId);
     return persisted ? CommitChunkStatus::kCommitted : CommitChunkStatus::kInvalidRequest;
 }
@@ -863,9 +930,10 @@ FileCommitStatus GatewayState::commitFile(const std::string& sessionId, FileMeta
         if(chunk == sessionIt->second.completed.end()) return FileCommitStatus::kInvalidRequest;
         out.chunkHashes.push_back(chunk->second.chunkHash);
         manifest += chunk->second.chunkHash + ":" + std::to_string(chunk->second.size) + ";";
-        const auto route = routes_.find(chunk->second.chunkHash);
-        if(route == routes_.end() || route->second.replicas.size() < 2)
-        out.state = FileState::kProtecting;
+        ChunkRoute route;
+        if (!getRouteLocked(chunk->second.chunkHash, route) || route.replicas.size() < 2) {
+            out.state = FileState::kProtecting;
+        }
     }
     out.fileHash = sha256Hex(manifest.data(), manifest.size());
     std::string parentPath;
@@ -877,7 +945,10 @@ FileCommitStatus GatewayState::commitFile(const std::string& sessionId, FileMeta
     out.fileName = name;
 
     const std::string pathKey = catalogPathKey(out.ownerId, childPath(parentPath, name));
-    if (objectByPath_.count(pathKey) != 0) return FileCommitStatus::kPathConflict;
+    std::string existingObjectId;
+    const leveldb::Status pathStatus = db_->Get(leveldb::ReadOptions(), "path:" + pathKey, &existingObjectId);
+    if (pathStatus.ok()) return FileCommitStatus::kPathConflict;
+    if (!pathStatus.IsNotFound()) return FileCommitStatus::kInvalidRequest;
 
     ObjectMeta object;
     object.objectId = randomId();
@@ -897,63 +968,69 @@ FileCommitStatus GatewayState::commitFile(const std::string& sessionId, FileMeta
         if (component.empty()) continue;
         current = childPath(current, component);
         const std::string directoryKey = catalogPathKey(out.ownerId, current);
-        if (directories_.count(directoryKey) == 0) {
+        std::string existingDirectory;
+        const leveldb::Status directoryStatus = db_->Get(
+            leveldb::ReadOptions(), "dir:" + directoryKey, &existingDirectory);
+        if (!directoryStatus.ok() && !directoryStatus.IsNotFound()) return FileCommitStatus::kInvalidRequest;
+        if (directoryStatus.IsNotFound()) {
             DirectoryMeta directory{out.ownerId, current, out.createdAt};
-            directories_[directoryKey] = directory;
             batch.Put("dir:" + directoryKey, directoryValue(directory));
         }
     }
-    if (files_.count(out.fileHash) == 0) {
-        files_[out.fileHash] = out;
+    std::string existingFile;
+    const leveldb::Status fileStatus = db_->Get(leveldb::ReadOptions(), "f:" + out.fileHash, &existingFile);
+    if (!fileStatus.ok() && !fileStatus.IsNotFound()) return FileCommitStatus::kInvalidRequest;
+    if (fileStatus.IsNotFound()) {
         batch.Put("f:" + out.fileHash, fileValue(out));
     }
     batch.Put("obj:" + object.objectId, objectValue(object));
     batch.Put("path:" + pathKey, object.objectId);
     if (!db_->Write(leveldb::WriteOptions(), &batch).ok()) return FileCommitStatus::kInvalidRequest;
 
-    objects_[object.objectId] = object;
-    objectByPath_[pathKey] = object.objectId;
     objectCache_.erase(object.objectId);
+    fileCache_.erase(out.fileHash);
+    catalogCache_.clear();
+    manifestCache_.erase(out.fileHash);
     return FileCommitStatus::kCommitted;
 }
 bool GatewayState::getFile(const std::string& fileHash, FileMeta& out) const
 {
     //false -- 没找到， true 找到
     std::lock_guard<std::mutex> lock(mutex_);
-    const auto it = files_.find(fileHash);
-    if(it == files_.end()) return false;
-    out = it->second;
-    return true;
+    return getFileLocked(fileHash, out);
 }
 bool GatewayState::getRoute(const std::string& chunkHash, ChunkRoute& out) const
 {
     std::lock_guard<std::mutex> lock(mutex_);
-    const auto it = routes_.find(chunkHash);
-    if(it == routes_.end()) return false;
-    out = it->second;
-    return true;
+    return getRouteLocked(chunkHash, out);
 }
 
 bool GatewayState::buildManifestSnapshot(const std::string& fileHash,
                                          ManifestSnapshot& out) const
 {
     std::lock_guard<std::mutex> lock(mutex_);
-    const auto file = files_.find(fileHash);
-    if(file == files_.end()) return false;
+    if (const auto cached = manifestCache_.get(fileHash)) {
+        out = *cached;
+        return true;
+    }
+    FileMeta file;
+    if (!getFileLocked(fileHash, file)) return false;
 
     ManifestSnapshot snapshot;
-    snapshot.file = file->second;
+    snapshot.file = file;
     snapshot.routes.reserve(snapshot.file.chunkHashes.size());
     for(const auto& chunkHash : snapshot.file.chunkHashes) {
-        const auto route = routes_.find(chunkHash);
-        if(route == routes_.end()) return false;
-        snapshot.routes.push_back(route->second);
-        for(const auto& nodeId : route->second.replicas) {
+        ChunkRoute route;
+        if (!getRouteLocked(chunkHash, route)) return false;
+        snapshot.routes.push_back(route);
+        for(const auto& nodeId : route.replicas) {
             const auto node = nodeRecords_.find(nodeId);
             if(node == nodeRecords_.end()) return false;
             snapshot.nodes.emplace(nodeId, node->second);
         }
     }
+    manifestCache_.put(fileHash, std::make_shared<const ManifestSnapshot>(snapshot),
+                       estimatedManifestBytes(snapshot), kManifestCacheTtlSeconds);
     out = std::move(snapshot);
     return true;
 }
@@ -966,42 +1043,57 @@ bool GatewayState::createDirectory(const std::string& parentPath, const std::str
     if (!normalizeDirectoryPath(parentPath, parent) || !normalizeEntryName(name, entryName)) return false;
 
     std::lock_guard<std::mutex> lock(mutex_);
-    if (parent != "/" && directories_.count(catalogPathKey("admin", parent)) == 0) return false;
+    DirectoryMeta parentDirectory;
+    if (parent != "/" && !getDirectoryLocked("admin", parent, parentDirectory)) return false;
     const std::string path = childPath(parent, entryName);
     const std::string key = catalogPathKey("admin", path);
-    if (directories_.count(key) != 0 || objectByPath_.count(key) != 0) return false;
+    std::string existingDirectory;
+    const leveldb::Status directoryStatus = db_->Get(leveldb::ReadOptions(), "dir:" + key, &existingDirectory);
+    if (directoryStatus.ok() || !directoryStatus.IsNotFound()) return false;
+    std::string existingObjectId;
+    const leveldb::Status objectStatus = db_->Get(leveldb::ReadOptions(), "path:" + key, &existingObjectId);
+    if (objectStatus.ok() || !objectStatus.IsNotFound()) return false;
 
     DirectoryMeta directory;
     directory.path = path;
     directory.createdAt = unixSeconds();
     if (!persistDirectoryLocked(directory)) return false;
-    directories_[key] = directory;
+    catalogCache_.erase(parent);
     if (out != nullptr) *out = directory;
     return true;
 }
 
-bool GatewayState::listCatalog(const std::string& path, CatalogSnapshot& out) const
+bool GatewayState::buildCatalogSnapshotLocked(const std::string& normalized,
+                                              CatalogSnapshot& out) const
 {
-    std::string normalized;
-    if (!normalizeDirectoryPath(path, normalized)) return false;
-    std::lock_guard<std::mutex> lock(mutex_);
-    if (normalized != "/" && directories_.count(catalogPathKey("admin", normalized)) == 0) return false;
-
     CatalogSnapshot snapshot;
     snapshot.path = normalized;
     snapshot.breadcrumbs = breadcrumbsFor(normalized);
-    for (const auto& [key, directory] : directories_) {
-        (void)key;
+
+    auto directoryIt = std::unique_ptr<leveldb::Iterator>(db_->NewIterator(leveldb::ReadOptions()));
+    for (directoryIt->Seek("dir:"); directoryIt->Valid() &&
+         directoryIt->key().ToString().rfind("dir:", 0) == 0; directoryIt->Next()) {
+        DirectoryMeta directory;
+        if (!parseDirectory(directoryIt->value().ToString(), directory)) return false;
         if (directory.ownerId == "admin" && directory.path != normalized &&
             directory.path.rfind(normalized == "/" ? "/" : normalized + "/", 0) == 0) {
             const std::string suffix = directory.path.substr(normalized == "/" ? 1 : normalized.size() + 1);
-            if (suffix.find('/') == std::string::npos) snapshot.directories.push_back(directory);
+            if (suffix.find('/') == std::string::npos) snapshot.directories.push_back(std::move(directory));
         }
     }
-    for (const auto& [objectId, object] : objects_) {
-        (void)objectId;
-        if (object.ownerId == "admin" && object.parentPath == normalized) snapshot.files.push_back(object);
+    if (!directoryIt->status().ok()) return false;
+
+    auto objectIt = std::unique_ptr<leveldb::Iterator>(db_->NewIterator(leveldb::ReadOptions()));
+    for (objectIt->Seek("obj:"); objectIt->Valid() &&
+         objectIt->key().ToString().rfind("obj:", 0) == 0; objectIt->Next()) {
+        ObjectMeta object;
+        if (!parseObject(objectIt->value().ToString(), object)) return false;
+        if (object.ownerId == "admin" && object.parentPath == normalized) {
+            snapshot.files.push_back(std::move(object));
+        }
     }
+    if (!objectIt->status().ok()) return false;
+
     std::sort(snapshot.directories.begin(), snapshot.directories.end(),
               [](const DirectoryMeta& left, const DirectoryMeta& right) { return left.path < right.path; });
     std::sort(snapshot.files.begin(), snapshot.files.end(),
@@ -1010,25 +1102,29 @@ bool GatewayState::listCatalog(const std::string& path, CatalogSnapshot& out) co
     return true;
 }
 
-bool GatewayState::getObject(const std::string& objectId, ObjectMeta& out) const
+bool GatewayState::listCatalog(const std::string& path, CatalogSnapshot& out) const
 {
+    std::string normalized;
+    if (!normalizeDirectoryPath(path, normalized)) return false;
     std::lock_guard<std::mutex> lock(mutex_);
-    const auto cached = objectCache_.get(objectId);
-    if (cached) {
+    if (const auto cached = catalogCache_.get(normalized)) {
         out = *cached;
         return true;
     }
-
-    if (!db_) return false;
-    std::string value;
-    if (!db_->Get(leveldb::ReadOptions(), "obj:" + objectId, &value).ok()) return false;
-
-    ObjectMeta object;
-    if (!parseObject(value, object) || object.objectId != objectId) return false;
-    objectCache_.put(objectId, std::make_shared<const ObjectMeta>(object),
-                     estimatedObjectBytes(object), kObjectCacheTtlSeconds);
-    out = std::move(object);
+    DirectoryMeta directory;
+    if (normalized != "/" && !getDirectoryLocked("admin", normalized, directory)) return false;
+    CatalogSnapshot snapshot;
+    if (!buildCatalogSnapshotLocked(normalized, snapshot)) return false;
+    catalogCache_.put(normalized, std::make_shared<const CatalogSnapshot>(snapshot),
+                      estimatedCatalogBytes(snapshot), kCatalogCacheTtlSeconds);
+    out = std::move(snapshot);
     return true;
+}
+
+bool GatewayState::getObject(const std::string& objectId, ObjectMeta& out) const
+{
+    std::lock_guard<std::mutex> lock(mutex_);
+    return getObjectLocked(objectId, out);
 }
 
 ObjectMetaCache::Stats GatewayState::objectCacheStats() const
@@ -1037,11 +1133,31 @@ ObjectMetaCache::Stats GatewayState::objectCacheStats() const
     return objectCache_.stats();
 }
 
+CatalogCache::Stats GatewayState::catalogCacheStats() const
+{
+    std::lock_guard<std::mutex> lock(mutex_);
+    return catalogCache_.stats();
+}
+
+ManifestCache::Stats GatewayState::manifestCacheStats() const
+{
+    std::lock_guard<std::mutex> lock(mutex_);
+    return manifestCache_.stats();
+}
+
+MetadataCacheUsage GatewayState::metadataCacheUsage() const
+{
+    std::lock_guard<std::mutex> lock(mutex_);
+    return {objectCache_.size(), fileCache_.size(), routeCache_.size(),
+            catalogCache_.size(), manifestCache_.size()};
+}
+
 DeleteStatus GatewayState::deleteObject(const std::string& objectId)
 {
     if (objectId.empty()) return DeleteStatus::kInvalidRequest;
     std::lock_guard<std::mutex> lock(mutex_);
-    if (objects_.count(objectId) == 0) return DeleteStatus::kNotFound;
+    ObjectMeta object;
+    if (!getObjectLocked(objectId, object)) return DeleteStatus::kNotFound;
     return deleteCatalogEntriesLocked({objectId}, {});
 }
 
@@ -1054,23 +1170,34 @@ DeleteStatus GatewayState::deleteDirectory(const std::string& path)
 
     std::lock_guard<std::mutex> lock(mutex_);
     const std::string rootKey = catalogPathKey("admin", normalized);
-    if (directories_.count(rootKey) == 0) return DeleteStatus::kNotFound;
+    DirectoryMeta rootDirectory;
+    if (!getDirectoryLocked("admin", normalized, rootDirectory)) return DeleteStatus::kNotFound;
 
     std::vector<std::string> objectIds;
     std::vector<std::string> directoryKeys;
     const std::string prefix = normalized + "/";
-    for (const auto& [objectId, object] : objects_) {
+    auto objectIt = std::unique_ptr<leveldb::Iterator>(db_->NewIterator(leveldb::ReadOptions()));
+    for (objectIt->Seek("obj:"); objectIt->Valid() && objectIt->key().ToString().rfind("obj:", 0) == 0; objectIt->Next()) {
+        ObjectMeta object;
+        if (!parseObject(objectIt->value().ToString(), object)) return DeleteStatus::kInvalidRequest;
+        const std::string objectId = object.objectId;
         if (object.ownerId == "admin" &&
             (object.parentPath == normalized || object.parentPath.rfind(prefix, 0) == 0)) {
             objectIds.push_back(objectId);
         }
     }
-    for (const auto& [key, directory] : directories_) {
+    if (!objectIt->status().ok()) return DeleteStatus::kInvalidRequest;
+    auto directoryIt = std::unique_ptr<leveldb::Iterator>(db_->NewIterator(leveldb::ReadOptions()));
+    for (directoryIt->Seek("dir:"); directoryIt->Valid() && directoryIt->key().ToString().rfind("dir:", 0) == 0; directoryIt->Next()) {
+        DirectoryMeta directory;
+        if (!parseDirectory(directoryIt->value().ToString(), directory)) return DeleteStatus::kInvalidRequest;
+        const std::string key = catalogPathKey(directory.ownerId, directory.path);
         if (directory.ownerId == "admin" &&
             (directory.path == normalized || directory.path.rfind(prefix, 0) == 0)) {
             directoryKeys.push_back(key);
         }
     }
+    if (!directoryIt->status().ok()) return DeleteStatus::kInvalidRequest;
     return deleteCatalogEntriesLocked(objectIds, directoryKeys);
 }
 
@@ -1110,7 +1237,8 @@ bool GatewayState::acknowledgeDelete(const std::string& chunkHash, const std::st
     if (!db_->Write(leveldb::WriteOptions(), &batch).ok()) return false;
     if (next.pendingNodeIds.empty()) {
         deleteTasks_.erase(taskIt);
-        routes_.erase(chunkHash);
+        routeCache_.erase(chunkHash);
+        manifestCache_.clear();
     } else {
         taskIt->second = std::move(next);
     }
@@ -1122,9 +1250,9 @@ DeleteStatus GatewayState::deleteCatalogEntriesLocked(const std::vector<std::str
 {
     std::map<std::string, ObjectMeta> targets;
     for (const auto& objectId : objectIds) {
-        const auto object = objects_.find(objectId);
-        if (object == objects_.end()) return DeleteStatus::kNotFound;
-        targets.emplace(objectId, object->second);
+        ObjectMeta object;
+        if (!getObjectLocked(objectId, object)) return DeleteStatus::kNotFound;
+        targets.emplace(objectId, std::move(object));
     }
 
     std::set<std::string> targetFileHashes;
@@ -1134,25 +1262,29 @@ DeleteStatus GatewayState::deleteCatalogEntriesLocked(const std::vector<std::str
     }
 
     std::set<std::string> survivingFileHashes;
-    for (const auto& [objectId, object] : objects_) {
-        if (targets.count(objectId) == 0) survivingFileHashes.insert(object.fileHash);
+    auto objectIt = std::unique_ptr<leveldb::Iterator>(db_->NewIterator(leveldb::ReadOptions()));
+    for (objectIt->Seek("obj:"); objectIt->Valid() && objectIt->key().ToString().rfind("obj:", 0) == 0; objectIt->Next()) {
+        ObjectMeta object;
+        if (!parseObject(objectIt->value().ToString(), object)) return DeleteStatus::kInvalidRequest;
+        if (targets.count(object.objectId) == 0) survivingFileHashes.insert(object.fileHash);
     }
+    if (!objectIt->status().ok()) return DeleteStatus::kInvalidRequest;
 
     std::set<std::string> survivingChunks;
     for (const auto& fileHash : survivingFileHashes) {
-        const auto file = files_.find(fileHash);
-        if (file == files_.end()) return DeleteStatus::kInvalidRequest;
-        survivingChunks.insert(file->second.chunkHashes.begin(), file->second.chunkHashes.end());
+        FileMeta file;
+        if (!getFileLocked(fileHash, file)) return DeleteStatus::kInvalidRequest;
+        survivingChunks.insert(file.chunkHashes.begin(), file.chunkHashes.end());
     }
 
     std::set<std::string> removableFiles;
     std::set<std::string> removableChunks;
     for (const auto& fileHash : targetFileHashes) {
         if (survivingFileHashes.count(fileHash) != 0) continue;
-        const auto file = files_.find(fileHash);
-        if (file == files_.end()) return DeleteStatus::kInvalidRequest;
+        FileMeta file;
+        if (!getFileLocked(fileHash, file)) return DeleteStatus::kInvalidRequest;
         removableFiles.insert(fileHash);
-        for (const auto& chunkHash : file->second.chunkHashes) {
+        for (const auto& chunkHash : file.chunkHashes) {
             if (survivingChunks.count(chunkHash) == 0) removableChunks.insert(chunkHash);
         }
     }
@@ -1161,13 +1293,13 @@ DeleteStatus GatewayState::deleteCatalogEntriesLocked(const std::vector<std::str
     const int64_t now = unixSeconds();
     for (const auto& chunkHash : removableChunks) {
         if (deleteTasks_.count(chunkHash) != 0) continue;
-        const auto route = routes_.find(chunkHash);
-        if (route == routes_.end() || route->second.replicas.empty()) {
+        ChunkRoute route;
+        if (!getRouteLocked(chunkHash, route) || route.replicas.empty()) {
             return DeleteStatus::kInvalidRequest;
         }
         DeleteTask task;
         task.chunkHash = chunkHash;
-        task.pendingNodeIds = route->second.replicas;
+        task.pendingNodeIds = route.replicas;
         std::sort(task.pendingNodeIds.begin(), task.pendingNodeIds.end());
         task.pendingNodeIds.erase(std::unique(task.pendingNodeIds.begin(), task.pendingNodeIds.end()),
                                   task.pendingNodeIds.end());
@@ -1191,11 +1323,12 @@ DeleteStatus GatewayState::deleteCatalogEntriesLocked(const std::vector<std::str
 
     for (const auto& [objectId, object] : targets) {
         objectCache_.erase(objectId);
-        objects_.erase(objectId);
-        objectByPath_.erase(catalogPathKey(object.ownerId, childPath(object.parentPath, object.name)));
     }
-    for (const auto& directoryKey : directoryKeys) directories_.erase(directoryKey);
-    for (const auto& fileHash : removableFiles) files_.erase(fileHash);
+    for (const auto& fileHash : removableFiles) {
+        fileCache_.erase(fileHash);
+        manifestCache_.erase(fileHash);
+    }
+    catalogCache_.clear();
     for (const auto& [chunkHash, task] : newTasks) deleteTasks_[chunkHash] = task;
     return DeleteStatus::kDeleted;
 }
@@ -1204,16 +1337,6 @@ DeleteStatus GatewayState::deleteCatalogEntriesLocked(const std::vector<std::str
 
 }
 }
-
-
-
-
-
-
-
-
-
-
 
 
 

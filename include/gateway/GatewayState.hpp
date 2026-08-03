@@ -161,6 +161,19 @@ struct ManifestSnapshot {
     std::map<std::string, NodeRecord> nodes;
 };
 
+using FileMetaCache = LruCache<std::string, FileMeta>;
+using ChunkRouteCache = LruCache<std::string, ChunkRoute>;
+using CatalogCache = LruCache<std::string, CatalogSnapshot>;
+using ManifestCache = LruCache<std::string, ManifestSnapshot>;
+
+struct MetadataCacheUsage {
+    size_t objectEntries = 0;
+    size_t fileEntries = 0;
+    size_t routeEntries = 0;
+    size_t catalogEntries = 0;
+    size_t manifestEntries = 0;
+};
+
 struct DeleteTaskSnapshot {
     std::string chunkHash;
     std::vector<std::string> pendingNodeIds;
@@ -205,6 +218,9 @@ public:
     bool listCatalog(const std::string& path, CatalogSnapshot& out) const;
     bool getObject(const std::string& objectId, ObjectMeta& out) const;
     ObjectMetaCache::Stats objectCacheStats() const;
+    CatalogCache::Stats catalogCacheStats() const;
+    ManifestCache::Stats manifestCacheStats() const;
+    MetadataCacheUsage metadataCacheUsage() const;
     DeleteStatus deleteObject(const std::string& objectId);
     DeleteStatus deleteDirectory(const std::string& path);
     std::vector<DeleteTaskSnapshot> pendingDeletesForNode(const std::string& nodeId) const;
@@ -221,34 +237,34 @@ private:
     void releaseExpiredLeasesLocked(int64_t now);
     void releaseLeasesForNodeLocked(const std::string& nodeId);
     bool persistSessionLocked(const SessionState& session);
-    bool persistFileLocked(const FileMeta& file);
     bool persistRouteLocked(const ChunkRoute& route);
     bool persistDirectoryLocked(const DirectoryMeta& directory);
-    bool persistObjectLocked(const ObjectMeta& object);
+    bool getFileLocked(const std::string& fileHash, FileMeta& out) const;
+    bool getRouteLocked(const std::string& chunkHash, ChunkRoute& out) const;
+    bool getDirectoryLocked(const std::string& ownerId, const std::string& path,
+                            DirectoryMeta& out) const;
+    bool getObjectLocked(const std::string& objectId, ObjectMeta& out) const;
+    bool objectIdAtPathLocked(const std::string& pathKey, std::string& objectId) const;
+    bool buildCatalogSnapshotLocked(const std::string& normalized, CatalogSnapshot& out) const;
     bool loadDeleteTasksLocked();
     DeleteStatus deleteCatalogEntriesLocked(const std::vector<std::string>& objectIds,
                                             const std::vector<std::string>& directoryKeys);
     bool loadSessionsLocked();
-    bool loadFilesLocked();
-    bool loadRoutesLocked();
     bool loadNodesLocked();
-    bool loadDirectoriesLocked();
-    bool loadObjectsLocked();
     bool backfillLegacyCatalogLocked();
 
     std::string dbPath_;
     std::unique_ptr<leveldb::DB> db_;
     mutable std::mutex mutex_; //可以再静态函数里面修改
     mutable ObjectMetaCache objectCache_;
+    mutable FileMetaCache fileCache_;
+    mutable ChunkRouteCache routeCache_;
+    mutable CatalogCache catalogCache_;
+    mutable ManifestCache manifestCache_;
     //内存索引，加速，不用一直查询leveldb，leveldb备份
     std::map<std::string, NodeRecord>   nodeRecords_;
     std::map<std::string, NodeRuntime>  nodeRuntime_;
     std::map<std::string, SessionState> sessions_;
-    std::map<std::string, FileMeta>     files_;
-    std::map<std::string, ChunkRoute>   routes_;
-    std::map<std::string, DirectoryMeta> directories_;
-    std::map<std::string, ObjectMeta> objects_;
-    std::map<std::string, std::string> objectByPath_;
     std::map<std::string, DeleteTask> deleteTasks_;
     std::map<std::string, WriteLease> leases_;
     std::map<std::string, std::string> leaseByRequestKey_;
@@ -260,8 +276,6 @@ private:
 
 }
 }
-
-
 
 
 

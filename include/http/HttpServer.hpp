@@ -8,6 +8,7 @@
 #include "http/HttpResponse.hpp"
 #include "http/HttpContext.hpp"
 #include "http/DeferredResponse.hpp"
+#include "utils/AsyncLogger.hpp"
 #include "utils/ThreadPool.hpp"
 #include <algorithm>
 #include <asm-generic/errno-base.h>
@@ -138,9 +139,10 @@ private:
                         httpCallback_(req, resp.get(), conn, deferred);
 
                         loop_->queueInLoop([this, conn, resp, ctxPtr](){
-                            std::cout << "[SEND] isSendFile=" << resp->isSendFile() 
-                            << " path=" << resp->bodyFilePath() 
-                            << " size=" << resp->bodyFileSize() << std::endl;
+                            miniKV::utils::logDebug(
+                                "event=http_response_send file_body=" +
+                                std::to_string(resp->isSendFile()) + " file_size=" +
+                                std::to_string(resp->bodyFileSize()));
                             network::Buffer outBuf;
                             resp->appendToBuffer(&outBuf);
                             conn->send(std::string(outBuf.peek(), outBuf.readableBytes()));
@@ -224,4 +226,3 @@ private:
 
 
 }
-

@@ -1,5 +1,6 @@
 #include "agent/NodeAgentConfig.hpp"
 #include "agent/ProcessSupervisor.hpp"
+#include "utils/AsyncLogger.hpp"
 
 #include <cerrno>
 #include <chrono>
@@ -49,6 +50,12 @@ ChildSpec childSpec(const ManagedServiceConfig& service, const NodeAgentConfig& 
     spec.stdoutPath = service.logs.stdoutPath;
     spec.stderrPath = service.logs.stderrPath;
     spec.restart = service.restart;
+    spec.environment["MINIKV_V2_NODE_ID"] = config.nodeId;
+    spec.environment["MINIKV_V2_LOG_FILE"] = service.logging.filePath;
+    spec.environment["MINIKV_V2_LOG_LEVEL"] = service.logging.level;
+    spec.environment["MINIKV_V2_LOG_QUEUE_SIZE"] = std::to_string(service.logging.queueSize);
+    spec.environment["MINIKV_V2_LOG_ROTATE_BYTES"] = std::to_string(service.logging.rotateBytes);
+    spec.environment["MINIKV_V2_LOG_ROTATE_FILES"] = std::to_string(service.logging.rotateFiles);
     if(service.type == ServiceType::kGateway) {
         spec.argv = {spec.executable, std::to_string(service.listenPort), service.dataDir};
     } else {
@@ -104,8 +111,16 @@ int main(int argc, char** argv)
 看看有没有“正在等待复活时间”的孩子（restartPending），如果当前时间到了约定时间（now >= restartAt），立即把它重新生出来（调用 spawn）。
     */
         const NodeAgentConfig config = miniKV::agent::loadNodeAgentConfigFile(configPath);
+        const std::filesystem::path agentLogPath = std::filesystem::path(configPath).parent_path() /
+                                                    "logs" / "node-agent.log";
+        if(!miniKV::utils::initAsyncLogger(miniKV::utils::asyncLoggerConfigFromEnvironment(
+               "node_agent", config.nodeId, agentLogPath.string()))) {
+            std::cerr << "cannot initialize node agent async logger\n";
+        }
         const std::string secret = miniKV::agent::readClusterSecret(config.secretFile);
         miniKV::agent::ProcessSupervisor supervisor(secret);
+        miniKV::utils::logInfo("event=agent_started config=" + configPath +
+                               " node=" + config.nodeId);
 
         sigset_t signals;
         ::sigemptyset(&signals);
@@ -123,6 +138,7 @@ int main(int argc, char** argv)
             std::filesystem::create_directories(service.dataDir);
             createParentDirectory(service.logs.stdoutPath);
             createParentDirectory(service.logs.stderrPath);
+            createParentDirectory(service.logging.filePath);
             supervisor.start(childSpec(service, config, binaryDirectory));
         }
 
@@ -150,8 +166,12 @@ int main(int argc, char** argv)
             if(!stopping) supervisor.startDueRestarts(now);
         }
         ::close(signalFd);
+        miniKV::utils::logInfo("event=agent_stopped");
+        miniKV::utils::shutdownAsyncLogger();
         return 0;
     } catch(const std::exception& error) {
+        miniKV::utils::logError("event=agent_failed error=" + std::string(error.what()));
+        miniKV::utils::shutdownAsyncLogger();
         std::cerr << "node agent failed: " << error.what() << '\n';
         return 1;
     }

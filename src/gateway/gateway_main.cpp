@@ -7,6 +7,7 @@
 #include "utils/Util.hpp"
 #include "http/DeferredResponse.hpp"
 #include "http/AsyncHttpClient.hpp"
+#include "utils/AsyncLogger.hpp"
 
 #include <algorithm>
 #include <cstdlib>
@@ -38,6 +39,12 @@ std::string configuredSecret(int argc, char** argv) {
     if (argc > 3) return argv[3];
     if (const char* value = std::getenv("MINIKV_V2_CLUSTER_SECRET")) return value;
     return {};
+}
+
+std::string configuredNodeId()
+{
+    if(const char* value = std::getenv("MINIKV_V2_NODE_ID")) return value;
+    return "-";
 }
 
 std::vector<ChunkRouteRequest> parseRouteRequests(const std::string& body) {
@@ -162,9 +169,17 @@ int main(int argc, char** argv) {
         return 2;
     }
     std::filesystem::create_directories(dataDir);
+    if(!miniKV::utils::initAsyncLogger(miniKV::utils::asyncLoggerConfigFromEnvironment(
+           "gateway", configuredNodeId(), dataDir + "/logs/gateway.log"))) {
+        std::cerr << "cannot initialize Gateway async logger\n";
+    }
     std::string stateDir = dataDir + "/metadata";
     GatewayState state(stateDir);
-    if (!state.open()) { std::cerr << "cannot open Gateway metadata\n"; return 1; }
+    if (!state.open()) {
+        miniKV::utils::logError("event=gateway_metadata_open_failed path=" + stateDir);
+        std::cerr << "cannot open Gateway metadata\n";
+        return 1;
+    }
 
     ThreadPool workers(4);
     EventLoop loop;
@@ -192,15 +207,14 @@ int main(int argc, char** argv) {
                     (miniKV::http::HttpClientResponse response, std::string error) {
                     deleteRequestsInFlight.erase(requestKey);
                     if(!error.empty() || response.status < 200 || response.status >= 300) {
-                        std::cerr << "delete dispatch " << chunkHash << " to " << nodeId
-                                  << " failed: "
-                                  << (error.empty() ? "HTTP " + std::to_string(response.status) : error)
-                                  << '\n';
+                        miniKV::utils::logWarn("event=delete_dispatch_failed chunk=" + chunkHash +
+                                               " node=" + nodeId + " error=" +
+                                               (error.empty() ? "http_" + std::to_string(response.status) : error));
                         return;
                     }
                     if(!state.acknowledgeDelete(chunkHash, nodeId)) {
-                        std::cerr << "delete dispatch " << chunkHash << " to " << nodeId
-                                  << " could not persist ACK\n";
+                        miniKV::utils::logError("event=delete_ack_persist_failed chunk=" + chunkHash +
+                                                " node=" + nodeId);
                     }
                 });
             }
@@ -214,7 +228,14 @@ int main(int argc, char** argv) {
         if (request.method() == HttpRequest::kPost && path == "/api/v2/nodes/register") {
             if (!constantTimeEquals(request.getHeader("X-Cluster-Internal-Token"), clusterSecret)) { json(response, 403, jsonError("invalid cluster token")); return; }
             NodeRecord node; node.nodeId = jsonString(body, "nodeId"); node.address = jsonString(body, "address"); node.httpPort = static_cast<uint16_t>(jsonUint(body, "httpPort", 9002)); node.maxStorageBytes = jsonUint(body, "maxStorageBytes"); node.reservedBytes = jsonUint(body, "reservedBytes"); node.maxConcurrentWrites = static_cast<uint32_t>(jsonUint(body, "maxConcurrentWrites", 2)); node.capabilities = {"storage"};
-            if (!state.registerNode(node)) json(response, 400, jsonError("invalid node registration")); else json(response, 200, "{\"status\":\"registered\"}");
+            if (!state.registerNode(node)) {
+                json(response, 400, jsonError("invalid node registration"));
+            } else {
+                miniKV::utils::logInfo("event=node_registered node=" + node.nodeId +
+                                       " address=" + node.address + " port=" +
+                                       std::to_string(node.httpPort));
+                json(response, 200, "{\"status\":\"registered\"}");
+            }
             return;
         }
         if (request.method() == HttpRequest::kPost && beginsWith(path, "/api/v2/nodes/") && path.find("/heartbeat") != std::string::npos) {
@@ -259,6 +280,9 @@ int main(int argc, char** argv) {
 
             UploadPreflightResult result;
             const PreflightStatus status = state.preflightUpload(preflight, result);
+            miniKV::utils::logInfo("event=upload_preflight status=" + std::to_string(static_cast<int>(status)) +
+                                   " file=" + preflight.fileName + " chunks=" +
+                                   std::to_string(preflight.chunks.size()));
             if (status == PreflightStatus::kPathConflict) {
                 json(response, 409, jsonError("a file already exists at this path"));
             } else if (status == PreflightStatus::kContentExists) {
@@ -286,6 +310,9 @@ int main(int argc, char** argv) {
             const auto requests = parseRouteRequests(body);
             std::vector<PlacementPlan> plans;
             const RoutePlanStatus routeStatus = state.planRoutes(id, requests, plans);
+            miniKV::utils::logInfo("event=route_plan session=" + id + " chunks=" +
+                                   std::to_string(requests.size()) + " status=" +
+                                   std::to_string(static_cast<int>(routeStatus)));
             if (requests.empty() || plans.size() != requests.size() ||
                 routeStatus != RoutePlanStatus::kOk) {
                 if (routeStatus == RoutePlanStatus::kNoCapacity) {
@@ -344,6 +371,10 @@ int main(int argc, char** argv) {
             const CommitChunkStatus status = state.commitChunk(
                 jsonString(body, "sessionId"), static_cast<uint32_t>(jsonUint(body, "chunkIndex")),
                 jsonString(body, "chunkHash"), jsonUint(body, "size"), nodes, capability.leaseId);
+            miniKV::utils::logInfo("event=chunk_commit session=" + capability.sessionId + " index=" +
+                                   std::to_string(capability.chunkIndex) + " replicas=" +
+                                   std::to_string(nodes.size()) + " status=" +
+                                   std::to_string(static_cast<int>(status)));
             if (status == CommitChunkStatus::kInvalidRequest) {
                 json(response, 400, jsonError("invalid chunk commit"));
             } else {
@@ -372,6 +403,8 @@ int main(int argc, char** argv) {
         if (request.method() == HttpRequest::kPost && beginsWith(path, "/api/v2/upload/sessions/") && path.size() > 7 && path.rfind("/commit") == path.size() - 7) {
             FileMeta file;
             const FileCommitStatus status = state.commitFile(pathTail(path, "/api/v2/upload/sessions/", "/commit"), file);
+            miniKV::utils::logInfo("event=file_commit status=" + std::to_string(static_cast<int>(status)) +
+                                   " object=" + file.objectId + " file=" + file.fileHash);
             if (status == FileCommitStatus::kPathConflict) {
                 json(response, 409, jsonError("a file already exists at this path"));
                 return;
@@ -453,6 +486,7 @@ int main(int argc, char** argv) {
     });
     loop.runAfter(0, dispatchPendingDeletes);
     server.start();
-    std::cout << "V2 Gateway listening on :" << port << "\n";
+    miniKV::utils::logInfo("event=gateway_started port=" + std::to_string(port) +
+                           " metadata_dir=" + stateDir);
     loop.loop();
 }

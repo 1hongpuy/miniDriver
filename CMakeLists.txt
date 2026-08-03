@@ -59,6 +59,11 @@ find_library(LEVELDB_LIB leveldb REQUIRED)
 find_path(LEVELDB_INC leveldb/db.h REQUIRED)
 find_package(OpenSSL REQUIRED)
 find_package(yaml-cpp REQUIRED)
+find_package(spdlog REQUIRED)
+
+target_link_libraries(minikv_utils PUBLIC spdlog::spdlog)
+target_link_libraries(minikv_http PUBLIC minikv_utils)
+target_link_libraries(minikv_agent PUBLIC minikv_utils)
 
 add_library(minikv_benchmark STATIC
     src/benchmark/BenchmarkCli.cpp
@@ -247,6 +252,22 @@ add_executable(test_lru_cache test/test_lru_cache.cpp)
 target_include_directories(test_lru_cache PRIVATE include)
 target_link_libraries(test_lru_cache PRIVATE pthread)
 
+add_executable(test_async_logger test/test_async_logger.cpp)
+target_include_directories(test_async_logger PRIVATE include)
+target_link_libraries(test_async_logger PRIVATE minikv_utils pthread)
+
+add_executable(test_node_agent_logging_config test/test_node_agent_logging_config.cpp)
+target_include_directories(test_node_agent_logging_config PRIVATE include)
+target_link_libraries(test_node_agent_logging_config PRIVATE minikv_agent yaml-cpp pthread)
+
+add_executable(test_replica_upload_metrics test/test_replica_upload_metrics.cpp)
+target_include_directories(test_replica_upload_metrics PRIVATE include)
+target_link_libraries(test_replica_upload_metrics PRIVATE pthread)
+
+add_executable(test_process_supervisor test/test_process_supervisor.cpp)
+target_include_directories(test_process_supervisor PRIVATE include)
+target_link_libraries(test_process_supervisor PRIVATE minikv_agent pthread)
+
 add_executable(test_write_admission test/test_write_admission.cpp)
 target_include_directories(test_write_admission PRIVATE include)
 target_link_libraries(test_write_admission PRIVATE pthread)
@@ -287,6 +308,10 @@ if(BUILD_TESTING)
     add_test(NAME gateway_metadata_lazy_load COMMAND test_gateway_metadata_lazy_load)
     add_test(NAME gateway_upload_preflight COMMAND test_gateway_upload_preflight)
     add_test(NAME lru_cache COMMAND test_lru_cache)
+    add_test(NAME async_logger COMMAND test_async_logger)
+    add_test(NAME node_agent_logging_config COMMAND test_node_agent_logging_config)
+    add_test(NAME replica_upload_metrics COMMAND test_replica_upload_metrics)
+    add_test(NAME process_supervisor COMMAND test_process_supervisor)
     add_test(NAME datanode_delete
              COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/test/test_v2_datanode_delete.sh
                           ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/minikv_v2_datanode)

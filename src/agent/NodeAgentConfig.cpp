@@ -3,6 +3,7 @@
 #include <yaml-cpp/yaml.h>
 
 #include <fstream>
+#include <filesystem>
 #include <set>
 #include <sstream>
 #include <stdexcept>
@@ -59,6 +60,36 @@ RestartPolicy parseRestart(const YAML::Node& node)
     return policy;
 }
 
+bool isLogLevel(const std::string& level)
+{
+    return level == "trace" || level == "debug" || level == "info" ||
+           level == "warn" || level == "error" || level == "critical" ||
+           level == "off";
+}
+
+ServiceLoggingConfig parseLogging(const YAML::Node& node,
+                                  const std::string& dataDir,
+                                  const std::string& serviceId)
+{
+    ServiceLoggingConfig config;
+    config.filePath = (std::filesystem::path(dataDir) / "logs" /
+                       (serviceId + ".log")).string();
+    if(!node) return config;
+    if(!node.IsMap()) invalid("logging must be a map");
+
+    if(node["file"]) config.filePath = node["file"].as<std::string>();
+    if(node["level"]) config.level = node["level"].as<std::string>();
+    if(node["queueSize"]) config.queueSize = node["queueSize"].as<uint32_t>();
+    if(node["rotateBytes"]) config.rotateBytes = node["rotateBytes"].as<uint64_t>();
+    if(node["rotateFiles"]) config.rotateFiles = node["rotateFiles"].as<uint32_t>();
+
+    if(config.filePath.empty() || !isLogLevel(config.level) || config.queueSize == 0 ||
+       config.rotateBytes == 0 || config.rotateFiles == 0) {
+        invalid("invalid logging configuration");
+    }
+    return config;
+}
+
 NodeAgentConfig parse(const YAML::Node& root)
 {
     if(!root || !root.IsMap()) invalid("root must be a map");
@@ -99,6 +130,7 @@ NodeAgentConfig parse(const YAML::Node& root)
             if(logs["stderr"]) service.logs.stderrPath = logs["stderr"].as<std::string>();
         }
         if(service.id.empty() || service.dataDir.empty()) invalid("empty service id or dataDir");
+        service.logging = parseLogging(serviceNode["logging"], service.dataDir, service.id);
         if(!ids.insert(service.id).second) invalid("duplicate service id " + service.id);
         if(!ports.insert(service.listenPort).second) invalid("duplicate listenPort");
         hasEnabledDataNode = hasEnabledDataNode || (service.enabled && service.type == ServiceType::kDataNode);

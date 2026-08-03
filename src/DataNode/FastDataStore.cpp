@@ -1,6 +1,7 @@
 #include "DataNode/FastDataStore.hpp"
 #include "utils/Util.hpp"
 
+#include <chrono>
 #include <cerrno>
 #include <filesystem>
 #include <fcntl.h>
@@ -15,6 +16,19 @@
 namespace miniKV::datanode {
 
 using namespace util;
+
+namespace {
+
+using Clock = std::chrono::steady_clock;
+
+uint64_t elapsedNanoseconds(Clock::time_point started, Clock::time_point finished)
+{
+    if(finished <= started) return 0;
+    return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+        finished - started).count());
+}
+
+}  // namespace
 
 FastDataStore::FastDataStore(std::string dataDirectory)
     : dataDirectory_(std::move(dataDirectory)) {}
@@ -49,11 +63,15 @@ bool FastDataStore::WriteSession::append(const char* bytes, size_t size) {
         failed_ = true;
         return false;
     }
-    if (EVP_DigestUpdate(static_cast<EVP_MD_CTX*>(digestContext_), bytes, size) != 1) {
+    const auto hashStarted = Clock::now();
+    const int hashResult = EVP_DigestUpdate(static_cast<EVP_MD_CTX*>(digestContext_), bytes, size);
+    metrics_.shaUpdateNanoseconds += elapsedNanoseconds(hashStarted, Clock::now());
+    if (hashResult != 1) {
         failed_ = true;
         return false;
     }
     if (!discard_) {
+        const auto writeStarted = Clock::now();
         size_t written = 0;
         while (written < size) {
             const ssize_t n = ::pwrite(store_->dataFd_, bytes + written, size - written,
@@ -64,6 +82,7 @@ bool FastDataStore::WriteSession::append(const char* bytes, size_t size) {
             }
             written += static_cast<size_t>(n);
         }
+        metrics_.pwriteNanoseconds += elapsedNanoseconds(writeStarted, Clock::now());
     }
     writtenBytes_ += size;
     return true;
@@ -72,6 +91,7 @@ bool FastDataStore::WriteSession::append(const char* bytes, size_t size) {
 bool FastDataStore::WriteSession::finish(bool& alreadyExists) {
     alreadyExists = false;
     if (finished_ || failed_ || writtenBytes_ != expectedSize_) return false;
+    const auto finalizeStarted = Clock::now();
     unsigned char digest[EVP_MAX_MD_SIZE];
     unsigned int digestSize = 0;
     if (EVP_DigestFinal_ex(static_cast<EVP_MD_CTX*>(digestContext_), digest, &digestSize) != 1) {
@@ -86,10 +106,13 @@ bool FastDataStore::WriteSession::finish(bool& alreadyExists) {
         actualHash += kHex[digest[i] & 0x0f];
     }
     if (actualHash != expectedHash_) {
+        metrics_.shaFinalizeNanoseconds += elapsedNanoseconds(finalizeStarted, Clock::now());
         failed_ = true;
         return false;
     }
+    metrics_.shaFinalizeNanoseconds += elapsedNanoseconds(finalizeStarted, Clock::now());
 
+    const auto indexStarted = Clock::now();
     std::lock_guard<std::mutex> lock(store_->mutex_);
     PhysicalExtent existing;
     if (store_->findExtentLocked(expectedHash_, existing)) {
@@ -103,6 +126,7 @@ bool FastDataStore::WriteSession::finish(bool& alreadyExists) {
         // The matching extent was already present when the request started.
         alreadyExists = true;
     }
+    metrics_.indexNanoseconds += elapsedNanoseconds(indexStarted, Clock::now());
     finished_ = true;
     return true;
 }

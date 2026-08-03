@@ -1,5 +1,6 @@
 #include "utils/AsyncLogger.hpp"
 
+#include <chrono>
 #include <filesystem>
 #include <cerrno>
 #include <cstdlib>
@@ -84,6 +85,9 @@ bool initAsyncLogger(const AsyncLoggerConfig& config)
         gLogger->set_pattern("ts=%Y-%m-%dT%H:%M:%S.%e%z level=%l tid=%t %v");
         gLogger->set_level(level);
         spdlog::register_logger(gLogger);
+        // Control-plane events can be sparse; make them observable without
+        // waiting for process shutdown or an internal stdio buffer to fill.
+        spdlog::flush_every(std::chrono::seconds(1));
         gProcessName = config.processName;
         gNodeId = config.nodeId;
         return true;

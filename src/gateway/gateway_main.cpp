@@ -10,6 +10,7 @@
 #include "utils/AsyncLogger.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <cstdlib>
 #include <filesystem>
 #include <iostream>
@@ -23,6 +24,15 @@ using miniKV::utils::ThreadPool;
 using namespace miniKV::util;
 using namespace miniKV::gateway;
 namespace {
+
+using Clock = std::chrono::steady_clock;
+
+uint64_t elapsedMicroseconds(Clock::time_point started, Clock::time_point finished)
+{
+    if(finished <= started) return 0;
+    return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
+        finished - started).count());
+}
 
 bool beginsWith(const std::string& value, const std::string& prefix) { return value.rfind(prefix, 0) == 0; }
 std::string pathTail(const std::string& path, const std::string& prefix, const std::string& suffix = "") {
@@ -279,10 +289,12 @@ int main(int argc, char** argv) {
             preflight.chunks = parseRouteRequests(body);
 
             UploadPreflightResult result;
+            const auto preflightStarted = Clock::now();
             const PreflightStatus status = state.preflightUpload(preflight, result);
             miniKV::utils::logInfo("event=upload_preflight status=" + std::to_string(static_cast<int>(status)) +
                                    " file=" + preflight.fileName + " chunks=" +
-                                   std::to_string(preflight.chunks.size()));
+                                   std::to_string(preflight.chunks.size()) + " elapsed_us=" +
+                                   std::to_string(elapsedMicroseconds(preflightStarted, Clock::now())));
             if (status == PreflightStatus::kPathConflict) {
                 json(response, 409, jsonError("a file already exists at this path"));
             } else if (status == PreflightStatus::kContentExists) {
@@ -297,7 +309,12 @@ int main(int argc, char** argv) {
         }
         if (request.method() == HttpRequest::kPost && path == "/api/v2/upload/sessions") {
             SessionState session;
-            if (!state.createSession(jsonString(body, "fileName"), jsonString(body, "dirPath"), jsonUint(body, "fileSize"), static_cast<uint32_t>(jsonUint(body, "chunkSize")), session)) { json(response, 400, jsonError("fileName and positive fileSize are required")); return; }
+            const auto sessionStarted = Clock::now();
+            const bool created = state.createSession(jsonString(body, "fileName"), jsonString(body, "dirPath"), jsonUint(body, "fileSize"), static_cast<uint32_t>(jsonUint(body, "chunkSize")), session);
+            miniKV::utils::logInfo("event=upload_session_create created=" +
+                                   std::string(created ? "true" : "false") + " elapsed_us=" +
+                                   std::to_string(elapsedMicroseconds(sessionStarted, Clock::now())));
+            if (!created) { json(response, 400, jsonError("fileName and positive fileSize are required")); return; }
             json(response, 200, "{\"sessionId\":\"" + session.sessionId + "\",\"chunkSize\":" + std::to_string(session.chunkSize) + ",\"totalChunks\":" + std::to_string(session.totalChunks) + "}"); return;
         }
         if (request.method() == HttpRequest::kGet && beginsWith(path, "/api/v2/upload/sessions/")) {
@@ -309,10 +326,12 @@ int main(int argc, char** argv) {
             const std::string id = pathTail(path, "/api/v2/upload/sessions/", "/routes");
             const auto requests = parseRouteRequests(body);
             std::vector<PlacementPlan> plans;
+            const auto routeStarted = Clock::now();
             const RoutePlanStatus routeStatus = state.planRoutes(id, requests, plans);
             miniKV::utils::logInfo("event=route_plan session=" + id + " chunks=" +
                                    std::to_string(requests.size()) + " status=" +
-                                   std::to_string(static_cast<int>(routeStatus)));
+                                   std::to_string(static_cast<int>(routeStatus)) + " elapsed_us=" +
+                                   std::to_string(elapsedMicroseconds(routeStarted, Clock::now())));
             if (requests.empty() || plans.size() != requests.size() ||
                 routeStatus != RoutePlanStatus::kOk) {
                 if (routeStatus == RoutePlanStatus::kNoCapacity) {
@@ -368,13 +387,15 @@ int main(int argc, char** argv) {
                 capability.chunkHash != jsonString(body, "chunkHash") ||
                 capability.chunkSize != jsonUint(body, "size")) { json(response, 400, jsonError("invalid upload capability")); return; }
             const std::vector<std::string> nodes = split(jsonString(body, "successfulNodes"), ',');
+            const auto chunkCommitStarted = Clock::now();
             const CommitChunkStatus status = state.commitChunk(
                 jsonString(body, "sessionId"), static_cast<uint32_t>(jsonUint(body, "chunkIndex")),
                 jsonString(body, "chunkHash"), jsonUint(body, "size"), nodes, capability.leaseId);
             miniKV::utils::logInfo("event=chunk_commit session=" + capability.sessionId + " index=" +
                                    std::to_string(capability.chunkIndex) + " replicas=" +
                                    std::to_string(nodes.size()) + " status=" +
-                                   std::to_string(static_cast<int>(status)));
+                                   std::to_string(static_cast<int>(status)) + " elapsed_us=" +
+                                   std::to_string(elapsedMicroseconds(chunkCommitStarted, Clock::now())));
             if (status == CommitChunkStatus::kInvalidRequest) {
                 json(response, 400, jsonError("invalid chunk commit"));
             } else {
@@ -402,9 +423,11 @@ int main(int argc, char** argv) {
         }
         if (request.method() == HttpRequest::kPost && beginsWith(path, "/api/v2/upload/sessions/") && path.size() > 7 && path.rfind("/commit") == path.size() - 7) {
             FileMeta file;
+            const auto fileCommitStarted = Clock::now();
             const FileCommitStatus status = state.commitFile(pathTail(path, "/api/v2/upload/sessions/", "/commit"), file);
             miniKV::utils::logInfo("event=file_commit status=" + std::to_string(static_cast<int>(status)) +
-                                   " object=" + file.objectId + " file=" + file.fileHash);
+                                   " object=" + file.objectId + " file=" + file.fileHash + " elapsed_us=" +
+                                   std::to_string(elapsedMicroseconds(fileCommitStarted, Clock::now())));
             if (status == FileCommitStatus::kPathConflict) {
                 json(response, 409, jsonError("a file already exists at this path"));
                 return;
@@ -423,7 +446,12 @@ int main(int argc, char** argv) {
             const std::string objectId = pathTail(path, "/api/v2/objects/", "/manifest");
             ObjectMeta object;
             ManifestSnapshot snapshot;
-            if (!state.getObject(objectId, object) || !state.buildManifestSnapshot(object.fileHash, snapshot)) {
+            const auto manifestStarted = Clock::now();
+            const bool found = state.getObject(objectId, object) && state.buildManifestSnapshot(object.fileHash, snapshot);
+            miniKV::utils::logInfo("event=object_manifest object=" + objectId +
+                                   " found=" + std::string(found ? "true" : "false") + " elapsed_us=" +
+                                   std::to_string(elapsedMicroseconds(manifestStarted, Clock::now())));
+            if (!found) {
                 json(response, 404, jsonError("object not found or manifest is incomplete"));
             } else {
                 json(response, 200, manifestJson(snapshot));

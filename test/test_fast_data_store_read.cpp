@@ -1,4 +1,5 @@
 #include "DataNode/FastDataStore.hpp"
+#include "utils/Util.hpp"
 
 #include <filesystem>
 #include <iostream>
@@ -17,8 +18,16 @@ int main() {
     bool alreadyExists = false;
     {
         miniKV::datanode::FastDataStore store(directory.string());
-        if (!store.open() || !store.put(hash, bytes, alreadyExists) || alreadyExists) {
+        auto session = store.open() ? store.beginPut(hash, bytes.size()) : nullptr;
+        if (session == nullptr || !session->append(bytes.data(), bytes.size()) ||
+            !session->finish(alreadyExists) || alreadyExists) {
             std::cerr << "FAIL: cannot persist known SHA-256 chunk\n";
+            return 1;
+        }
+        const auto& metrics = session->metrics();
+        if (metrics.shaUpdateNanoseconds == 0 || metrics.pwriteNanoseconds == 0 ||
+            metrics.shaFinalizeNanoseconds == 0 || metrics.indexNanoseconds == 0) {
+            std::cerr << "FAIL: write session did not expose stage timings\n";
             return 1;
         }
 

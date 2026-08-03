@@ -19,6 +19,13 @@ struct FileRegion { off_t offset = 0; size_t length = 0; };
 
 class FastDataStore {
 public:
+    struct WriteMetrics {
+        uint64_t shaUpdateNanoseconds = 0;
+        uint64_t pwriteNanoseconds = 0;
+        uint64_t shaFinalizeNanoseconds = 0;
+        uint64_t indexNanoseconds = 0;
+    };
+
     class WriteSession {
     public:
         ~WriteSession();
@@ -27,6 +34,7 @@ public:
         bool finish(bool& alreadyExists);
         void abort();
         uint64_t writtenBytes() const { return writtenBytes_; }
+        const WriteMetrics& metrics() const { return metrics_; }
 
     private:
         friend class FastDataStore;
@@ -42,6 +50,7 @@ public:
         bool discard_ = false;
         bool finished_ = false;
         bool failed_ = false;
+        WriteMetrics metrics_;
     };
 
     explicit FastDataStore(std::string dataDirectory);

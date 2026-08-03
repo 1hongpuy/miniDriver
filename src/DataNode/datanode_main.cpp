@@ -347,13 +347,19 @@ private:
         if(response_ == nullptr) return;
         const auto completedAt = Clock::now();
         if(replicaPipe_ != nullptr) replicaMetrics_ = replicaPipe_->metrics();
+        const FastDataStore::WriteMetrics writeMetrics = writer_ == nullptr
+            ? FastDataStore::WriteMetrics{} : writer_->metrics();
         const std::string line = std::string(status == 200 ? "event=chunk_complete" : "event=chunk_failed") +
             " chunk=" + chunkHash_ + " session=" + capability_.sessionId +
             " index=" + std::to_string(capability_.chunkIndex) + " http_status=" +
             std::to_string(status) + " bytes=" + std::to_string(capability_.chunkSize) +
             " replicas=" + std::to_string(successfulNodes_.size()) +
             " total_ms=" + std::to_string(elapsedMilliseconds(acceptedAt_, completedAt)) +
-            " local_write_ms=" + std::to_string(elapsedMilliseconds(firstBodyAt_, localFinishedAt_)) +
+            " body_receive_ms=" + std::to_string(elapsedMilliseconds(firstBodyAt_, localFinishedAt_)) +
+            " sha_update_us=" + std::to_string(writeMetrics.shaUpdateNanoseconds / 1000ULL) +
+            " pwrite_us=" + std::to_string(writeMetrics.pwriteNanoseconds / 1000ULL) +
+            " sha_finalize_us=" + std::to_string(writeMetrics.shaFinalizeNanoseconds / 1000ULL) +
+            " index_us=" + std::to_string(writeMetrics.indexNanoseconds / 1000ULL) +
             " replica_ms=" + std::to_string(elapsedMilliseconds(localFinishedAt_, replicaFinishedAt_)) +
             " gateway_commit_ms=" + std::to_string(elapsedMilliseconds(
                 gatewayCommitStartedAt_, gatewayCommitFinishedAt_)) +

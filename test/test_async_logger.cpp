@@ -5,6 +5,7 @@
 #include <filesystem>
 #include <fstream>
 #include <string>
+#include <thread>
 
 int main()
 {
@@ -25,6 +26,15 @@ int main()
     MINIKV_CHECK(miniKV::utils::initAsyncLogger(config));
     miniKV::utils::logDebug("event=logger_debug_hidden");
     miniKV::utils::logInfo("event=logger_test session=session-1 bytes=42");
+
+    // Gateway control-plane traffic can be sparse. The record must become
+    // observable without requiring process shutdown or a full stdio buffer.
+    std::this_thread::sleep_for(std::chrono::milliseconds(1200));
+    std::ifstream visibleInput(path);
+    const std::string visibleContent((std::istreambuf_iterator<char>(visibleInput)),
+                                     std::istreambuf_iterator<char>());
+    MINIKV_CHECK(visibleContent.find("event=logger_test") != std::string::npos);
+
     miniKV::utils::shutdownAsyncLogger();
 
     MINIKV_CHECK(miniKV::utils::initAsyncLogger(config));

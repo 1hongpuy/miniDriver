@@ -193,6 +193,10 @@ target_link_libraries(test_gateway_delete PRIVATE
     OpenSSL::Crypto
 )
 
+add_executable(test_lru_cache test/test_lru_cache.cpp)
+target_include_directories(test_lru_cache PRIVATE include)
+target_link_libraries(test_lru_cache PRIVATE pthread)
+
 add_executable(test_write_admission test/test_write_admission.cpp)
 target_include_directories(test_write_admission PRIVATE include)
 target_link_libraries(test_write_admission PRIVATE pthread)
@@ -227,6 +231,7 @@ if(BUILD_TESTING)
     add_test(NAME gateway_manifest_snapshot COMMAND test_gateway_manifest_snapshot)
     add_test(NAME gateway_catalog COMMAND test_gateway_catalog)
     add_test(NAME gateway_delete COMMAND test_gateway_delete)
+    add_test(NAME lru_cache COMMAND test_lru_cache)
     add_test(NAME datanode_delete
              COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/test/test_v2_datanode_delete.sh
                           ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/minikv_v2_datanode)

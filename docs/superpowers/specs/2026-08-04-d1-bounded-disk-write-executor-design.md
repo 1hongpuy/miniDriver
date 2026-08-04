@@ -93,17 +93,20 @@ diskBlockBytes                 64 KiB
 diskBlockCount                 128
 ```
 
-The body callback returns `kPause` after accepting the current owned block when
-either queue high watermark is reached. `HttpContext` retains later unconsumed
-bytes and the connection disables `EPOLLIN`. Worker completion queues an
-EventLoop callback. When both the per-upload and global queues are below their
-low watermarks, that callback resumes the HTTP body parser and `EPOLLIN`.
+The body callback returns `kPause` only after accepting and copying the current
+owned block when its per-upload high watermark is reached. `HttpContext` then
+retains later unconsumed bytes and the connection disables `EPOLLIN`. Worker
+completion queues an EventLoop callback. When the per-upload queue is below its
+low watermark, that callback resumes the HTTP body parser and `EPOLLIN`.
 
 The queue is deliberately byte-bounded rather than task-count-bounded because
-the memory risk comes from body bytes, not task metadata. If an upload cannot
-copy its current block because the global executor is already full, it must
-return `kPause` without accepting it; the parser keeps that input block for a
-later retry.
+the memory risk comes from body bytes, not task metadata. D1 keeps the existing
+`maxConcurrentWrites = 2` and limits each active upload to 1 MiB. Therefore at
+most roughly 2 MiB of blocks are leased, well below the 8 MiB pool. A failed
+pool acquisition is treated as an internal resource invariant violation and
+returns an explicit upload error rather than returning `kPause` after failing to
+own the current input bytes. General global-pool waiter registration, which
+would require a new HTTP result meaning “pause without consume”, is deferred.
 
 `HttpContext` already limits one streaming body callback to 64 KiB. The executor
 therefore allocates its 128 reusable 64 KiB blocks at startup, matching the

@@ -33,6 +33,10 @@ int main()
     MINIKV_CHECK(wrote.load());
     MINIKV_CHECK(executor.tryAcquireBlock().has_value());
 
+    std::promise<void> finalized;
+    MINIKV_CHECK(executor.submitTask([&finalized] { finalized.set_value(); }));
+    MINIKV_CHECK(finalized.get_future().wait_for(std::chrono::seconds(1)) == std::future_status::ready);
+
     std::cout << "PASS: bounded disk executor reuses fixed blocks\n";
     return 0;
 }

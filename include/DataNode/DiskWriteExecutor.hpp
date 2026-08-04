@@ -53,6 +53,7 @@ public:
     };
 
     using Work = std::function<void(BlockLease)>;
+    using Task = std::function<void()>;
 
     DiskWriteExecutor();
     explicit DiskWriteExecutor(Config config);
@@ -63,6 +64,7 @@ public:
 
     std::optional<BlockLease> tryAcquireBlock();
     bool submit(BlockLease block, Work work);
+    bool submitTask(Task task);
     Metrics metrics() const;
     void stop();
 
@@ -74,6 +76,7 @@ private:
     struct WorkItem {
         BlockLease block;
         Work work;
+        Task task;
     };
 
     void release(uint16_t index);

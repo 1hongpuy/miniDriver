@@ -92,6 +92,20 @@ bool DiskWriteExecutor::submit(BlockLease block, Work work)
     return true;
 }
 
+bool DiskWriteExecutor::submitTask(Task task)
+{
+    if(!task) return false;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if(stopping_) return false;
+        WorkItem item;
+        item.task = std::move(task);
+        readyQueue_.push_back(std::move(item));
+    }
+    cv_.notify_one();
+    return true;
+}
+
 DiskWriteExecutor::Metrics DiskWriteExecutor::metrics() const
 {
     std::lock_guard<std::mutex> lock(mutex_);
@@ -131,7 +145,8 @@ void DiskWriteExecutor::workerMain()
         }
 
         try {
-            item.work(std::move(item.block));
+            if(item.work) item.work(std::move(item.block));
+            else item.task();
         } catch(...) {
             // The owning upload pipeline reports its own write failure.
         }

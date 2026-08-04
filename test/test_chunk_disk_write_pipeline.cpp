@@ -87,6 +87,60 @@ int main()
         return 1;
     }
 
+    DiskWriteExecutor::Config pausedConfig;
+    pausedConfig.workerCount = 1;
+    pausedConfig.blockCount = 32;
+    DiskWriteExecutor pausedExecutor(pausedConfig);
+    std::promise<void> blockerStarted;
+    std::promise<void> unblockWorker;
+    const auto unblock = unblockWorker.get_future().share();
+    if(!pausedExecutor.submitTask([&blockerStarted, unblock] {
+        blockerStarted.set_value();
+        unblock.wait();
+    }) || blockerStarted.get_future().wait_for(std::chrono::seconds(1)) !=
+            std::future_status::ready) {
+        std::cerr << "FAIL: cannot gate disk worker for backpressure test\n";
+        return 1;
+    }
+
+    auto pausedSession = store.beginPut(hash, 16 * DiskWriteExecutor::kBlockBytes);
+    if(pausedSession == nullptr) {
+        std::cerr << "FAIL: cannot create paused pipeline session\n";
+        return 1;
+    }
+    miniKV::network::EventLoop pausedLoop;
+    std::thread pausedLoopThread([&pausedLoop] { pausedLoop.loop(); });
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    std::promise<bool> paused;
+    pausedLoop.queueInLoop([&] {
+        auto pipeline = ChunkDiskWritePipeline::create(
+            &pausedLoop, pausedExecutor,
+            std::shared_ptr<miniKV::datanode::FastDataStore::WriteSession>(std::move(pausedSession)),
+            [] {});
+        auto result = miniKV::http::HttpContext::BodyConsumeResult::kContinue;
+        for(size_t i = 0; i < 16; ++i) {
+            result = pipeline->push(bytes.data(), DiskWriteExecutor::kBlockBytes);
+        }
+        const bool hitHighWatermark =
+            result == miniKV::http::HttpContext::BodyConsumeResult::kPause &&
+            pipeline->metrics().queuedBytes == 16 * DiskWriteExecutor::kBlockBytes &&
+            pipeline->metrics().pauseCount == 1;
+        pipeline->cancel();
+        paused.set_value(hitHighWatermark);
+        pausedLoop.quit();
+    });
+    auto pausedResult = paused.get_future();
+    if(pausedResult.wait_for(std::chrono::seconds(3)) != std::future_status::ready ||
+       !pausedResult.get()) {
+        std::cerr << "FAIL: disk queue did not apply its high-watermark pause\n";
+        unblockWorker.set_value();
+        pausedLoop.quit();
+        pausedLoopThread.join();
+        return 1;
+    }
+    unblockWorker.set_value();
+    pausedLoopThread.join();
+
     std::filesystem::remove_all(directory, error);
     std::cout << "PASS: chunk disk write pipeline serializes blocks and finishes off-loop\n";
     return 0;

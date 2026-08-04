@@ -8,6 +8,8 @@
 #include "http/AsyncHttpClient.hpp"
 #include "http/CorsPolicy.hpp"
 #include "DataNode/FastDataStore.hpp"
+#include "DataNode/ChunkDiskWritePipeline.hpp"
+#include "DataNode/DiskWriteExecutor.hpp"
 #include "DataNode/HttpGatewayControlClient.hpp"
 #include "DataNode/ReplicaUploadPipe.hpp"
 #include "DataNode/WriteAdmission.hpp"
@@ -147,11 +149,13 @@ public:
     using Clock = std::chrono::steady_clock;
 
     ChunkUploadStream(EventLoop* loop, FastDataStore& store, WriteAdmission& writeAdmission,
+                      DiskWriteExecutor& diskExecutor,
                       std::string nodeId, GatewayControlClient& gatewayControl,
                       std::string gatewayAddress, uint16_t gatewayPort,
                       std::string clusterSecret, CorsPolicy corsPolicy,
                       std::string requestOrigin, const HttpRequest& request, std::string chunkHash)
-        : loop_(loop), store_(store), writeAdmission_(writeAdmission), nodeId_(std::move(nodeId)),
+        : loop_(loop), store_(store), writeAdmission_(writeAdmission), diskExecutor_(diskExecutor),
+            nodeId_(std::move(nodeId)),
             gatewayControl_(gatewayControl),
             gatewayAddress_(std::move(gatewayAddress)), gatewayPort_(gatewayPort),
             clusterSecret_(std::move(clusterSecret)), corsPolicy_(std::move(corsPolicy)),
@@ -161,11 +165,26 @@ public:
         setup(request);
     }
 
-    ~ChunkUploadStream() { releaseActiveWrite(); }
+    ~ChunkUploadStream()
+    {
+        if(diskPipeline_ != nullptr) diskPipeline_->cancel();
+        releaseActiveWrite();
+    }
 
     void startReplica(const TcpConnectionPtr& upstream)
     {
-        if(!error_.empty() || writer_ == nullptr || position_ + 1 >= chain_.size()) return;
+        if(!error_.empty() || writer_ == nullptr) return;
+
+        std::weak_ptr<miniKV::network::TcpConnection> weakUpstream(upstream);
+        diskPipeline_ = ChunkDiskWritePipeline::create(
+            loop_, diskExecutor_, writer_, [weakUpstream] {
+                if(auto connection = weakUpstream.lock()) connection->resumeRead();
+            });
+        if(diskPipeline_ == nullptr) {
+            error_ = "cannot create local disk write pipeline";
+            return;
+        }
+        if(position_ + 1 >= chain_.size()) return;
 
         const ReplicaTarget& target = chain_[position_ + 1];
         ReplicaUploadPipeOptions options;
@@ -186,7 +205,6 @@ public:
             {"X-Replica-Position", std::to_string(position_ + 1)},
             {"X-Upload-Token", uploadToken_}
         };
-        std::weak_ptr<miniKV::network::TcpConnection> weakUpstream(upstream);
         options.resumeUpstream = [weakUpstream] {
             if(auto connection = weakUpstream.lock()) connection->resumeRead();
         };
@@ -202,21 +220,30 @@ public:
     {
         if(firstBodyAt_ == Clock::time_point{}) firstBodyAt_ = Clock::now();
         if(admissionRejected_) return HttpContext::BodyConsumeResult::kContinue;
-        if(!error_.empty() || writer_ == nullptr) return HttpContext::BodyConsumeResult::kAbort;
-        if(!writer_->append(bytes, size)) {
-            error_ = "local streaming write failed";
+        if(!error_.empty() || writer_ == nullptr || diskPipeline_ == nullptr)
+            return HttpContext::BodyConsumeResult::kAbort;
+
+        const auto diskResult = diskPipeline_->push(bytes, size);
+        if(diskResult == HttpContext::BodyConsumeResult::kAbort) {
+            error_ = "local disk write queue rejected body bytes";
             return HttpContext::BodyConsumeResult::kAbort;
         }
-        if(replicaPipe_ == nullptr) return HttpContext::BodyConsumeResult::kContinue;
+        if(replicaPipe_ == nullptr) return diskResult;
 
-        const auto result = replicaPipe_->push(bytes, size);
-        if(result == HttpContext::BodyConsumeResult::kAbort) {
+        const auto replicaResult = replicaPipe_->push(bytes, size);
+        if(replicaResult == HttpContext::BodyConsumeResult::kAbort) {
             error_ = "replica stream rejected body bytes";
+            diskPipeline_->cancel();
             miniKV::utils::logError("event=chunk_replica_body_rejected chunk=" + chunkHash_);
-        } else if(result == HttpContext::BodyConsumeResult::kPause) {
+            return HttpContext::BodyConsumeResult::kAbort;
+        }
+        if(replicaResult == HttpContext::BodyConsumeResult::kPause) {
             miniKV::utils::logDebug("event=chunk_replica_backpressure chunk=" + chunkHash_);
         }
-        return result;
+        return diskResult == HttpContext::BodyConsumeResult::kPause ||
+               replicaResult == HttpContext::BodyConsumeResult::kPause
+            ? HttpContext::BodyConsumeResult::kPause
+            : HttpContext::BodyConsumeResult::kContinue;
     }
 
     void finish(const DeferredResponse::Ptr& deferred)
@@ -230,30 +257,18 @@ public:
             completeClient(503, "DataNode write capacity reached");
             return;
         }
-        if(!error_.empty() || writer_ == nullptr) {
+        if(!error_.empty() || writer_ == nullptr || diskPipeline_ == nullptr) {
             completeClient(400, error_.empty() ? "invalid stream" : error_);
             return;
         }
 
-        bool alreadyExists = false;
-        if(!writer_->finish(alreadyExists)) {
-            miniKV::utils::logError("event=chunk_local_finish_failed chunk=" + chunkHash_ +
-                                    " bytes=" + std::to_string(writer_->writtenBytes()));
-            completeClient(400, "chunk length or SHA-256 verification failed");
-            return;
-        }
-        localFinishedAt_ = Clock::now();
-        miniKV::utils::logDebug("event=chunk_local_finish chunk=" + chunkHash_ +
-                                " bytes=" + std::to_string(writer_->writtenBytes()) +
-                                " replica=" + (replicaPipe_ == nullptr ? "false" : "true"));
-        alreadyExists_ = alreadyExists;
-        successfulNodes_.push_back(nodeId_);
-
-        if(replicaPipe_ == nullptr) {
-            afterReplica();
-            return;
-        }
-        replicaPipe_->finish();
+        std::weak_ptr<ChunkUploadStream> weakSelf(shared_from_this());
+        diskPipeline_->finishInput([weakSelf](bool success, bool alreadyExists) {
+            if(auto self = weakSelf.lock()) self->onLocalFinish(success, alreadyExists);
+        });
+        if(response_ == nullptr) return;
+        if(replicaPipe_ == nullptr) replicaCompleted_ = true;
+        else replicaPipe_->finish();
     }
 
 private:
@@ -284,12 +299,32 @@ private:
             return;
         }
         activeWriteCounted_ = true;
-        writer_ = store_.beginPut(chunkHash_, capability_.chunkSize);
-        if(writer_ == nullptr) {
+        auto writer = store_.beginPut(chunkHash_, capability_.chunkSize);
+        if(writer == nullptr) {
             releaseActiveWrite();
             error_ = "cannot allocate local chunk extent";
             return;
         }
+        writer_ = std::shared_ptr<FastDataStore::WriteSession>(std::move(writer));
+    }
+
+    void onLocalFinish(bool success, bool alreadyExists)
+    {
+        if(response_ == nullptr) return;
+        if(!success) {
+            miniKV::utils::logError("event=chunk_local_finish_failed chunk=" + chunkHash_ +
+                                    " bytes=" + std::to_string(writer_->writtenBytes()));
+            completeClient(400, "chunk length or SHA-256 verification failed");
+            return;
+        }
+        localFinished_ = true;
+        localFinishedAt_ = Clock::now();
+        alreadyExists_ = alreadyExists;
+        successfulNodes_.push_back(nodeId_);
+        miniKV::utils::logDebug("event=chunk_local_finish chunk=" + chunkHash_ +
+                                " bytes=" + std::to_string(writer_->writtenBytes()) +
+                                " replica=" + (replicaPipe_ == nullptr ? "false" : "true"));
+        maybeAfterLocalAndReplica();
     }
 
     void onReplicaComplete(HttpClientResponse response, std::string error)
@@ -311,6 +346,13 @@ private:
                 }
             }
         }
+        replicaCompleted_ = true;
+        maybeAfterLocalAndReplica();
+    }
+
+    void maybeAfterLocalAndReplica()
+    {
+        if(!localFinished_ || !replicaCompleted_) return;
         afterReplica();
     }
 
@@ -349,6 +391,8 @@ private:
         if(replicaPipe_ != nullptr) replicaMetrics_ = replicaPipe_->metrics();
         const FastDataStore::WriteMetrics writeMetrics = writer_ == nullptr
             ? FastDataStore::WriteMetrics{} : writer_->metrics();
+        const ChunkDiskWritePipeline::Metrics diskMetrics = diskPipeline_ == nullptr
+            ? ChunkDiskWritePipeline::Metrics{} : diskPipeline_->metrics();
         const std::string line = std::string(status == 200 ? "event=chunk_complete" : "event=chunk_failed") +
             " chunk=" + chunkHash_ + " session=" + capability_.sessionId +
             " index=" + std::to_string(capability_.chunkIndex) + " http_status=" +
@@ -366,6 +410,9 @@ private:
             " pauses=" + std::to_string(replicaMetrics_.pauseCount) +
             " pause_ms=" + std::to_string(replicaMetrics_.pauseNanoseconds / 1000000ULL) +
             " max_pending_bytes=" + std::to_string(replicaMetrics_.maxPendingBytes) +
+            " disk_queue_peak_bytes=" + std::to_string(diskMetrics.peakQueuedBytes) +
+            " disk_pause_count=" + std::to_string(diskMetrics.pauseCount) +
+            " disk_pause_ms=" + std::to_string(diskMetrics.pauseNanoseconds / 1000000ULL) +
             " error=" + (error.empty() ? "-" : error);
         if(status == 200) miniKV::utils::logInfo(line);
         else miniKV::utils::logError(line);
@@ -393,6 +440,7 @@ private:
         releaseActiveWrite();
         auto deferred = std::move(response_);
         replicaPipe_.reset();
+        diskPipeline_.reset();
         selfHold_.reset();
         deferred->complete(std::move(response));
     }
@@ -415,6 +463,7 @@ private:
     EventLoop* loop_;
     FastDataStore& store_;
     WriteAdmission& writeAdmission_;
+    DiskWriteExecutor& diskExecutor_;
     std::string nodeId_;
     GatewayControlClient& gatewayControl_;
     std::string gatewayAddress_;
@@ -427,7 +476,8 @@ private:
     UploadCapability capability_;
     std::vector<ReplicaTarget> chain_;
     size_t position_ = 0;
-    std::unique_ptr<FastDataStore::WriteSession> writer_;
+    std::shared_ptr<FastDataStore::WriteSession> writer_;
+    ChunkDiskWritePipeline::Ptr diskPipeline_;
     ReplicaUploadPipe::Ptr replicaPipe_;
     DeferredResponse::Ptr response_;
     std::vector<std::string> successfulNodes_;
@@ -436,6 +486,8 @@ private:
     bool alreadyExists_ = false;
     bool activeWriteCounted_ = false;
     bool admissionRejected_ = false;
+    bool localFinished_ = false;
+    bool replicaCompleted_ = false;
     Clock::time_point acceptedAt_{};
     Clock::time_point firstBodyAt_{};
     Clock::time_point localFinishedAt_{};
@@ -488,6 +540,10 @@ int main(int argc, char** argv)
     }
     WriteAdmission writeAdmission(kMaxConcurrentWrites);
     EventLoop loop;
+    DiskWriteExecutor::Config diskConfig;
+    diskConfig.workerCount = 2;
+    diskConfig.blockCount = 128;
+    DiskWriteExecutor diskExecutor(diskConfig);
     HttpGatewayControlClient gatewayControl(&loop, gatewayAddress, gatewayPort, clusterSecret);
 
     std::function<void()> registerNode;
@@ -535,7 +591,8 @@ int main(int argc, char** argv)
     server.setBodyStreamSetup([&](HttpContext* context, const HttpRequest& request,
         const TcpConnectionPtr& upstream) {
         const std::string hash = request.path().substr(std::string("/v2/chunks/").size());
-        auto stream = std::make_shared<ChunkUploadStream>(&loop, store, writeAdmission, nodeId, gatewayControl,
+        auto stream = std::make_shared<ChunkUploadStream>(&loop, store, writeAdmission, diskExecutor,
+        nodeId, gatewayControl,
         gatewayAddress, gatewayPort, clusterSecret, corsPolicy, request.getHeader("Origin"), request, hash);
         stream->startReplica(upstream);
         context->setUserData(stream);

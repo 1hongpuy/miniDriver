@@ -59,9 +59,10 @@ def main():
                     if parsed.path == "/api/v2/catalog":
                         path = parse_qs(parsed.query).get("path", ["/"])[0]
                         route.fulfill(status=200, content_type="application/json", body=json.dumps(catalog(path)))
-                    elif parsed.path == "/api/v2/upload/sessions":
+                    elif parsed.path == "/api/v2/upload/preflight":
                         route.fulfill(status=200, content_type="application/json", body=json.dumps({
-                            "sessionId": "speed-session", "chunkSize": 1024, "totalChunks": 1,
+                            "status": "UPLOAD_REQUIRED", "sessionId": "speed-session",
+                            "chunkSize": 1024, "totalChunks": 1, "completed": [],
                         }))
                     elif parsed.path == "/api/v2/upload/sessions/speed-session/routes":
                         route.fulfill(status=200, content_type="application/json", body=json.dumps({"routes": [{

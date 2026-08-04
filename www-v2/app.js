@@ -319,12 +319,25 @@
     await Promise.all(Array.from({ length: workerCount }, worker));
   }
 
-  async function fetchVerifiedChunk(chunk) {
+  async function fetchVerifiedChunk(chunk, onBytes = () => {}) {
     const replica = chunk.replicas && chunk.replicas[0];
     if (!replica) throw new Error(`Chunk ${chunk.index} 没有可读副本`);
     const response = await fetch(`http://${replica.address}:${replica.httpPort}/v2/chunks/${chunk.hash}`);
     if (!response.ok) throw new Error(`Chunk ${chunk.index} 下载失败: HTTP ${response.status}`);
-    const blob = await response.blob();
+    if (!response.body) throw new Error(`Chunk ${chunk.index} 下载响应没有 body stream`);
+    const reader = response.body.getReader();
+    const blocks = [];
+    try {
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        blocks.push(value);
+        onBytes(value.byteLength);
+      }
+    } finally {
+      reader.releaseLock();
+    }
+    const blob = new Blob(blocks, { type: "application/octet-stream" });
     if (await sha256(blob) !== chunk.hash) throw new Error(`Chunk ${chunk.index} SHA-256 校验失败`);
     return blob;
   }
@@ -345,25 +358,76 @@
     window.setTimeout(() => URL.revokeObjectURL(objectUrl), 60000);
   }
 
-  async function downloadFile(item) {
-    const manifest = await request(`/objects/${item.objectId}/manifest`, { method: "GET" });
-    const fileName = downloadName(item);
-    if (window.isSecureContext && window.showSaveFilePicker) {
-      const handle = await window.showSaveFilePicker({ suggestedName: fileName });
-      const writable = await handle.createWritable();
-      try {
-        for (const chunk of manifest.chunks) await writable.write(await fetchVerifiedChunk(chunk));
-        await writable.close();
-        return;
-      } catch (error) {
-        await writable.abort();
-        throw error;
-      }
+  function createDownloadProgress(button, totalBytes) {
+    const startedAt = performance.now();
+    let receivedBytes = 0;
+    let lastRenderedAt = 0;
+
+    function render(force = false) {
+      const now = performance.now();
+      if (!force && now - lastRenderedAt < 100) return;
+      lastRenderedAt = now;
+      const percent = Math.min(100, Math.floor((receivedBytes / totalBytes) * 100));
+      const elapsedSeconds = Math.max(0.001, (now - startedAt) / 1000);
+      const rate = receivedBytes / elapsedSeconds;
+      button.textContent = `下载中 ${percent}% · ${formatRate(rate)}`;
     }
 
-    const chunkBlobs = [];
-    for (const chunk of manifest.chunks) chunkBlobs.push(await fetchVerifiedChunk(chunk));
-    saveBlob(fileName, chunkBlobs);
+    return {
+      onBytes(count) {
+        receivedBytes += count;
+        render();
+      },
+      complete() {
+        const elapsedSeconds = Math.max(0.001, (performance.now() - startedAt) / 1000);
+        button.textContent = `已下载 · 平均 ${formatRate(receivedBytes / elapsedSeconds)}`;
+        button.disabled = false;
+      },
+      fail(error) {
+        button.textContent = "下载失败";
+        button.title = error.message;
+        button.disabled = false;
+      },
+    };
+  }
+
+  async function downloadFile(item, button) {
+    button.disabled = true;
+    button.textContent = "获取下载清单";
+    let progress = null;
+    try {
+      const manifest = await request(`/objects/${item.objectId}/manifest`, { method: "GET" });
+      progress = createDownloadProgress(button, manifest.fileSize);
+      const fileName = downloadName(item);
+      if (window.isSecureContext && window.showSaveFilePicker) {
+        const handle = await window.showSaveFilePicker({ suggestedName: fileName });
+        const writable = await handle.createWritable();
+        try {
+          for (const chunk of manifest.chunks) {
+            await writable.write(await fetchVerifiedChunk(chunk, progress.onBytes));
+          }
+          await writable.close();
+        } catch (error) {
+          await writable.abort();
+          throw error;
+        }
+      } else {
+        const chunkBlobs = [];
+        for (const chunk of manifest.chunks) {
+          chunkBlobs.push(await fetchVerifiedChunk(chunk, progress.onBytes));
+        }
+        saveBlob(fileName, chunkBlobs);
+      }
+      progress.complete();
+    } catch (error) {
+      if (progress) progress.fail(error);
+      else {
+        button.textContent = "下载失败";
+        button.title = error.message;
+        button.disabled = false;
+      }
+      throw error;
+    }
   }
 
   function emptyState(message) {
@@ -444,10 +508,8 @@
       const downloadButton = document.createElement("button");
       downloadButton.type = "button"; downloadButton.className = "catalog-row__command"; downloadButton.textContent = "下载";
       downloadButton.addEventListener("click", async () => {
-        downloadButton.disabled = true; downloadButton.textContent = "读取中";
-        try { await downloadFile(file); downloadButton.textContent = "已开始"; }
-        catch (error) { downloadButton.textContent = "失败"; window.alert(error.message); }
-        finally { window.setTimeout(() => { downloadButton.disabled = false; downloadButton.textContent = "下载"; }, 1000); }
+        try { await downloadFile(file, downloadButton); }
+        catch (error) { window.alert(error.message); }
       });
       const deleteButton = document.createElement("button");
       deleteButton.type = "button"; deleteButton.className = "catalog-row__command catalog-row__command--danger";
@@ -625,10 +687,8 @@
   $("#preview-zoom-in").addEventListener("click", () => { previewState.scale = Math.min(4, previewState.scale + .25); updatePreviewScale(); });
   previewDownload.addEventListener("click", async () => {
     if (!previewState.object) return;
-    previewDownload.disabled = true; previewDownload.textContent = "正在读取";
-    try { await downloadFile(previewState.object); previewDownload.textContent = "下载已开始"; }
-    catch (error) { previewDownload.textContent = "下载失败"; window.alert(error.message); }
-    finally { previewDownload.disabled = false; }
+    try { await downloadFile(previewState.object, previewDownload); }
+    catch (error) { window.alert(error.message); }
   });
   document.addEventListener("keydown", (event) => { if (event.key === "Escape" && !preview.hidden) closePreview(); });
   uploadForm.addEventListener("submit", async (event) => {

@@ -19,4 +19,19 @@ if ! grep -Fq 'new Blob(chunkBlobs' "${app_js}"; then
     exit 1
 fi
 
+if ! grep -Fq 'response.body.getReader()' "${app_js}"; then
+    echo "FAIL: Chunk download does not consume the response body incrementally" >&2
+    exit 1
+fi
+
+if ! grep -Fq 'onBytes(value.byteLength)' "${app_js}"; then
+    echo "FAIL: Chunk download does not report delivered body bytes" >&2
+    exit 1
+fi
+
+if ! grep -Fq '下载中 ${percent}% · ${formatRate(rate)}' "${app_js}"; then
+    echo "FAIL: Download UI does not render whole-file speed" >&2
+    exit 1
+fi
+
 echo "PASS: V2 frontend has a Blob download fallback"

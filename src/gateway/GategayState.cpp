@@ -55,6 +55,19 @@ std::string catalogPathKey(const std::string& ownerId, const std::string& path)
     return ownerId + '\n' + path;
 }
 
+std::string thumbnailKey(const std::string& sourceFileHash, const std::string& profile)
+{
+    return "d:" + sourceFileHash + ":thumbnail:" + profile;
+}
+
+bool isClaimableMediaJob(const media::MediaJob& job, int64_t now)
+{
+    if (job.state == media::JobState::kPending || job.state == media::JobState::kFailed) {
+        return job.nextRetryAt <= now;
+    }
+    return job.state == media::JobState::kRunning && job.leaseUntil <= now;
+}
+
 bool normalizeDirectoryPath(const std::string& input, std::string& out)
 {
     if (input.empty() || input.front() != '/' || input.find('\0') != std::string::npos) return false;
@@ -473,6 +486,32 @@ bool GatewayState::getObjectLocked(const std::string& objectId, ObjectMeta& out)
     objectCache_.put(objectId, std::make_shared<const ObjectMeta>(object),
                      estimatedObjectBytes(object), kObjectCacheTtlSeconds);
     out = std::move(object);
+    return true;
+}
+
+bool GatewayState::getMediaJobLocked(const std::string& jobId, media::MediaJob& out) const
+{
+    if (!db_ || jobId.empty()) return false;
+    std::string value;
+    if (!db_->Get(leveldb::ReadOptions(), "j:" + jobId, &value).ok()) return false;
+    media::MediaJob job;
+    if (!media::parseMediaJob(value, job) || job.jobId != jobId) return false;
+    out = std::move(job);
+    return true;
+}
+
+bool GatewayState::getThumbnailLocked(const std::string& sourceFileHash, const std::string& profile,
+                                      media::ThumbnailMeta& out) const
+{
+    if (!db_ || sourceFileHash.empty() || profile.empty()) return false;
+    std::string value;
+    if (!db_->Get(leveldb::ReadOptions(), thumbnailKey(sourceFileHash, profile), &value).ok()) return false;
+    media::ThumbnailMeta thumbnail;
+    if (!media::parseThumbnailMeta(value, thumbnail) ||
+        thumbnail.sourceFileHash != sourceFileHash || thumbnail.profile != profile) {
+        return false;
+    }
+    out = std::move(thumbnail);
     return true;
 }
 
@@ -1288,6 +1327,207 @@ bool GatewayState::getObject(const std::string& objectId, ObjectMeta& out) const
 {
     std::lock_guard<std::mutex> lock(mutex_);
     return getObjectLocked(objectId, out);
+}
+
+ThumbnailEnqueueResult GatewayState::enqueueThumbnail(const std::string& sourceFileHash,
+                                                       const std::string& profile, int64_t now)
+{
+    ThumbnailEnqueueResult result;
+    if (sourceFileHash.empty() || profile.empty()) return result;
+
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (!db_) return result;
+
+    media::ThumbnailMeta thumbnail;
+    if (getThumbnailLocked(sourceFileHash, profile, thumbnail)) {
+        media::MediaJob existing;
+        if (!getMediaJobLocked(thumbnail.jobId, existing)) return result;
+        result.job = existing;
+
+        if (existing.state == media::JobState::kReady ||
+            existing.state == media::JobState::kUnsupported ||
+            (existing.state == media::JobState::kPending) ||
+            (existing.state == media::JobState::kRunning && existing.leaseUntil > now) ||
+            (existing.state == media::JobState::kFailed && existing.nextRetryAt > now)) {
+            return result;
+        }
+
+        existing.state = media::JobState::kPending;
+        existing.leaseUntil = 0;
+        existing.leaseToken.clear();
+        existing.nextRetryAt = now;
+        existing.updatedAt = now;
+        thumbnail.state = media::JobState::kPending;
+        thumbnail.lastError.clear();
+        thumbnail.updatedAt = now;
+
+        leveldb::WriteBatch batch;
+        batch.Put("j:" + existing.jobId, media::serializeMediaJob(existing));
+        batch.Put(thumbnailKey(sourceFileHash, profile), media::serializeThumbnailMeta(thumbnail));
+        if (!db_->Write(leveldb::WriteOptions(), &batch).ok()) return ThumbnailEnqueueResult{};
+        result.job = std::move(existing);
+        result.publishRequired = true;
+        return result;
+    }
+
+    media::MediaJob job;
+    job.jobId = randomId();
+    if (job.jobId.empty()) return result;
+    job.type = media::JobType::kThumbnail;
+    job.sourceFileHash = sourceFileHash;
+    job.profile = profile;
+    job.state = media::JobState::kPending;
+    job.nextRetryAt = now;
+    job.createdAt = now;
+    job.updatedAt = now;
+
+    thumbnail.sourceFileHash = sourceFileHash;
+    thumbnail.profile = profile;
+    thumbnail.state = media::JobState::kPending;
+    thumbnail.jobId = job.jobId;
+    thumbnail.updatedAt = now;
+
+    leveldb::WriteBatch batch;
+    batch.Put("j:" + job.jobId, media::serializeMediaJob(job));
+    batch.Put(thumbnailKey(sourceFileHash, profile), media::serializeThumbnailMeta(thumbnail));
+    if (!db_->Write(leveldb::WriteOptions(), &batch).ok()) return result;
+    result.job = std::move(job);
+    result.publishRequired = true;
+    return result;
+}
+
+bool GatewayState::getMediaJob(const std::string& jobId, media::MediaJob& out) const
+{
+    std::lock_guard<std::mutex> lock(mutex_);
+    return getMediaJobLocked(jobId, out);
+}
+
+bool GatewayState::getThumbnail(const std::string& sourceFileHash, const std::string& profile,
+                                media::ThumbnailMeta& out) const
+{
+    std::lock_guard<std::mutex> lock(mutex_);
+    return getThumbnailLocked(sourceFileHash, profile, out);
+}
+
+bool GatewayState::claimMediaJob(const std::string& jobId, int64_t now, int64_t leaseSeconds,
+                                 media::MediaJob& out)
+{
+    if (jobId.empty() || leaseSeconds <= 0 || leaseSeconds > 3600) return false;
+    std::lock_guard<std::mutex> lock(mutex_);
+
+    media::MediaJob job;
+    if (!getMediaJobLocked(jobId, job) || !isClaimableMediaJob(job, now)) return false;
+    media::ThumbnailMeta thumbnail;
+    if (job.type != media::JobType::kThumbnail ||
+        !getThumbnailLocked(job.sourceFileHash, job.profile, thumbnail) || thumbnail.jobId != job.jobId) {
+        return false;
+    }
+
+    job.state = media::JobState::kRunning;
+    ++job.attempts;
+    job.leaseUntil = now + leaseSeconds;
+    job.leaseToken = randomId();
+    if (job.leaseToken.empty()) return false;
+    job.nextRetryAt = 0;
+    job.updatedAt = now;
+    thumbnail.state = media::JobState::kRunning;
+    thumbnail.lastError.clear();
+    thumbnail.updatedAt = now;
+
+    leveldb::WriteBatch batch;
+    batch.Put("j:" + job.jobId, media::serializeMediaJob(job));
+    batch.Put(thumbnailKey(job.sourceFileHash, job.profile), media::serializeThumbnailMeta(thumbnail));
+    if (!db_->Write(leveldb::WriteOptions(), &batch).ok()) return false;
+    out = std::move(job);
+    return true;
+}
+
+bool GatewayState::completeMediaJob(const std::string& jobId, const std::string& leaseToken,
+                                    const std::string& derivedObjectId,
+                                    const std::string& derivedFileHash, int64_t now)
+{
+    if (jobId.empty() || leaseToken.empty() || derivedObjectId.empty() || derivedFileHash.empty()) return false;
+    std::lock_guard<std::mutex> lock(mutex_);
+
+    media::MediaJob job;
+    if (!getMediaJobLocked(jobId, job) || job.state != media::JobState::kRunning ||
+        job.leaseToken != leaseToken) {
+        return false;
+    }
+    media::ThumbnailMeta thumbnail;
+    if (job.type != media::JobType::kThumbnail ||
+        !getThumbnailLocked(job.sourceFileHash, job.profile, thumbnail) || thumbnail.jobId != job.jobId) {
+        return false;
+    }
+
+    job.state = media::JobState::kReady;
+    job.leaseUntil = 0;
+    job.leaseToken.clear();
+    job.nextRetryAt = 0;
+    job.lastError.clear();
+    job.updatedAt = now;
+    thumbnail.state = media::JobState::kReady;
+    thumbnail.derivedObjectId = derivedObjectId;
+    thumbnail.derivedFileHash = derivedFileHash;
+    thumbnail.lastError.clear();
+    thumbnail.updatedAt = now;
+
+    leveldb::WriteBatch batch;
+    batch.Put("j:" + job.jobId, media::serializeMediaJob(job));
+    batch.Put(thumbnailKey(job.sourceFileHash, job.profile), media::serializeThumbnailMeta(thumbnail));
+    return db_->Write(leveldb::WriteOptions(), &batch).ok();
+}
+
+bool GatewayState::failMediaJob(const std::string& jobId, const std::string& leaseToken,
+                                bool unsupported, const std::string& error, int64_t nextRetryAt,
+                                int64_t now)
+{
+    if (jobId.empty() || leaseToken.empty() || error.empty()) return false;
+    std::lock_guard<std::mutex> lock(mutex_);
+
+    media::MediaJob job;
+    if (!getMediaJobLocked(jobId, job) || job.state != media::JobState::kRunning ||
+        job.leaseToken != leaseToken) {
+        return false;
+    }
+    media::ThumbnailMeta thumbnail;
+    if (job.type != media::JobType::kThumbnail ||
+        !getThumbnailLocked(job.sourceFileHash, job.profile, thumbnail) || thumbnail.jobId != job.jobId) {
+        return false;
+    }
+
+    job.state = unsupported ? media::JobState::kUnsupported : media::JobState::kFailed;
+    job.leaseUntil = 0;
+    job.leaseToken.clear();
+    job.nextRetryAt = unsupported ? 0 : nextRetryAt;
+    job.lastError = error;
+    job.updatedAt = now;
+    thumbnail.state = job.state;
+    thumbnail.lastError = error;
+    thumbnail.updatedAt = now;
+
+    leveldb::WriteBatch batch;
+    batch.Put("j:" + job.jobId, media::serializeMediaJob(job));
+    batch.Put(thumbnailKey(job.sourceFileHash, job.profile), media::serializeThumbnailMeta(thumbnail));
+    return db_->Write(leveldb::WriteOptions(), &batch).ok();
+}
+
+std::vector<media::MediaJob> GatewayState::dueMediaJobs(int64_t now, size_t maxJobs) const
+{
+    std::lock_guard<std::mutex> lock(mutex_);
+    std::vector<media::MediaJob> result;
+    if (!db_ || maxJobs == 0) return result;
+
+    auto iterator = std::unique_ptr<leveldb::Iterator>(db_->NewIterator(leveldb::ReadOptions()));
+    for (iterator->Seek("j:"); iterator->Valid() &&
+         iterator->key().ToString().rfind("j:", 0) == 0 && result.size() < maxJobs;
+         iterator->Next()) {
+        media::MediaJob job;
+        if (!media::parseMediaJob(iterator->value().ToString(), job)) return {};
+        if (isClaimableMediaJob(job, now)) result.push_back(std::move(job));
+    }
+    if (!iterator->status().ok()) return {};
+    return result;
 }
 
 ObjectMetaCache::Stats GatewayState::objectCacheStats() const

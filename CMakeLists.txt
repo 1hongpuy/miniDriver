@@ -66,6 +66,7 @@ find_package(spdlog REQUIRED)
 
 target_link_libraries(minikv_utils PUBLIC spdlog::spdlog OpenSSL::Crypto)
 target_link_libraries(minikv_media PUBLIC minikv_utils)
+target_link_libraries(minikv_gateway PUBLIC minikv_media)
 target_link_libraries(minikv_http PUBLIC minikv_utils)
 target_link_libraries(minikv_agent PUBLIC minikv_utils)
 
@@ -286,6 +287,17 @@ target_include_directories(test_chunk_disk_write_pipeline PRIVATE include)
 add_executable(test_media_job test/test_media_job.cpp)
 target_include_directories(test_media_job PRIVATE include test)
 target_link_libraries(test_media_job PRIVATE minikv_media)
+
+add_executable(test_gateway_media_jobs test/test_gateway_media_jobs.cpp)
+target_include_directories(test_gateway_media_jobs PRIVATE ${LEVELDB_INC} include test)
+target_link_libraries(test_gateway_media_jobs PRIVATE
+    minikv_gateway
+    minikv_media
+    minikv_utils
+    ${LEVELDB_LIB}
+    pthread
+    OpenSSL::Crypto
+)
 target_link_libraries(test_chunk_disk_write_pipeline PRIVATE
     minikv_datanode
     minikv_net
@@ -344,6 +356,7 @@ if(BUILD_TESTING)
     add_test(NAME disk_write_executor COMMAND test_disk_write_executor)
     add_test(NAME chunk_disk_write_pipeline COMMAND test_chunk_disk_write_pipeline)
     add_test(NAME media_job COMMAND test_media_job)
+    add_test(NAME gateway_media_jobs COMMAND test_gateway_media_jobs)
     add_test(NAME benchmark_types COMMAND test_benchmark_types)
     add_test(NAME benchmark_input COMMAND test_benchmark_input)
     add_test(NAME benchmark_http COMMAND test_benchmark_http)

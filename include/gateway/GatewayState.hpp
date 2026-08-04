@@ -1,6 +1,7 @@
 #pragma once
 
 #include "gateway/LruCache.hpp"
+#include "media/MediaJob.hpp"
 
 #include <cstdint>
 #include <string>
@@ -206,6 +207,11 @@ struct DeleteTask {
     int64_t updatedAt = 0;
 };
 
+struct ThumbnailEnqueueResult {
+    media::MediaJob job;
+    bool publishRequired = false;
+};
+
 class GatewayState {
 public:
     explicit GatewayState(const std::string& dbPath);
@@ -253,6 +259,21 @@ public:
     std::vector<DeleteTaskSnapshot> pendingDeletesForNode(const std::string& nodeId) const;
     bool acknowledgeDelete(const std::string& chunkHash, const std::string& nodeId);
 
+    ThumbnailEnqueueResult enqueueThumbnail(const std::string& sourceFileHash,
+                                            const std::string& profile, int64_t now);
+    bool getMediaJob(const std::string& jobId, media::MediaJob& out) const;
+    bool getThumbnail(const std::string& sourceFileHash, const std::string& profile,
+                      media::ThumbnailMeta& out) const;
+    bool claimMediaJob(const std::string& jobId, int64_t now, int64_t leaseSeconds,
+                       media::MediaJob& out);
+    bool completeMediaJob(const std::string& jobId, const std::string& leaseToken,
+                          const std::string& derivedObjectId,
+                          const std::string& derivedFileHash, int64_t now);
+    bool failMediaJob(const std::string& jobId, const std::string& leaseToken,
+                      bool unsupported, const std::string& error, int64_t nextRetryAt,
+                      int64_t now);
+    std::vector<media::MediaJob> dueMediaJobs(int64_t now, size_t maxJobs) const;
+
 
 private:
     PlacementPlan selectPlacementLocked(const SessionState& session, uint32_t index);
@@ -271,6 +292,9 @@ private:
     bool getDirectoryLocked(const std::string& ownerId, const std::string& path,
                             DirectoryMeta& out) const;
     bool getObjectLocked(const std::string& objectId, ObjectMeta& out) const;
+    bool getMediaJobLocked(const std::string& jobId, media::MediaJob& out) const;
+    bool getThumbnailLocked(const std::string& sourceFileHash, const std::string& profile,
+                            media::ThumbnailMeta& out) const;
     bool objectIdAtPathLocked(const std::string& pathKey, std::string& objectId) const;
     bool buildCatalogSnapshotLocked(const std::string& normalized, CatalogSnapshot& out) const;
     bool loadDeleteTasksLocked();
@@ -307,7 +331,6 @@ private:
 
 }
 }
-
 
 
 

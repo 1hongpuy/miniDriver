@@ -23,7 +23,8 @@ requires an owned bounded block.
 ### Included
 
 - A fixed-size `DiskWriteExecutor` owned by each DataNode process.
-- A per-upload FIFO of owned body blocks, preserving byte order.
+- A fixed 64 KiB block pool and a per-upload FIFO of pool-owned blocks,
+  preserving byte order without allocating one heap buffer per body callback.
 - A bounded global queued-byte budget and a bounded per-upload budget.
 - Disk-backpressure integration with existing `HttpContext::kPause` and resume.
 - Worker execution of SHA-256 update, `pwrite`, SHA finalization, and physical
@@ -43,6 +44,7 @@ requires an owned bounded block.
 
 ```text
 HTTP EventLoop receives <= 64 KiB body block
+  -> borrow a 64 KiB block from DiskWriteExecutor's fixed block pool
   -> copy bytes into ChunkWritePipeline FIFO
   -> schedule serial DiskWriteExecutor work for this upload
   -> concurrently pass the original block to ReplicaUploadPipe
@@ -62,6 +64,16 @@ Only one worker task for an individual `WriteSession` may run at a time. This
 preserves file offset order and use of its OpenSSL digest context. Different
 Chunk uploads may run on different workers.
 
+Disk work owns a separate `DiskWritePipelineState` while an operation is
+outstanding. Its completion callback captures `std::weak_ptr<ChunkUploadStream>`
+and first locks it after returning to the EventLoop. It must not dereference a
+raw `this` pointer. The weak reference prevents a completion notification from
+accessing an HTTP stream that was cancelled and released. The pipeline state,
+not the HTTP stream, keeps the `WriteSession` and borrowed block alive until the
+worker has returned the block to the pool. A temporary strong stream hold is
+still permitted only while a deferred client response must remain semantically
+pending; it is not used as an accidental lifetime guarantee for worker lambdas.
+
 The replica path remains EventLoop-driven. The current body block is copied for
 the disk FIFO before the callback returns, while `ReplicaUploadPipe` continues
 to own its existing output buffering. A client receives success only after local
@@ -77,6 +89,8 @@ globalQueuedWriteBytes         8 MiB
 globalResumeQueuedWriteBytes   4 MiB
 perUploadQueuedWriteBytes      1 MiB
 perUploadResumeBytes           512 KiB
+diskBlockBytes                 64 KiB
+diskBlockCount                 128
 ```
 
 The body callback returns `kPause` after accepting the current owned block when
@@ -90,6 +104,18 @@ the memory risk comes from body bytes, not task metadata. If an upload cannot
 copy its current block because the global executor is already full, it must
 return `kPause` without accepting it; the parser keeps that input block for a
 later retry.
+
+`HttpContext` already limits one streaming body callback to 64 KiB. The executor
+therefore allocates its 128 reusable 64 KiB blocks at startup, matching the
+8 MiB global byte budget. A per-block `std::vector<char>` would still allocate
+on the heap for each callback, so it is not treated as an allocation solution.
+The implementation uses the condition-variable predicate form:
+
+```cpp
+cv_.wait(lock, [this] { return stopping_ || !readyQueue_.empty(); });
+```
+
+This prevents a spurious wakeup from running an empty queue iteration.
 
 ## Lifecycle and Errors
 
@@ -128,3 +154,6 @@ Shared immutable buffers and `writev`/zero-copy optimizations are V4 work.
    write path still allow heartbeat/admin requests to complete.
 5. Structured logs expose `disk_queue_peak_bytes`, `disk_pause_count`, and
    `disk_pause_ms`; compare them with existing `replica` metrics.
+6. Lifetime test: cancel an upload with queued work, then run worker completion;
+   it must not access the released `ChunkUploadStream` and must return its block
+   to the pool.

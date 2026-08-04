@@ -272,6 +272,9 @@ public:
     bool failMediaJob(const std::string& jobId, const std::string& leaseToken,
                       bool unsupported, const std::string& error, int64_t nextRetryAt,
                       int64_t now);
+    // Records that a PENDING job has been handed to the bounded Redis publisher.
+    // A worker may still claim it immediately; this only rate-limits recovery scans.
+    bool deferMediaJobDispatch(const std::string& jobId, int64_t nextDispatchAt);
     std::vector<media::MediaJob> dueMediaJobs(int64_t now, size_t maxJobs) const;
 
 
@@ -331,7 +334,6 @@ private:
 
 }
 }
-
 
 
 

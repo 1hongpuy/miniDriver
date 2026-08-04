@@ -44,7 +44,7 @@ d:{sourceFileHash}:thumbnail:thumb-512-jpeg-v1
 ```text
 jobId, type, sourceFileHash, profile,
 state(PENDING/RUNNING/READY/FAILED/UNSUPPORTED),
-attempts, leaseUntil, nextRetryAt, lastError, createdAt, updatedAt
+attempts, leaseUntil, leaseToken, nextRetryAt, lastError, createdAt, updatedAt
 ```
 
 `ThumbnailMeta` 是面向目录查询的派生结果索引，保存：
@@ -75,7 +75,8 @@ LevelDB WriteBatch: job=PENDING + ThumbnailMeta=PENDING
 ```
 
 Worker 收到消息后先向 Gateway claim。Gateway 对 `PENDING` 或已过期 `RUNNING` 的任务
-签发短租约并返回任务详情。Worker 成功将结果写回 Gateway 后才 `XACK`；失败不把 Redis
+签发短租约和随机 `leaseToken` 并返回任务详情。结果回写必须带该 token，过期 Worker 不能
+覆盖新 Worker 的结果。Worker 成功将结果写回 Gateway 后才 `XACK`；失败不把 Redis
 消息视为唯一恢复依据，Gateway 的补偿扫描会根据账本重新投递。
 
 ### Worker 进程模型
@@ -192,4 +193,3 @@ Catalog 文件项新增可选字段：
 4. Worker 被停止后，任务租约到期可由同类 Worker 接管；Redis 重启后账本扫描可重投递。
 5. Worker 的 JPEG 解码不会阻塞 DataNode EventLoop，且并发超过配置上限时在 Worker 队列受控等待。
 6. 不支持格式不会无限重试，目录仍可下载原始文件。
-

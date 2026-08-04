@@ -7,13 +7,16 @@
 #include "utils/Util.hpp"
 #include "http/DeferredResponse.hpp"
 #include "http/AsyncHttpClient.hpp"
+#include "media/RedisTaskPublisher.hpp"
 #include "utils/AsyncLogger.hpp"
 
 #include <algorithm>
 #include <chrono>
+#include <cctype>
 #include <cstdlib>
 #include <filesystem>
 #include <iostream>
+#include <limits>
 #include <set>
 #include <sstream>
 
@@ -55,6 +58,62 @@ std::string configuredNodeId()
 {
     if(const char* value = std::getenv("MINIKV_V2_NODE_ID")) return value;
     return "-";
+}
+
+uint64_t configuredUint(const char* name, uint64_t fallback)
+{
+    const char* value = std::getenv(name);
+    if(value == nullptr || *value == '\0') return fallback;
+    try {
+        const unsigned long long parsed = std::stoull(value);
+        return parsed == 0 ? fallback : static_cast<uint64_t>(parsed);
+    } catch(...) {
+        return fallback;
+    }
+}
+
+miniKV::media::RedisTaskPublisherConfig configuredRedisPublisher()
+{
+    miniKV::media::RedisTaskPublisherConfig config;
+    if(const char* value = std::getenv("MINIKV_V2_REDIS_ADDRESS")) config.address = value;
+    const uint64_t port = configuredUint("MINIKV_V2_REDIS_PORT", config.port);
+    if(port <= UINT16_MAX) config.port = static_cast<uint16_t>(port);
+    if(const char* value = std::getenv("MINIKV_V2_REDIS_THUMBNAIL_STREAM")) {
+        config.thumbnailStream = value;
+    }
+    config.streamMaxLen = configuredUint("MINIKV_V2_REDIS_STREAM_MAXLEN", config.streamMaxLen);
+    return config;
+}
+
+bool isJpegFileName(const std::string& fileName)
+{
+    const size_t dot = fileName.rfind('.');
+    if(dot == std::string::npos) return false;
+    std::string suffix = fileName.substr(dot);
+    std::transform(suffix.begin(), suffix.end(), suffix.begin(),
+                   [](unsigned char value) { return static_cast<char>(std::tolower(value)); });
+    return suffix == ".jpg" || suffix == ".jpeg";
+}
+
+const char* mediaJobStateName(miniKV::media::JobState state)
+{
+    switch(state) {
+    case miniKV::media::JobState::kPending: return "PENDING";
+    case miniKV::media::JobState::kRunning: return "RUNNING";
+    case miniKV::media::JobState::kReady: return "READY";
+    case miniKV::media::JobState::kFailed: return "FAILED";
+    case miniKV::media::JobState::kUnsupported: return "UNSUPPORTED";
+    }
+    return "FAILED";
+}
+
+std::string mediaJobJson(const miniKV::media::MediaJob& job)
+{
+    return "{\"jobId\":\"" + jsonEscape(job.jobId) + "\",\"type\":\"thumbnail\",\"sourceFileHash\":\"" +
+           jsonEscape(job.sourceFileHash) + "\",\"profile\":\"" + jsonEscape(job.profile) +
+           "\",\"state\":\"" + mediaJobStateName(job.state) +
+           "\",\"attempts\":" + std::to_string(job.attempts) + ",\"leaseUntil\":" +
+           std::to_string(job.leaseUntil) + ",\"leaseToken\":\"" + jsonEscape(job.leaseToken) + "\"}";
 }
 
 std::vector<ChunkRouteRequest> parseRouteRequests(const std::string& body) {
@@ -193,6 +252,12 @@ int main(int argc, char** argv) {
 
     ThreadPool workers(4);
     EventLoop loop;
+    miniKV::media::RedisTaskPublisher mediaPublisher(configuredRedisPublisher());
+    if(!mediaPublisher.start()) {
+        miniKV::utils::logError("event=media_publisher_start_failed");
+        std::cerr << "cannot start media task publisher\n";
+        return 1;
+    }
     miniKV::http::HttpServer server(&loop, &workers, port);
     std::set<std::string> deleteRequestsInFlight;
     std::function<void()> dispatchPendingDeletes;
@@ -228,6 +293,27 @@ int main(int argc, char** argv) {
                     }
                 });
             }
+        }
+    };
+    const auto enqueueMediaJob = [&](const miniKV::media::MediaJob& job) {
+        if(!mediaPublisher.enqueue(job)) {
+            miniKV::utils::logWarn("event=media_dispatch_deferred job=" + job.jobId +
+                                   " reason=publisher_queue_full");
+            return;
+        }
+        constexpr int64_t kRedisRepublishSeconds = 30;
+        if(!state.deferMediaJobDispatch(job.jobId, unixSeconds() + kRedisRepublishSeconds)) {
+            miniKV::media::MediaJob current;
+            if(!state.getMediaJob(job.jobId, current) ||
+               current.state == miniKV::media::JobState::kPending) {
+                miniKV::utils::logWarn("event=media_dispatch_persist_failed job=" + job.jobId);
+            }
+        }
+    };
+    const auto dispatchPendingMediaJobs = [&] {
+        constexpr size_t kDispatchBatchSize = 128;
+        for(const miniKV::media::MediaJob& job : state.dueMediaJobs(unixSeconds(), kDispatchBatchSize)) {
+            enqueueMediaJob(job);
         }
     };
     server.setHttpCallback([&](const HttpRequest& request, HttpResponse* response,
@@ -421,6 +507,62 @@ int main(int argc, char** argv) {
             json(response, 200, "{\"status\":\"released\"}");
             return;
         }
+        if (request.method() == HttpRequest::kPost && beginsWith(path, "/internal/v2/media/jobs/")) {
+            if (!constantTimeEquals(request.getHeader("X-Cluster-Internal-Token"), clusterSecret)) {
+                json(response, 403, jsonError("invalid cluster token"));
+                return;
+            }
+            const std::string prefix = "/internal/v2/media/jobs/";
+            const std::string claimSuffix = "/claim";
+            const std::string completeSuffix = "/complete";
+            const std::string failSuffix = "/fail";
+            if(path.size() > prefix.size() + claimSuffix.size() &&
+               path.rfind(claimSuffix) == path.size() - claimSuffix.size()) {
+                miniKV::media::MediaJob job;
+                const int64_t leaseSeconds = static_cast<int64_t>(
+                    jsonUint(body, "leaseSeconds", 60));
+                const std::string jobId = pathTail(path, prefix, claimSuffix);
+                if(!state.claimMediaJob(jobId, unixSeconds(), leaseSeconds, job)) {
+                    json(response, 409, jsonError("media job is not claimable"));
+                } else {
+                    miniKV::utils::logInfo("event=media_job_claimed job=" + job.jobId +
+                                           " attempt=" + std::to_string(job.attempts));
+                    json(response, 200, mediaJobJson(job));
+                }
+                return;
+            }
+            if(path.size() > prefix.size() + completeSuffix.size() &&
+               path.rfind(completeSuffix) == path.size() - completeSuffix.size()) {
+                const std::string jobId = pathTail(path, prefix, completeSuffix);
+                if(!state.completeMediaJob(jobId, jsonString(body, "leaseToken"),
+                                           jsonString(body, "derivedObjectId"),
+                                           jsonString(body, "derivedFileHash"), unixSeconds())) {
+                    json(response, 409, jsonError("media completion rejected"));
+                } else {
+                    miniKV::utils::logInfo("event=media_job_completed job=" + jobId);
+                    json(response, 200, "{\"status\":\"completed\"}");
+                }
+                return;
+            }
+            if(path.size() > prefix.size() + failSuffix.size() &&
+               path.rfind(failSuffix) == path.size() - failSuffix.size()) {
+                const std::string jobId = pathTail(path, prefix, failSuffix);
+                const bool unsupported = jsonUint(body, "unsupported") != 0;
+                const uint64_t retryAfterSeconds = jsonUint(body, "retryAfterSeconds", 60);
+                const int64_t nextRetryAt = unsupported ? 0 : unixSeconds() +
+                    static_cast<int64_t>(std::min<uint64_t>(retryAfterSeconds, 3600));
+                if(!state.failMediaJob(jobId, jsonString(body, "leaseToken"), unsupported,
+                                       jsonString(body, "error"), nextRetryAt, unixSeconds())) {
+                    json(response, 409, jsonError("media failure rejected"));
+                } else {
+                    miniKV::utils::logWarn("event=media_job_failed job=" + jobId);
+                    json(response, 200, "{\"status\":\"recorded\"}");
+                }
+                return;
+            }
+            json(response, 404, jsonError("media job action not found"));
+            return;
+        }
         if (request.method() == HttpRequest::kPost && beginsWith(path, "/api/v2/upload/sessions/") && path.size() > 7 && path.rfind("/commit") == path.size() - 7) {
             FileMeta file;
             const auto fileCommitStarted = Clock::now();
@@ -435,6 +577,11 @@ int main(int argc, char** argv) {
             if (status != FileCommitStatus::kCommitted) {
                 json(response, 400, jsonError("all chunks with at least one replica are required"));
                 return;
+            }
+            if(isJpegFileName(file.fileName)) {
+                const auto thumbnail = state.enqueueThumbnail(
+                    file.fileHash, "thumb-512-jpeg-v1", unixSeconds());
+                if(thumbnail.publishRequired) enqueueMediaJob(thumbnail.job);
             }
             json(response, 200, "{\"objectId\":\"" + jsonEscape(file.objectId) + "\",\"fileHash\":\"" +
                 jsonEscape(file.fileHash) + "\",\"state\":\"" + fileStateName(file.state) + "\"}");
@@ -511,8 +658,10 @@ int main(int argc, char** argv) {
     loop.runEvery(5000, [&] {
         state.checkNodeTimeouts(unixSeconds());
         dispatchPendingDeletes();
+        dispatchPendingMediaJobs();
     });
     loop.runAfter(0, dispatchPendingDeletes);
+    loop.runAfter(0, dispatchPendingMediaJobs);
     server.start();
     miniKV::utils::logInfo("event=gateway_started port=" + std::to_string(port) +
                            " metadata_dir=" + stateDir);

@@ -62,7 +62,11 @@ std::string thumbnailKey(const std::string& sourceFileHash, const std::string& p
 
 bool isClaimableMediaJob(const media::MediaJob& job, int64_t now)
 {
-    if (job.state == media::JobState::kPending || job.state == media::JobState::kFailed) {
+    // Redis may already contain the job while its next dispatch scan is deferred.
+    // Pending jobs are therefore claimable immediately; retry backoff applies only
+    // after a worker has explicitly failed the job.
+    if (job.state == media::JobState::kPending) return true;
+    if (job.state == media::JobState::kFailed) {
         return job.nextRetryAt <= now;
     }
     return job.state == media::JobState::kRunning && job.leaseUntil <= now;
@@ -1451,7 +1455,7 @@ bool GatewayState::completeMediaJob(const std::string& jobId, const std::string&
 
     media::MediaJob job;
     if (!getMediaJobLocked(jobId, job) || job.state != media::JobState::kRunning ||
-        job.leaseToken != leaseToken) {
+        job.leaseToken != leaseToken || job.leaseUntil < now) {
         return false;
     }
     media::ThumbnailMeta thumbnail;
@@ -1487,7 +1491,7 @@ bool GatewayState::failMediaJob(const std::string& jobId, const std::string& lea
 
     media::MediaJob job;
     if (!getMediaJobLocked(jobId, job) || job.state != media::JobState::kRunning ||
-        job.leaseToken != leaseToken) {
+        job.leaseToken != leaseToken || job.leaseUntil < now) {
         return false;
     }
     media::ThumbnailMeta thumbnail;
@@ -1512,6 +1516,21 @@ bool GatewayState::failMediaJob(const std::string& jobId, const std::string& lea
     return db_->Write(leveldb::WriteOptions(), &batch).ok();
 }
 
+bool GatewayState::deferMediaJobDispatch(const std::string& jobId, int64_t nextDispatchAt)
+{
+    if (jobId.empty() || nextDispatchAt <= 0) return false;
+    std::lock_guard<std::mutex> lock(mutex_);
+
+    media::MediaJob job;
+    if (!getMediaJobLocked(jobId, job) || job.state != media::JobState::kPending) return false;
+    job.nextRetryAt = nextDispatchAt;
+    if (!db_->Put(leveldb::WriteOptions(), "j:" + job.jobId,
+                  media::serializeMediaJob(job)).ok()) {
+        return false;
+    }
+    return true;
+}
+
 std::vector<media::MediaJob> GatewayState::dueMediaJobs(int64_t now, size_t maxJobs) const
 {
     std::lock_guard<std::mutex> lock(mutex_);
@@ -1524,7 +1543,11 @@ std::vector<media::MediaJob> GatewayState::dueMediaJobs(int64_t now, size_t maxJ
          iterator->Next()) {
         media::MediaJob job;
         if (!media::parseMediaJob(iterator->value().ToString(), job)) return {};
-        if (isClaimableMediaJob(job, now)) result.push_back(std::move(job));
+        const bool needsDispatch =
+            (job.state == media::JobState::kPending && job.nextRetryAt <= now) ||
+            (job.state == media::JobState::kFailed && job.nextRetryAt <= now) ||
+            (job.state == media::JobState::kRunning && job.leaseUntil <= now);
+        if (needsDispatch) result.push_back(std::move(job));
     }
     if (!iterator->status().ok()) return {};
     return result;

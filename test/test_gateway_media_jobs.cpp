@@ -24,14 +24,20 @@ int main()
     MINIKV_CHECK(!duplicate.publishRequired);
     MINIKV_CHECK(duplicate.job.jobId == first.job.jobId);
 
+    MINIKV_CHECK(state.deferMediaJobDispatch(first.job.jobId, now + 30));
+    MINIKV_CHECK(state.dueMediaJobs(now + 1, 10).empty());
+
     miniKV::media::MediaJob claimed;
-    MINIKV_CHECK(state.claimMediaJob(first.job.jobId, now, 10, claimed));
+    MINIKV_CHECK(state.claimMediaJob(first.job.jobId, now + 1, 10, claimed));
     MINIKV_CHECK(claimed.state == miniKV::media::JobState::kRunning);
     MINIKV_CHECK(claimed.attempts == 1);
-    MINIKV_CHECK(claimed.leaseUntil == now + 10);
+    MINIKV_CHECK(claimed.leaseUntil == now + 11);
     const std::string firstLeaseToken = claimed.leaseToken;
     MINIKV_CHECK(!firstLeaseToken.empty());
-    MINIKV_CHECK(!state.claimMediaJob(first.job.jobId, now + 1, 10, claimed));
+    MINIKV_CHECK(!state.claimMediaJob(first.job.jobId, now + 2, 10, claimed));
+
+    MINIKV_CHECK(!state.completeMediaJob(first.job.jobId, firstLeaseToken,
+                                         "expired-object", "expired-file", now + 12));
 
     MINIKV_CHECK(state.claimMediaJob(first.job.jobId, now + 11, 10, claimed));
     MINIKV_CHECK(claimed.attempts == 2);

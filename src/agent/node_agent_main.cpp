@@ -58,6 +58,10 @@ ChildSpec childSpec(const ManagedServiceConfig& service, const NodeAgentConfig& 
     spec.environment["MINIKV_V2_LOG_ROTATE_FILES"] = std::to_string(service.logging.rotateFiles);
     if(service.type == ServiceType::kGateway) {
         spec.argv = {spec.executable, std::to_string(service.listenPort), service.dataDir};
+        spec.environment["MINIKV_V2_REDIS_ADDRESS"] = config.redis.address;
+        spec.environment["MINIKV_V2_REDIS_PORT"] = std::to_string(config.redis.port);
+        spec.environment["MINIKV_V2_REDIS_THUMBNAIL_STREAM"] = config.redis.thumbnailStream;
+        spec.environment["MINIKV_V2_REDIS_STREAM_MAXLEN"] = std::to_string(config.redis.streamMaxLen);
     } else {
         spec.argv = {spec.executable, config.nodeId, config.advertiseAddress,
                     std::to_string(service.listenPort), service.dataDir,

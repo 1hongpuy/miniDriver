@@ -106,12 +106,24 @@ NodeAgentConfig parse(const YAML::Node& root)
     config.advertiseAddress = required<std::string>(node, "advertiseAddress");
     config.secretFile = required<std::string>(cluster, "secretFile");
     if(config.nodeId.empty() || config.advertiseAddress.empty() || config.secretFile.empty()) invalid("empty required field");
+    if(node["capabilities"]) {
+        if(!node["capabilities"].IsSequence()) invalid("node.capabilities must be a sequence");
+        std::set<std::string> uniqueCapabilities;
+        for(const YAML::Node& capability : node["capabilities"]) {
+            const std::string value = capability.as<std::string>();
+            if(value.empty() || !uniqueCapabilities.insert(value).second) {
+                invalid("invalid node capability");
+            }
+            config.capabilities.push_back(value);
+        }
+    }
     if(web) {
         if(!web.IsMap()) invalid("web must be a map");
         if(web["allowedOrigin"]) config.webAllowedOrigin = web["allowedOrigin"].as<std::string>();
     }
     
     bool hasEnabledDataNode = false;
+    bool hasEnabledGateway = false;
     std::set<std::string> ids;
     std::set<uint16_t> ports;
     for(const YAML::Node& serviceNode : services) {
@@ -134,6 +146,7 @@ NodeAgentConfig parse(const YAML::Node& root)
         if(!ids.insert(service.id).second) invalid("duplicate service id " + service.id);
         if(!ports.insert(service.listenPort).second) invalid("duplicate listenPort");
         hasEnabledDataNode = hasEnabledDataNode || (service.enabled && service.type == ServiceType::kDataNode);
+        hasEnabledGateway = hasEnabledGateway || (service.enabled && service.type == ServiceType::kGateway);
         config.services.push_back(std::move(service));
     }
     if(config.services.empty()) invalid("services cannot be empty");
@@ -144,6 +157,19 @@ NodeAgentConfig parse(const YAML::Node& root)
     } else if(cluster["gatewayAddress"] || cluster["gatewayPort"]) {
         config.gatewayAddress = cluster["gatewayAddress"] ? cluster["gatewayAddress"].as<std::string>() : "";
         config.gatewayPort = cluster["gatewayPort"] ? port(cluster, "gatewayPort") : 0;
+    }
+    if(cluster["redis"]) {
+        const YAML::Node redis = cluster["redis"];
+        if(!redis.IsMap()) invalid("cluster.redis must be a map");
+        if(redis["address"]) config.redis.address = redis["address"].as<std::string>();
+        if(redis["port"]) config.redis.port = port(redis, "port");
+        if(redis["thumbnailStream"]) config.redis.thumbnailStream = redis["thumbnailStream"].as<std::string>();
+        if(redis["streamMaxLen"]) config.redis.streamMaxLen = redis["streamMaxLen"].as<uint64_t>();
+    }
+    if(hasEnabledGateway && (!cluster["redis"] || config.redis.address.empty() ||
+                             config.redis.port == 0 || config.redis.thumbnailStream.empty() ||
+                             config.redis.streamMaxLen == 0)) {
+        invalid("enabled gateway requires valid cluster.redis");
     }
     return config;
 }

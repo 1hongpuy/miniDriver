@@ -31,6 +31,13 @@ struct ServiceLoggingConfig {
     uint32_t rotateFiles = 5;
 };
 
+struct RedisTaskConfig {
+    std::string address = "127.0.0.1";
+    uint16_t port = 6379;
+    std::string thumbnailStream = "media:thumbnail";
+    uint64_t streamMaxLen = 100000;
+};
+
 struct ManagedServiceConfig {
     std::string id;
     ServiceType type = ServiceType::kDataNode;
@@ -50,6 +57,8 @@ struct NodeAgentConfig {
     uint16_t gatewayPort = 0;
     std::string secretFile;
     std::string webAllowedOrigin;
+    std::vector<std::string> capabilities;
+    RedisTaskConfig redis;
     std::vector<ManagedServiceConfig> services;
 };
 
@@ -61,7 +70,6 @@ std::string readClusterSecret(const std::string& path);
 
 
 }  // namespace miniKV::v2
-
 
 
 

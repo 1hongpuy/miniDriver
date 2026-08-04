@@ -4,8 +4,15 @@
 int main()
 {
     const auto config = miniKV::agent::parseNodeAgentConfigText(R"(
-node: { nodeId: node-c, advertiseAddress: 100.89.50.125 }
-cluster: { secretFile: /tmp/secret, gatewayAddress: 100.75.93.124, gatewayPort: 18081 }
+node:
+  nodeId: node-c
+  advertiseAddress: 100.89.50.125
+  capabilities: [storage, thumbnail]
+cluster:
+  secretFile: /tmp/secret
+  gatewayAddress: 100.75.93.124
+  gatewayPort: 18081
+  redis: { address: 100.89.50.125, port: 6380, thumbnailStream: media:test, streamMaxLen: 200 }
 services:
   - id: datanode-0
     type: datanode
@@ -28,5 +35,11 @@ services:
     MINIKV_CHECK(config.services[1].logging.filePath == "/tmp/gateway/logs/gateway-0.log");
     MINIKV_CHECK(config.services[1].logging.level == "info");
     MINIKV_CHECK(config.services[1].logging.queueSize == 8192);
+    MINIKV_CHECK(config.capabilities.size() == 2);
+    MINIKV_CHECK(config.capabilities[1] == "thumbnail");
+    MINIKV_CHECK(config.redis.address == "100.89.50.125");
+    MINIKV_CHECK(config.redis.port == 6380);
+    MINIKV_CHECK(config.redis.thumbnailStream == "media:test");
+    MINIKV_CHECK(config.redis.streamMaxLen == 200);
     return 0;
 }

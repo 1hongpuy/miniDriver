@@ -272,6 +272,21 @@ add_executable(test_write_admission test/test_write_admission.cpp)
 target_include_directories(test_write_admission PRIVATE include)
 target_link_libraries(test_write_admission PRIVATE pthread)
 
+add_executable(test_disk_write_executor test/test_disk_write_executor.cpp)
+target_include_directories(test_disk_write_executor PRIVATE include)
+target_link_libraries(test_disk_write_executor PRIVATE minikv_datanode pthread)
+
+add_executable(test_chunk_disk_write_pipeline test/test_chunk_disk_write_pipeline.cpp)
+target_include_directories(test_chunk_disk_write_pipeline PRIVATE include)
+target_link_libraries(test_chunk_disk_write_pipeline PRIVATE
+    minikv_datanode
+    minikv_net
+    minikv_utils
+    ${LEVELDB_LIB}
+    pthread
+    OpenSSL::Crypto
+)
+
 add_executable(test_benchmark_types test/test_benchmark_types.cpp)
 target_include_directories(test_benchmark_types PRIVATE include)
 target_link_libraries(test_benchmark_types PRIVATE minikv_benchmark)
@@ -318,6 +333,8 @@ if(BUILD_TESTING)
     add_test(NAME v2_blob_download_fallback
              COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/test/test_v2_blob_download_fallback.sh)
     add_test(NAME write_admission COMMAND test_write_admission)
+    add_test(NAME disk_write_executor COMMAND test_disk_write_executor)
+    add_test(NAME chunk_disk_write_pipeline COMMAND test_chunk_disk_write_pipeline)
     add_test(NAME benchmark_types COMMAND test_benchmark_types)
     add_test(NAME benchmark_input COMMAND test_benchmark_input)
     add_test(NAME benchmark_http COMMAND test_benchmark_http)

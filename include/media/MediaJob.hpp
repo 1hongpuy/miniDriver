@@ -26,6 +26,7 @@ struct MediaJob {
     JobState state = JobState::kPending;
     uint32_t attempts = 0;
     int64_t leaseUntil = 0;
+    std::string leaseToken;
     int64_t nextRetryAt = 0;
     std::string lastError;
     int64_t createdAt = 0;

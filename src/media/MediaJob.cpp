@@ -70,23 +70,24 @@ std::string serializeMediaJob(const MediaJob& job)
     return hexEncode(job.jobId) + "|" + std::to_string(static_cast<int>(job.type)) + "|" +
            hexEncode(job.sourceFileHash) + "|" + hexEncode(job.profile) + "|" +
            std::to_string(static_cast<int>(job.state)) + "|" + std::to_string(job.attempts) + "|" +
-           std::to_string(job.leaseUntil) + "|" + std::to_string(job.nextRetryAt) + "|" +
-           hexEncode(job.lastError) + "|" + std::to_string(job.createdAt) + "|" +
-           std::to_string(job.updatedAt);
+           std::to_string(job.leaseUntil) + "|" + hexEncode(job.leaseToken) + "|" +
+           std::to_string(job.nextRetryAt) + "|" + hexEncode(job.lastError) + "|" +
+           std::to_string(job.createdAt) + "|" + std::to_string(job.updatedAt);
 }
 
 bool parseMediaJob(const std::string& value, MediaJob& out)
 {
     const std::vector<std::string> fields = split(value, '|');
-    if (fields.size() != 11) return false;
+    if (fields.size() != 12) return false;
 
     MediaJob parsed;
     if (!hexDecode(fields[0], parsed.jobId) || !parseJobType(fields[1], parsed.type) ||
         !hexDecode(fields[2], parsed.sourceFileHash) || !hexDecode(fields[3], parsed.profile) ||
         !parseJobState(fields[4], parsed.state) || !parseUint32(fields[5], parsed.attempts) ||
-        !parseInt64(fields[6], parsed.leaseUntil) || !parseInt64(fields[7], parsed.nextRetryAt) ||
-        !hexDecode(fields[8], parsed.lastError) || !parseInt64(fields[9], parsed.createdAt) ||
-        !parseInt64(fields[10], parsed.updatedAt) || parsed.jobId.empty() ||
+        !parseInt64(fields[6], parsed.leaseUntil) || !hexDecode(fields[7], parsed.leaseToken) ||
+        !parseInt64(fields[8], parsed.nextRetryAt) || !hexDecode(fields[9], parsed.lastError) ||
+        !parseInt64(fields[10], parsed.createdAt) || !parseInt64(fields[11], parsed.updatedAt) ||
+        parsed.jobId.empty() ||
         parsed.sourceFileHash.empty() || parsed.profile.empty()) {
         return false;
     }

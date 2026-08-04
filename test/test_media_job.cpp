@@ -13,6 +13,7 @@ int main()
     expected.state = miniKV::media::JobState::kPending;
     expected.attempts = 2;
     expected.leaseUntil = 123;
+    expected.leaseToken = "lease-token";
     expected.nextRetryAt = 456;
     expected.lastError = "temporary redis failure";
     expected.createdAt = 10;
@@ -28,6 +29,7 @@ int main()
     MINIKV_CHECK(actual.state == expected.state);
     MINIKV_CHECK(actual.attempts == expected.attempts);
     MINIKV_CHECK(actual.leaseUntil == expected.leaseUntil);
+    MINIKV_CHECK(actual.leaseToken == expected.leaseToken);
     MINIKV_CHECK(actual.nextRetryAt == expected.nextRetryAt);
     MINIKV_CHECK(actual.lastError == expected.lastError);
     MINIKV_CHECK(actual.createdAt == expected.createdAt);

@@ -8,6 +8,20 @@
 
 **Tech Stack:** C++17, LevelDB, hiredis, existing HTTP/EventLoop library, yaml-cpp, CTest.
 
+## Execution Status
+
+Implemented on `feat/d2-media-task-infrastructure`:
+
+- Tasks 1-3: media values, lease-bound LevelDB ledger, and bounded hiredis Publisher.
+- Task 4: JPEG commit enqueue, rate-limited recovery scan, and authenticated
+  `claim`/`complete`/`fail` APIs.
+- Task 5: YAML Redis configuration and deployment documentation.
+- Task 6: local Redis `XADD` smoke test plus operations documentation.
+
+Implementation detail added during execution: every claim creates a random `leaseToken`; result
+updates must match it, preventing an expired worker from overwriting a newer claim. A `PENDING`
+job remains immediately claimable even while its next reconciliation publish is rate-limited.
+
 ## Global Constraints
 
 - Gateway LevelDB is the source of truth; Redis Streams is not the only copy of task state.

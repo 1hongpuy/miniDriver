@@ -365,6 +365,9 @@ if(BUILD_TESTING)
     add_test(NAME media_job COMMAND test_media_job)
     add_test(NAME gateway_media_jobs COMMAND test_gateway_media_jobs)
     add_test(NAME redis_task_publisher COMMAND test_redis_task_publisher)
+    add_test(NAME v2_media_task_redis
+             COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/test/test_v2_media_task_redis.sh
+                          ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/test_redis_task_publisher)
     add_test(NAME benchmark_types COMMAND test_benchmark_types)
     add_test(NAME benchmark_input COMMAND test_benchmark_input)
     add_test(NAME benchmark_http COMMAND test_benchmark_http)

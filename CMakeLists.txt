@@ -63,9 +63,12 @@ find_path(LEVELDB_INC leveldb/db.h REQUIRED)
 find_package(OpenSSL REQUIRED)
 find_package(yaml-cpp REQUIRED)
 find_package(spdlog REQUIRED)
+find_path(HIREDIS_INC hiredis/hiredis.h REQUIRED)
+find_library(HIREDIS_LIB hiredis REQUIRED)
 
 target_link_libraries(minikv_utils PUBLIC spdlog::spdlog OpenSSL::Crypto)
-target_link_libraries(minikv_media PUBLIC minikv_utils)
+target_include_directories(minikv_media PUBLIC ${HIREDIS_INC})
+target_link_libraries(minikv_media PUBLIC minikv_utils ${HIREDIS_LIB})
 target_link_libraries(minikv_gateway PUBLIC minikv_media)
 target_link_libraries(minikv_http PUBLIC minikv_utils)
 target_link_libraries(minikv_agent PUBLIC minikv_utils)
@@ -298,6 +301,10 @@ target_link_libraries(test_gateway_media_jobs PRIVATE
     pthread
     OpenSSL::Crypto
 )
+
+add_executable(test_redis_task_publisher test/test_redis_task_publisher.cpp)
+target_include_directories(test_redis_task_publisher PRIVATE include test)
+target_link_libraries(test_redis_task_publisher PRIVATE minikv_media pthread)
 target_link_libraries(test_chunk_disk_write_pipeline PRIVATE
     minikv_datanode
     minikv_net
@@ -357,6 +364,7 @@ if(BUILD_TESTING)
     add_test(NAME chunk_disk_write_pipeline COMMAND test_chunk_disk_write_pipeline)
     add_test(NAME media_job COMMAND test_media_job)
     add_test(NAME gateway_media_jobs COMMAND test_gateway_media_jobs)
+    add_test(NAME redis_task_publisher COMMAND test_redis_task_publisher)
     add_test(NAME benchmark_types COMMAND test_benchmark_types)
     add_test(NAME benchmark_input COMMAND test_benchmark_input)
     add_test(NAME benchmark_http COMMAND test_benchmark_http)

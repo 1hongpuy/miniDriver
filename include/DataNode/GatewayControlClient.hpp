@@ -22,6 +22,7 @@ struct NodeRegistration {
     uint64_t maxStorageBytes = 0;
     uint64_t reservedBytes = 0;
     uint32_t maxConcurrentWrites = 2;
+    std::vector<std::string> capabilities{"storage"};
 };
 
 struct NodeHeartbeat {

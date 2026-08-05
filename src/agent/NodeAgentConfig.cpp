@@ -39,6 +39,7 @@ ServiceType parseType(const std::string& value)
 {
     if(value == "gateway") return ServiceType::kGateway;
     if(value == "datanode") return ServiceType::kDataNode;
+    if(value == "thumbnail_worker") return ServiceType::kThumbnailWorker;
     invalid("unknown service type " + value);
 }
 
@@ -124,6 +125,7 @@ NodeAgentConfig parse(const YAML::Node& root)
     
     bool hasEnabledDataNode = false;
     bool hasEnabledGateway = false;
+    bool hasEnabledThumbnailWorker = false;
     std::set<std::string> ids;
     std::set<uint16_t> ports;
     for(const YAML::Node& serviceNode : services) {
@@ -132,8 +134,21 @@ NodeAgentConfig parse(const YAML::Node& root)
         service.id = required<std::string>(serviceNode, "id");
         service.type = parseType(required<std::string>(serviceNode, "type"));
         if(serviceNode["enabled"]) service.enabled = serviceNode["enabled"].as<bool>();
-        service.listenPort = port(serviceNode, "listenPort");
+        if(service.type != ServiceType::kThumbnailWorker) {
+            service.listenPort = port(serviceNode, "listenPort");
+        } else if(serviceNode["listenPort"]) {
+            service.listenPort = port(serviceNode, "listenPort");
+        }
         service.dataDir = required<std::string>(serviceNode, "dataDir");
+        if(service.type == ServiceType::kThumbnailWorker) {
+            service.tempDir = required<std::string>(serviceNode, "tempDir");
+            if(serviceNode["maxConcurrentJobs"]) {
+                service.maxConcurrentJobs = serviceNode["maxConcurrentJobs"].as<uint32_t>();
+            }
+            if(service.tempDir.empty() || service.maxConcurrentJobs == 0) {
+                invalid("invalid thumbnail worker configuration");
+            }
+        }
         service.restart = parseRestart(serviceNode["restart"]);
         if(serviceNode["logs"]) {
             const YAML::Node logs = serviceNode["logs"];
@@ -144,13 +159,15 @@ NodeAgentConfig parse(const YAML::Node& root)
         if(service.id.empty() || service.dataDir.empty()) invalid("empty service id or dataDir");
         service.logging = parseLogging(serviceNode["logging"], service.dataDir, service.id);
         if(!ids.insert(service.id).second) invalid("duplicate service id " + service.id);
-        if(!ports.insert(service.listenPort).second) invalid("duplicate listenPort");
+        if(service.listenPort != 0 && !ports.insert(service.listenPort).second) invalid("duplicate listenPort");
         hasEnabledDataNode = hasEnabledDataNode || (service.enabled && service.type == ServiceType::kDataNode);
         hasEnabledGateway = hasEnabledGateway || (service.enabled && service.type == ServiceType::kGateway);
+        hasEnabledThumbnailWorker = hasEnabledThumbnailWorker ||
+            (service.enabled && service.type == ServiceType::kThumbnailWorker);
         config.services.push_back(std::move(service));
     }
     if(config.services.empty()) invalid("services cannot be empty");
-    if(hasEnabledDataNode) {
+    if(hasEnabledDataNode || hasEnabledThumbnailWorker) {
         config.gatewayAddress = required<std::string>(cluster, "gatewayAddress");
         config.gatewayPort = port(cluster, "gatewayPort");
         if(config.gatewayAddress.empty()) invalid("empty gatewayAddress");
@@ -166,7 +183,7 @@ NodeAgentConfig parse(const YAML::Node& root)
         if(redis["thumbnailStream"]) config.redis.thumbnailStream = redis["thumbnailStream"].as<std::string>();
         if(redis["streamMaxLen"]) config.redis.streamMaxLen = redis["streamMaxLen"].as<uint64_t>();
     }
-    if(hasEnabledGateway && (!cluster["redis"] || config.redis.address.empty() ||
+    if((hasEnabledGateway || hasEnabledThumbnailWorker) && (!cluster["redis"] || config.redis.address.empty() ||
                              config.redis.port == 0 || config.redis.thumbnailStream.empty() ||
                              config.redis.streamMaxLen == 0)) {
         invalid("enabled gateway requires valid cluster.redis");

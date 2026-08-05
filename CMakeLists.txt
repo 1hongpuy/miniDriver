@@ -26,6 +26,7 @@ file(GLOB NET_SRC src/network/*.cpp)
 file(GLOB STORAGE_SRC src/storage/*.cpp)
 file(GLOB UTILS_SRC src/utils/*.cpp)
 file(GLOB_RECURSE MEDIA_SRC src/media/*.cpp)
+list(REMOVE_ITEM MEDIA_SRC "${CMAKE_CURRENT_SOURCE_DIR}/src/media/thumbnail_worker_main.cpp")
 # file(GLOB GATEWAY_SRC src/gateway/*.cpp)
 file(GLOB HTTP_SRC src/http/*.cpp)
 # file(GLOB AGENT_SRC src/agent/*.cpp)
@@ -52,7 +53,7 @@ add_library(minikv_datanode STATIC ${DATANODE_SRC})
 target_include_directories(minikv_net PUBLIC include)
 target_include_directories(minikv_storage PUBLIC include)
 target_include_directories(minikv_utils PUBLIC include)
-target_include_directories(minikv_media PUBLIC include)
+target_include_directories(minikv_media PUBLIC include third_party)
 target_include_directories(minikv_gateway PUBLIC include)
 target_include_directories(minikv_http PUBLIC include)
 target_include_directories(minikv_agent PUBLIC include)
@@ -104,6 +105,16 @@ target_link_libraries(minikv_v2_datanode PRIVATE
     minikv_net
     minikv_utils
     ${LEVELDB_LIB}
+    pthread
+    OpenSSL::Crypto
+)
+
+add_executable(minikv_v2_thumbnail_worker src/media/thumbnail_worker_main.cpp)
+target_link_libraries(minikv_v2_thumbnail_worker PRIVATE
+    minikv_media
+    minikv_http
+    minikv_net
+    minikv_utils
     pthread
     OpenSSL::Crypto
 )
@@ -268,6 +279,10 @@ add_executable(test_node_agent_logging_config test/test_node_agent_logging_confi
 target_include_directories(test_node_agent_logging_config PRIVATE include)
 target_link_libraries(test_node_agent_logging_config PRIVATE minikv_agent yaml-cpp pthread)
 
+add_executable(test_node_agent_thumbnail_worker_config test/test_node_agent_thumbnail_worker_config.cpp)
+target_include_directories(test_node_agent_thumbnail_worker_config PRIVATE include)
+target_link_libraries(test_node_agent_thumbnail_worker_config PRIVATE minikv_agent yaml-cpp pthread)
+
 add_executable(test_replica_upload_metrics test/test_replica_upload_metrics.cpp)
 target_include_directories(test_replica_upload_metrics PRIVATE include)
 target_link_libraries(test_replica_upload_metrics PRIVATE pthread)
@@ -302,9 +317,28 @@ target_link_libraries(test_gateway_media_jobs PRIVATE
     OpenSSL::Crypto
 )
 
+add_executable(test_gateway_derived_upload test/test_gateway_derived_upload.cpp)
+target_include_directories(test_gateway_derived_upload PRIVATE ${LEVELDB_INC} include test)
+target_link_libraries(test_gateway_derived_upload PRIVATE
+    minikv_gateway
+    minikv_media
+    minikv_utils
+    ${LEVELDB_LIB}
+    pthread
+    OpenSSL::Crypto
+)
+
 add_executable(test_redis_task_publisher test/test_redis_task_publisher.cpp)
 target_include_directories(test_redis_task_publisher PRIVATE include test)
 target_link_libraries(test_redis_task_publisher PRIVATE minikv_media pthread)
+
+add_executable(test_jpeg_thumbnail_generator test/test_jpeg_thumbnail_generator.cpp)
+target_include_directories(test_jpeg_thumbnail_generator PRIVATE include third_party test)
+target_link_libraries(test_jpeg_thumbnail_generator PRIVATE minikv_media pthread)
+
+add_executable(test_redis_task_consumer test/test_redis_task_consumer.cpp)
+target_include_directories(test_redis_task_consumer PRIVATE include test)
+target_link_libraries(test_redis_task_consumer PRIVATE minikv_media pthread)
 target_link_libraries(test_chunk_disk_write_pipeline PRIVATE
     minikv_datanode
     minikv_net
@@ -352,6 +386,7 @@ if(BUILD_TESTING)
     add_test(NAME lru_cache COMMAND test_lru_cache)
     add_test(NAME async_logger COMMAND test_async_logger)
     add_test(NAME node_agent_logging_config COMMAND test_node_agent_logging_config)
+    add_test(NAME node_agent_thumbnail_worker_config COMMAND test_node_agent_thumbnail_worker_config)
     add_test(NAME replica_upload_metrics COMMAND test_replica_upload_metrics)
     add_test(NAME process_supervisor COMMAND test_process_supervisor)
     add_test(NAME datanode_delete
@@ -364,7 +399,12 @@ if(BUILD_TESTING)
     add_test(NAME chunk_disk_write_pipeline COMMAND test_chunk_disk_write_pipeline)
     add_test(NAME media_job COMMAND test_media_job)
     add_test(NAME gateway_media_jobs COMMAND test_gateway_media_jobs)
+    add_test(NAME gateway_derived_upload COMMAND test_gateway_derived_upload)
     add_test(NAME redis_task_publisher COMMAND test_redis_task_publisher)
+    add_test(NAME jpeg_thumbnail_generator COMMAND test_jpeg_thumbnail_generator)
+    add_test(NAME redis_task_consumer
+             COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/test/test_v2_redis_task_consumer.sh
+                          ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/test_redis_task_consumer)
     add_test(NAME v2_media_task_redis
              COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/test/test_v2_media_task_redis.sh
                           ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/test_redis_task_publisher)

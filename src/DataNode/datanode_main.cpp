@@ -79,6 +79,18 @@ std::string configuredNodeId(const std::string& fallback)
     return fallback;
 }
 
+std::vector<std::string> configuredCapabilities()
+{
+    if(const char* value = std::getenv("MINIKV_V2_NODE_CAPABILITIES")) {
+        std::vector<std::string> capabilities;
+        for(std::string capability : split(value, ',')) {
+            if(!capability.empty()) capabilities.push_back(std::move(capability));
+        }
+        if(!capabilities.empty()) return capabilities;
+    }
+    return {"storage"};
+}
+
 
 bool parseReplicaTarget(const std::string& value, ReplicaTarget& out)
 {
@@ -521,6 +533,7 @@ int main(int argc, char** argv)
     const std::string gatewayAddress = argv[5];
     const uint16_t gatewayPort = static_cast<uint16_t>(std::stoul(argv[6]));
     const std::string clusterSecret = configuredSecret(argc, argv);
+    const std::vector<std::string> capabilities = configuredCapabilities();
     const CorsPolicy corsPolicy(configuredAllowedOrigin());
     if(clusterSecret.empty()) {
         std::cerr << "MINIKV_V2_CLUSTER_SECRET or a command-line clusterSecret is required\n";
@@ -553,7 +566,8 @@ int main(int argc, char** argv)
     registerNode = [&] {
         if(registered || registrationInFlight) return;
         registrationInFlight = true;
-        gatewayControl.registerStorageNode({nodeId, advertiseAddress, port, availableBytes(dataDir), 0, kMaxConcurrentWrites},
+        gatewayControl.registerStorageNode({nodeId, advertiseAddress, port, availableBytes(dataDir), 0,
+                                            kMaxConcurrentWrites, capabilities},
             [&](RpcResult result) {
                 registrationInFlight = false;
                 if(result.ok) {

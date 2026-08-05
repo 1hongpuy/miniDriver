@@ -14,7 +14,8 @@ EncodedControlRequest makeNodeRegistrationRequest(const NodeRegistration& reques
             "\",\"httpPort\":" + std::to_string(request.httpPort) +
             ",\"maxStorageBytes\":" + std::to_string(request.maxStorageBytes) +
             ",\"reservedBytes\":" + std::to_string(request.reservedBytes) +
-            ",\"maxConcurrentWrites\":" + std::to_string(request.maxConcurrentWrites) + "}"};
+            ",\"maxConcurrentWrites\":" + std::to_string(request.maxConcurrentWrites) +
+            ",\"capabilities\":\"" + jsonEscape(join(request.capabilities, ',')) + "\"}"};
 }
 
 EncodedControlRequest makeHeartbeatRequest(const NodeHeartbeat& request)

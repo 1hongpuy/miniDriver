@@ -206,6 +206,11 @@ size_t estimatedCatalogBytes(const CatalogSnapshot& catalog)
     for (const auto& breadcrumb : catalog.breadcrumbs) bytes += sizeof(Breadcrumb) + breadcrumb.name.size() + breadcrumb.path.size();
     for (const auto& directory : catalog.directories) bytes += sizeof(DirectoryMeta) + directory.ownerId.size() + directory.path.size();
     for (const auto& object : catalog.files) bytes += estimatedObjectBytes(object);
+    for (const auto& [fileHash, thumbnail] : catalog.thumbnailsByFileHash) {
+        bytes += fileHash.size() + sizeof(media::ThumbnailMeta) + thumbnail.profile.size() +
+                 thumbnail.derivedObjectId.size() + thumbnail.derivedFileHash.size() +
+                 thumbnail.jobId.size() + thumbnail.lastError.size();
+    }
     return bytes;
 }
 
@@ -403,17 +408,20 @@ std::string sessionValue(const SessionState& session) {
     return hexEncode(session.sessionId) + "|" + hexEncode(session.ownerId) + "|" + hexEncode(session.fileName) + "|" +
            hexEncode(session.dirPath) + "|" + std::to_string(session.fileSize) + "|" + std::to_string(session.chunkSize) + "|" +
            std::to_string(session.totalChunks) + "|" + std::to_string(session.createdAt) + "|" + std::to_string(session.lastActivityAt) + "|" + join(chunks, ';') + "|" +
-           hexEncode(session.manifestHash);
+           hexEncode(session.manifestHash) + "|" + hexEncode(session.derivedJobId) + "|" +
+           hexEncode(session.derivedProfile);
 }
 bool parseSession(const std::string& value, SessionState& session) {
     const auto f = split(value, '|'); 
-    if (f.size() != 10 && f.size() != 11) return false;
+    if (f.size() != 10 && f.size() != 11 && f.size() != 13) return false;
     try {
         if (!hexDecode(f[0], session.sessionId) || !hexDecode(f[1], session.ownerId) || !hexDecode(f[2], session.fileName) || !hexDecode(f[3], session.dirPath)) return false;
         session.fileSize = std::stoull(f[4]); session.chunkSize = static_cast<uint32_t>(std::stoul(f[5])); session.totalChunks = static_cast<uint32_t>(std::stoul(f[6]));
         session.createdAt = std::stoll(f[7]); session.lastActivityAt = std::stoll(f[8]);
         for (const auto& item : split(f[9], ';')) { if (item.empty()) continue; const auto chunk = split(item, ','); if (chunk.size() != 3) return false; CompletedChunk completed; completed.index = static_cast<uint32_t>(std::stoul(chunk[0])); if (!hexDecode(chunk[1], completed.chunkHash)) return false; completed.size = std::stoull(chunk[2]); session.completed[completed.index] = completed; }
-        if (f.size() == 11 && !hexDecode(f[10], session.manifestHash)) return false;
+        if (f.size() >= 11 && !hexDecode(f[10], session.manifestHash)) return false;
+        if (f.size() == 13 && (!hexDecode(f[11], session.derivedJobId) ||
+                               !hexDecode(f[12], session.derivedProfile))) return false;
         return true;
     } catch (...) { return false; }
 }
@@ -977,6 +985,71 @@ PreflightStatus GatewayState::preflightUpload(const UploadPreflightRequest& requ
     return PreflightStatus::kUploadRequired;
 }
 
+bool GatewayState::createDerivedUpload(const std::string& jobId, const std::string& leaseToken,
+                                       const DerivedUploadRequest& request,
+                                       DerivedUploadResult& out)
+{
+    out = {};
+    std::string fileName;
+    if(jobId.empty() || leaseToken.empty() || request.fileSize == 0 || request.chunkSize == 0 ||
+       request.manifestHash.empty() || !normalizeEntryName(request.fileName, fileName)) {
+        return false;
+    }
+    const uint64_t expectedChunks = 1 + (request.fileSize - 1) / request.chunkSize;
+    if(expectedChunks == 0 || expectedChunks > UINT32_MAX || request.chunks.size() != expectedChunks ||
+       manifestHash(request.fileSize, request.chunkSize, request.chunks) != request.manifestHash) {
+        return false;
+    }
+    for(size_t index = 0; index < request.chunks.size(); ++index) {
+        const auto& chunk = request.chunks[index];
+        const uint64_t expectedSize = index + 1 == request.chunks.size()
+            ? request.fileSize - static_cast<uint64_t>(index) * request.chunkSize
+            : request.chunkSize;
+        if(chunk.chunkIndex != index || chunk.chunkHash.empty() || chunk.chunkSize != expectedSize) {
+            return false;
+        }
+    }
+
+    const int64_t now = unixSeconds();
+    std::lock_guard<std::mutex> lock(mutex_);
+    media::MediaJob job;
+    if(!getMediaJobLocked(jobId, job) || job.type != media::JobType::kThumbnail ||
+       job.state != media::JobState::kRunning || job.leaseToken != leaseToken ||
+       job.leaseUntil < now) {
+        return false;
+    }
+
+    SessionState session;
+    session.sessionId = randomId();
+    if(session.sessionId.empty()) return false;
+    session.fileName = fileName;
+    session.fileSize = request.fileSize;
+    session.chunkSize = request.chunkSize;
+    session.totalChunks = static_cast<uint32_t>(expectedChunks);
+    session.manifestHash = request.manifestHash;
+    session.derivedJobId = job.jobId;
+    session.derivedProfile = job.profile;
+    session.createdAt = session.lastActivityAt = now;
+    for(const auto& chunk : request.chunks) {
+        ChunkRoute route;
+        if(getRouteLocked(chunk.chunkHash, route) && route.size == chunk.chunkSize &&
+           !route.replicas.empty()) {
+            session.completed.emplace(chunk.chunkIndex,
+                                      CompletedChunk{chunk.chunkIndex, chunk.chunkHash, chunk.chunkSize});
+            out.presentChunks.push_back(chunk);
+        } else {
+            out.missingChunks.push_back(chunk);
+        }
+    }
+    sessions_[session.sessionId] = session;
+    if(!persistSessionLocked(session)) {
+        sessions_.erase(session.sessionId);
+        return false;
+    }
+    out.session = std::move(session);
+    return true;
+}
+
 bool GatewayState::getSession(const std::string& sessionId, SessionState& out) const
 {
     std::lock_guard<std::mutex> lock(mutex_);
@@ -1199,6 +1272,93 @@ FileCommitStatus GatewayState::commitFile(const std::string& sessionId, FileMeta
     manifestCache_.erase(out.fileHash);
     return FileCommitStatus::kCommitted;
 }
+
+FileCommitStatus GatewayState::commitDerivedUpload(const std::string& jobId,
+                                                    const std::string& leaseToken,
+                                                    const std::string& sessionId,
+                                                    FileMeta& out)
+{
+    out = {};
+    if(jobId.empty() || leaseToken.empty() || sessionId.empty()) return FileCommitStatus::kInvalidRequest;
+    const int64_t now = unixSeconds();
+    std::lock_guard<std::mutex> lock(mutex_);
+    const auto sessionIt = sessions_.find(sessionId);
+    if(sessionIt == sessions_.end() || sessionIt->second.derivedJobId != jobId ||
+       sessionIt->second.completed.size() != sessionIt->second.totalChunks) {
+        return FileCommitStatus::kInvalidRequest;
+    }
+    media::MediaJob job;
+    media::ThumbnailMeta thumbnail;
+    if(!getMediaJobLocked(jobId, job) || job.type != media::JobType::kThumbnail ||
+       job.state != media::JobState::kRunning || job.leaseToken != leaseToken ||
+       job.leaseUntil < now || sessionIt->second.derivedProfile != job.profile ||
+       !getThumbnailLocked(job.sourceFileHash, job.profile, thumbnail) || thumbnail.jobId != jobId) {
+        return FileCommitStatus::kInvalidRequest;
+    }
+
+    std::vector<ChunkRouteRequest> manifestChunks;
+    out.ownerId = sessionIt->second.ownerId;
+    out.fileName = sessionIt->second.fileName;
+    out.fileSize = sessionIt->second.fileSize;
+    out.chunkSize = sessionIt->second.chunkSize;
+    out.createdAt = now;
+    out.state = FileState::kAvailable;
+    for(uint32_t index = 0; index < sessionIt->second.totalChunks; ++index) {
+        const auto completed = sessionIt->second.completed.find(index);
+        if(completed == sessionIt->second.completed.end()) return FileCommitStatus::kInvalidRequest;
+        out.chunkHashes.push_back(completed->second.chunkHash);
+        manifestChunks.push_back({index, completed->second.chunkHash, completed->second.size});
+        ChunkRoute route;
+        if(!getRouteLocked(completed->second.chunkHash, route) || route.replicas.size() < 2) {
+            out.state = FileState::kProtecting;
+        }
+    }
+    out.fileHash = manifestHash(out.fileSize, out.chunkSize, manifestChunks);
+    if(out.fileHash.empty() || out.fileHash != sessionIt->second.manifestHash) {
+        return FileCommitStatus::kInvalidRequest;
+    }
+
+    ObjectMeta object;
+    object.objectId = randomId();
+    if(object.objectId.empty()) return FileCommitStatus::kInvalidRequest;
+    object.ownerId = out.ownerId;
+    object.name = out.fileName;
+    object.fileHash = out.fileHash;
+    object.fileSize = out.fileSize;
+    object.contentType = "image/jpeg";
+    object.state = out.state;
+    object.createdAt = out.createdAt;
+    out.objectId = object.objectId;
+
+    std::string existingFile;
+    const leveldb::Status fileStatus = db_->Get(leveldb::ReadOptions(), "f:" + out.fileHash, &existingFile);
+    if(!fileStatus.ok() && !fileStatus.IsNotFound()) return FileCommitStatus::kInvalidRequest;
+
+    job.state = media::JobState::kReady;
+    job.leaseUntil = 0;
+    job.leaseToken.clear();
+    job.nextRetryAt = 0;
+    job.lastError.clear();
+    job.updatedAt = now;
+    thumbnail.state = media::JobState::kReady;
+    thumbnail.derivedObjectId = object.objectId;
+    thumbnail.derivedFileHash = out.fileHash;
+    thumbnail.lastError.clear();
+    thumbnail.updatedAt = now;
+
+    leveldb::WriteBatch batch;
+    if(fileStatus.IsNotFound()) batch.Put("f:" + out.fileHash, fileValue(out));
+    batch.Put("obj:" + object.objectId, objectValue(object));
+    batch.Put("j:" + job.jobId, media::serializeMediaJob(job));
+    batch.Put(thumbnailKey(job.sourceFileHash, job.profile), media::serializeThumbnailMeta(thumbnail));
+    if(!db_->Write(leveldb::WriteOptions(), &batch).ok()) return FileCommitStatus::kInvalidRequest;
+
+    objectCache_.erase(object.objectId);
+    fileCache_.erase(out.fileHash);
+    catalogCache_.clear();
+    manifestCache_.erase(out.fileHash);
+    return FileCommitStatus::kCommitted;
+}
 bool GatewayState::getFile(const std::string& fileHash, FileMeta& out) const
 {
     //false -- 没找到， true 找到
@@ -1295,6 +1455,10 @@ bool GatewayState::buildCatalogSnapshotLocked(const std::string& normalized,
         ObjectMeta object;
         if (!parseObject(objectIt->value().ToString(), object)) return false;
         if (object.ownerId == "admin" && object.parentPath == normalized) {
+            media::ThumbnailMeta thumbnail;
+            if(getThumbnailLocked(object.fileHash, "thumb-512-jpeg-v1", thumbnail)) {
+                snapshot.thumbnailsByFileHash.emplace(object.fileHash, std::move(thumbnail));
+            }
             snapshot.files.push_back(std::move(object));
         }
     }

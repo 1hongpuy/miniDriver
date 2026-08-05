@@ -47,8 +47,8 @@ services:
     dataDir: /data/minikv/gateway
 ```
 
-`node.capabilities` 已被解析并保留给 D3 Worker 调度配置；D2 不改变 DataNode 注册的
-`storage` 行为。D3 启用 thumbnail Worker 时才将能力上报给 Gateway。
+`node.capabilities` 会通过 DataNode 注册请求上报给 Gateway。节点仍必须包含
+`storage` 才能作为 Chunk 写入候选；`thumbnail` 只是声明该机器可运行缩略图 Worker。
 
 Node Agent 将 Redis 配置转换为 Gateway 子进程环境变量：
 

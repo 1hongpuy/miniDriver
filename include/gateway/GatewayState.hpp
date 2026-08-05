@@ -88,6 +88,10 @@ struct SessionState {
     // New sessions bind this canonical content identity before any bytes are sent.
     // Empty means a legacy session created by the original V2 API.
     std::string manifestHash;
+    // Non-empty only for a private object produced by an internal media job.
+    // Browser sessions leave these fields empty and retain the existing catalog semantics.
+    std::string derivedJobId;
+    std::string derivedProfile;
     std::map<uint32_t, CompletedChunk>   completed;
     int64_t createdAt = 0;
     int64_t lastActivityAt = 0;
@@ -162,6 +166,20 @@ struct UploadPreflightResult {
     std::vector<ChunkRouteRequest> missingChunks;
 };
 
+struct DerivedUploadRequest {
+    std::string fileName;
+    uint64_t fileSize = 0;
+    uint32_t chunkSize = 0;
+    std::string manifestHash;
+    std::vector<ChunkRouteRequest> chunks;
+};
+
+struct DerivedUploadResult {
+    SessionState session;
+    std::vector<ChunkRouteRequest> presentChunks;
+    std::vector<ChunkRouteRequest> missingChunks;
+};
+
 using ObjectMetaCache = LruCache<std::string, ObjectMeta>;
 
 struct Breadcrumb {
@@ -174,6 +192,7 @@ struct CatalogSnapshot {
     std::vector<Breadcrumb> breadcrumbs;
     std::vector<DirectoryMeta> directories;
     std::vector<ObjectMeta> files;
+    std::map<std::string, media::ThumbnailMeta> thumbnailsByFileHash;
 };
 
 struct ManifestSnapshot {
@@ -231,6 +250,8 @@ public:
     // resumable session containing only the chunks that still need transfer.
     PreflightStatus preflightUpload(const UploadPreflightRequest& request,
                                     UploadPreflightResult& out);
+    bool createDerivedUpload(const std::string& jobId, const std::string& leaseToken,
+                             const DerivedUploadRequest& request, DerivedUploadResult& out);
     static std::string manifestHash(uint64_t fileSize, uint32_t chunkSize,
                                     const std::vector<ChunkRouteRequest>& chunks);
     bool getSession(const std::string& sessionId, SessionState& out) const;
@@ -243,6 +264,9 @@ public:
                                   const std::string& leaseId);
     bool releaseLease(const std::string& leaseId);
     FileCommitStatus commitFile(const std::string& sessionId, FileMeta& out);
+    FileCommitStatus commitDerivedUpload(const std::string& jobId,
+                                         const std::string& leaseToken,
+                                         const std::string& sessionId, FileMeta& out);
     bool getFile(const std::string& fileHash, FileMeta& out) const;
     bool getRoute(const std::string& chunkHash, ChunkRoute& out) const;
     bool buildManifestSnapshot(const std::string& fileHash, ManifestSnapshot& out) const;
@@ -334,8 +358,6 @@ private:
 
 }
 }
-
-
 
 
 

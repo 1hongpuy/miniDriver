@@ -11,6 +11,7 @@
 #include <signal.h>
 #include <stdexcept>
 #include <string>
+#include <sstream>
 #include <sys/signalfd.h>
 #include <unistd.h>
 
@@ -32,6 +33,16 @@ std::string executableDirectory(const char* argv0)
     return path.has_parent_path() ? path.parent_path().string() : ".";
 }
 
+std::string join(const std::vector<std::string>& values)
+{
+    std::ostringstream out;
+    for(size_t index = 0; index < values.size(); ++index) {
+        if(index != 0) out << ',';
+        out << values[index];
+    }
+    return out.str();
+}
+
 void createParentDirectory(const std::string& path)
 {
     if(path.empty()) return;
@@ -42,8 +53,10 @@ void createParentDirectory(const std::string& path)
 ChildSpec childSpec(const ManagedServiceConfig& service, const NodeAgentConfig& config,
     const std::string& binaryDirectory)
 {
-    const std::filesystem::path executable = std::filesystem::path(binaryDirectory) /
-        (service.type == ServiceType::kGateway ? "minikv_v2_gateway" : "minikv_v2_datanode");
+    const char* binaryName = service.type == ServiceType::kGateway ? "minikv_v2_gateway" :
+        service.type == ServiceType::kDataNode ? "minikv_v2_datanode" :
+        "minikv_v2_thumbnail_worker";
+    const std::filesystem::path executable = std::filesystem::path(binaryDirectory) / binaryName;
     ChildSpec spec;
     spec.id = service.id;
     spec.executable = executable.string();
@@ -56,19 +69,28 @@ ChildSpec childSpec(const ManagedServiceConfig& service, const NodeAgentConfig& 
     spec.environment["MINIKV_V2_LOG_QUEUE_SIZE"] = std::to_string(service.logging.queueSize);
     spec.environment["MINIKV_V2_LOG_ROTATE_BYTES"] = std::to_string(service.logging.rotateBytes);
     spec.environment["MINIKV_V2_LOG_ROTATE_FILES"] = std::to_string(service.logging.rotateFiles);
+    spec.environment["MINIKV_V2_NODE_CAPABILITIES"] = join(config.capabilities);
     if(service.type == ServiceType::kGateway) {
         spec.argv = {spec.executable, std::to_string(service.listenPort), service.dataDir};
         spec.environment["MINIKV_V2_REDIS_ADDRESS"] = config.redis.address;
         spec.environment["MINIKV_V2_REDIS_PORT"] = std::to_string(config.redis.port);
         spec.environment["MINIKV_V2_REDIS_THUMBNAIL_STREAM"] = config.redis.thumbnailStream;
         spec.environment["MINIKV_V2_REDIS_STREAM_MAXLEN"] = std::to_string(config.redis.streamMaxLen);
-    } else {
+    } else if(service.type == ServiceType::kDataNode) {
         spec.argv = {spec.executable, config.nodeId, config.advertiseAddress,
                     std::to_string(service.listenPort), service.dataDir,
                     config.gatewayAddress, std::to_string(config.gatewayPort)};
         if(!config.webAllowedOrigin.empty()) {
             spec.environment["MINIKV_V2_ALLOWED_ORIGIN"] = config.webAllowedOrigin;
         }
+    } else {
+        spec.argv = {spec.executable, config.nodeId, service.dataDir, service.tempDir,
+                     std::to_string(service.maxConcurrentJobs)};
+        spec.environment["MINIKV_V2_GATEWAY_ADDRESS"] = config.gatewayAddress;
+        spec.environment["MINIKV_V2_GATEWAY_PORT"] = std::to_string(config.gatewayPort);
+        spec.environment["MINIKV_V2_REDIS_ADDRESS"] = config.redis.address;
+        spec.environment["MINIKV_V2_REDIS_PORT"] = std::to_string(config.redis.port);
+        spec.environment["MINIKV_V2_REDIS_THUMBNAIL_STREAM"] = config.redis.thumbnailStream;
     }      
     return spec;
 }

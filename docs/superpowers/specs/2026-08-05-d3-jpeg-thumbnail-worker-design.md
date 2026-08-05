@@ -54,11 +54,12 @@ The Worker must not use the browser-facing upload APIs and must not access a Dat
 Gateway adds internal endpoints that create and complete a derived upload session:
 
 ```text
-POST /internal/v2/derived-uploads
-  sourceFileHash, profile, fileName, fileSize, chunkSize, manifestHash, chunks
+POST /internal/v2/media/jobs/{jobId}/derived-uploads
+  leaseToken, fileName, fileSize, chunkSize, manifestHash, chunks
   -> sessionId, missingChunks
 
-POST /internal/v2/derived-uploads/{sessionId}/commit
+POST /internal/v2/media/jobs/{jobId}/derived-uploads/{sessionId}/commit
+  leaseToken
   -> derivedObjectId, derivedFileHash
 ```
 
@@ -97,7 +98,7 @@ Each catalog file item may include:
 "thumbnail": {
   "profile": "thumb-512-jpeg-v1",
   "state": "PENDING|RUNNING|READY|FAILED|UNSUPPORTED",
-  "derivedObjectId": "..."
+  "objectId": "..."
 }
 ```
 
@@ -117,7 +118,7 @@ services:
     enabled: true
     dataDir: /data/minikv/thumbnail-worker
     tempDir: /data/minikv/tmp/thumbnail
-    concurrency: 1
+    maxConcurrentJobs: 1
 ```
 
 The Worker needs Gateway address/port, Redis configuration, cluster secret, and its own logs.

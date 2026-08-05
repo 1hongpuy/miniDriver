@@ -193,7 +193,17 @@ std::string catalogJson(const CatalogSnapshot& snapshot) {
         out << "{\"objectId\":\"" << jsonEscape(file.objectId) << "\",\"name\":\""
             << jsonEscape(file.name) << "\",\"fileHash\":\"" << jsonEscape(file.fileHash)
             << "\",\"fileSize\":" << file.fileSize << ",\"state\":\""
-            << fileStateName(file.state) << "\",\"createdAt\":" << file.createdAt << "}";
+            << fileStateName(file.state) << "\",\"createdAt\":" << file.createdAt;
+        const auto thumbnail = snapshot.thumbnailsByFileHash.find(file.fileHash);
+        if(thumbnail != snapshot.thumbnailsByFileHash.end()) {
+            out << ",\"thumbnail\":{\"profile\":\"" << jsonEscape(thumbnail->second.profile)
+                << "\",\"state\":\"" << mediaJobStateName(thumbnail->second.state) << "\"";
+            if(thumbnail->second.state == miniKV::media::JobState::kReady) {
+                out << ",\"objectId\":\"" << jsonEscape(thumbnail->second.derivedObjectId) << "\"";
+            }
+            out << "}";
+        }
+        out << "}";
     }
     out << "]}";
     return out.str();
@@ -222,6 +232,30 @@ std::string uploadPreflightJson(const UploadPreflightResult& result) {
     for (size_t i = 0; i < result.missingChunks.size(); ++i) {
         if (i) out << ',';
         out << result.missingChunks[i].chunkIndex;
+    }
+    out << "]}";
+    return out.str();
+}
+
+std::string derivedUploadJson(const DerivedUploadResult& result)
+{
+    std::ostringstream out;
+    out << "{\"sessionId\":\"" << jsonEscape(result.session.sessionId)
+        << "\",\"manifestHash\":\"" << jsonEscape(result.session.manifestHash)
+        << "\",\"chunkSize\":" << result.session.chunkSize
+        << ",\"totalChunks\":" << result.session.totalChunks << ",\"completed\":[";
+    bool first = true;
+    for(const auto& [index, chunk] : result.session.completed) {
+        if(!first) out << ',';
+        first = false;
+        out << index;
+    }
+    out << "],\"missingChunks\":[";
+    for(size_t index = 0; index < result.missingChunks.size(); ++index) {
+        if(index != 0) out << ',';
+        const auto& chunk = result.missingChunks[index];
+        out << "{\"index\":" << chunk.chunkIndex << ",\"hash\":\""
+            << jsonEscape(chunk.chunkHash) << "\",\"size\":" << chunk.chunkSize << "}";
     }
     out << "]}";
     return out.str();
@@ -323,7 +357,11 @@ int main(int argc, char** argv) {
         const std::string body = request.body();
         if (request.method() == HttpRequest::kPost && path == "/api/v2/nodes/register") {
             if (!constantTimeEquals(request.getHeader("X-Cluster-Internal-Token"), clusterSecret)) { json(response, 403, jsonError("invalid cluster token")); return; }
-            NodeRecord node; node.nodeId = jsonString(body, "nodeId"); node.address = jsonString(body, "address"); node.httpPort = static_cast<uint16_t>(jsonUint(body, "httpPort", 9002)); node.maxStorageBytes = jsonUint(body, "maxStorageBytes"); node.reservedBytes = jsonUint(body, "reservedBytes"); node.maxConcurrentWrites = static_cast<uint32_t>(jsonUint(body, "maxConcurrentWrites", 2)); node.capabilities = {"storage"};
+            NodeRecord node; node.nodeId = jsonString(body, "nodeId"); node.address = jsonString(body, "address"); node.httpPort = static_cast<uint16_t>(jsonUint(body, "httpPort", 9002)); node.maxStorageBytes = jsonUint(body, "maxStorageBytes"); node.reservedBytes = jsonUint(body, "reservedBytes"); node.maxConcurrentWrites = static_cast<uint32_t>(jsonUint(body, "maxConcurrentWrites", 2));
+            for(const std::string& capability : split(jsonString(body, "capabilities"), ',')) {
+                if(!capability.empty()) node.capabilities.push_back(capability);
+            }
+            if(node.capabilities.empty()) node.capabilities = {"storage"};
             if (!state.registerNode(node)) {
                 json(response, 400, jsonError("invalid node registration"));
             } else {
@@ -513,9 +551,54 @@ int main(int argc, char** argv) {
                 return;
             }
             const std::string prefix = "/internal/v2/media/jobs/";
+            const std::string derivedCreateSuffix = "/derived-uploads";
+            const std::string derivedCommitSuffix = "/commit";
             const std::string claimSuffix = "/claim";
             const std::string completeSuffix = "/complete";
             const std::string failSuffix = "/fail";
+            if(path.size() > prefix.size() + derivedCreateSuffix.size() &&
+               path.rfind(derivedCreateSuffix) == path.size() - derivedCreateSuffix.size()) {
+                const std::string jobId = pathTail(path, prefix, derivedCreateSuffix);
+                DerivedUploadRequest derived;
+                derived.fileName = jsonString(body, "fileName");
+                derived.fileSize = jsonUint(body, "fileSize");
+                derived.chunkSize = static_cast<uint32_t>(jsonUint(body, "chunkSize"));
+                derived.manifestHash = jsonString(body, "manifestHash");
+                derived.chunks = parseRouteRequests(body);
+                DerivedUploadResult result;
+                if(!state.createDerivedUpload(jobId, jsonString(body, "leaseToken"), derived, result)) {
+                    json(response, 409, jsonError("derived upload rejected"));
+                } else {
+                    miniKV::utils::logInfo("event=derived_upload_created job=" + jobId +
+                                           " session=" + result.session.sessionId +
+                                           " missing=" + std::to_string(result.missingChunks.size()));
+                    json(response, 200, derivedUploadJson(result));
+                }
+                return;
+            }
+            if(path.size() > prefix.size() + derivedCreateSuffix.size() + 1 +
+                derivedCommitSuffix.size() &&
+               path.rfind(derivedCommitSuffix) == path.size() - derivedCommitSuffix.size()) {
+                const std::string rest = path.substr(prefix.size(),
+                    path.size() - prefix.size() - derivedCommitSuffix.size());
+                const size_t separator = rest.find(derivedCreateSuffix + "/");
+                if(separator != std::string::npos) {
+                    const std::string jobId = rest.substr(0, separator);
+                    const std::string sessionId = rest.substr(separator + derivedCreateSuffix.size() + 1);
+                    FileMeta file;
+                    const FileCommitStatus status = state.commitDerivedUpload(
+                        jobId, jsonString(body, "leaseToken"), sessionId, file);
+                    if(status == FileCommitStatus::kCommitted) {
+                        miniKV::utils::logInfo("event=derived_upload_committed job=" + jobId +
+                                               " object=" + file.objectId + " file=" + file.fileHash);
+                        json(response, 200, "{\"objectId\":\"" + jsonEscape(file.objectId) +
+                                            "\",\"fileHash\":\"" + jsonEscape(file.fileHash) + "\"}");
+                    } else {
+                        json(response, 409, jsonError("derived upload commit rejected"));
+                    }
+                    return;
+                }
+            }
             if(path.size() > prefix.size() + claimSuffix.size() &&
                path.rfind(claimSuffix) == path.size() - claimSuffix.size()) {
                 miniKV::media::MediaJob job;

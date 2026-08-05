@@ -9,7 +9,8 @@ namespace agent {
 
 enum class ServiceType {
     kGateway,
-    kDataNode
+    kDataNode,
+    kThumbnailWorker
 };
 
 struct RestartPolicy {
@@ -44,6 +45,8 @@ struct ManagedServiceConfig {
     bool enabled = true;
     uint16_t listenPort = 0;
     std::string dataDir;
+    std::string tempDir;
+    uint32_t maxConcurrentJobs = 1;
     RestartPolicy restart;
     ServiceLogs logs;
     ServiceLoggingConfig logging;
@@ -70,7 +73,6 @@ std::string readClusterSecret(const std::string& path);
 
 
 }  // namespace miniKV::v2
-
 
 
 

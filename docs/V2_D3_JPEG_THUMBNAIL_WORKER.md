@@ -132,5 +132,11 @@ Worker 进程即可，它们作为同一 Redis consumer group 的竞争消费者
 5. 用对应的 `objectId` 请求 `/api/v2/objects/{objectId}/manifest`，按普通 Chunk 下载流程
    读取 JPEG；最长边分别不超过 512px 和 2048px。
 
-当前不支持 RAW、PNG、HEIC 或视频。它们不会由 Gateway 投递派生图任务；后续加入各自
-解码器后沿用同一任务、派生对象和状态模型。
+## RAW 内嵌预览
+
+安装 `libraw-dev` 后，同一个 Worker 还会处理 `.nef`、`.cr2`、`.arw`、`.dng`。它不进行
+耗时的 RAW 解码或 demosaic，而是用 LibRaw 从相机文件中提取内嵌 JPEG，再按上面的两个
+profile 缩放。没有内嵌 JPEG、损坏或超过限制的 RAW 会进入 `UNSUPPORTED`，不会阻塞上传。
+
+当前不支持 PNG、HEIC 或视频；它们不会由 Gateway 投递派生图任务，后续加入各自解码器后
+沿用同一任务、派生对象和状态模型。

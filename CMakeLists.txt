@@ -66,10 +66,12 @@ find_package(yaml-cpp REQUIRED)
 find_package(spdlog REQUIRED)
 find_path(HIREDIS_INC hiredis/hiredis.h REQUIRED)
 find_library(HIREDIS_LIB hiredis REQUIRED)
+find_path(LIBRAW_INC libraw/libraw.h REQUIRED)
+find_library(LIBRAW_LIB raw REQUIRED)
 
 target_link_libraries(minikv_utils PUBLIC spdlog::spdlog OpenSSL::Crypto)
-target_include_directories(minikv_media PUBLIC ${HIREDIS_INC})
-target_link_libraries(minikv_media PUBLIC minikv_utils ${HIREDIS_LIB})
+target_include_directories(minikv_media PUBLIC ${HIREDIS_INC} ${LIBRAW_INC})
+target_link_libraries(minikv_media PUBLIC minikv_utils ${HIREDIS_LIB} ${LIBRAW_LIB})
 target_link_libraries(minikv_gateway PUBLIC minikv_media)
 target_link_libraries(minikv_http PUBLIC minikv_utils)
 target_link_libraries(minikv_agent PUBLIC minikv_utils)
@@ -336,6 +338,10 @@ add_executable(test_jpeg_thumbnail_generator test/test_jpeg_thumbnail_generator.
 target_include_directories(test_jpeg_thumbnail_generator PRIVATE include third_party test)
 target_link_libraries(test_jpeg_thumbnail_generator PRIVATE minikv_media pthread)
 
+add_executable(test_raw_embedded_preview test/test_raw_embedded_preview.cpp)
+target_include_directories(test_raw_embedded_preview PRIVATE include test)
+target_link_libraries(test_raw_embedded_preview PRIVATE minikv_media pthread)
+
 add_executable(test_redis_task_consumer test/test_redis_task_consumer.cpp)
 target_include_directories(test_redis_task_consumer PRIVATE include test)
 target_link_libraries(test_redis_task_consumer PRIVATE minikv_media pthread)
@@ -404,6 +410,7 @@ if(BUILD_TESTING)
     add_test(NAME gateway_derived_upload COMMAND test_gateway_derived_upload)
     add_test(NAME redis_task_publisher COMMAND test_redis_task_publisher)
     add_test(NAME jpeg_thumbnail_generator COMMAND test_jpeg_thumbnail_generator)
+    add_test(NAME raw_embedded_preview COMMAND test_raw_embedded_preview)
     add_test(NAME redis_task_consumer
              COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/test/test_v2_redis_task_consumer.sh
                           ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/test_redis_task_consumer)

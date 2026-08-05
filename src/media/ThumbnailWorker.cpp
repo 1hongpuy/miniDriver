@@ -2,6 +2,7 @@
 
 #include "http/AsyncHttpClient.hpp"
 #include "media/JpegThumbnailGenerator.hpp"
+#include "media/RawEmbeddedPreview.hpp"
 #include "network/EventLoop.hpp"
 #include "utils/AsyncLogger.hpp"
 #include "utils/Util.hpp"
@@ -265,7 +266,21 @@ void ThumbnailWorker::generateThumbnailInExecutor()
     const std::weak_ptr<ThumbnailWorker> weakSelf(shared_from_this());
     conversionThread_ = std::thread([weakSelf, source, output, options] {
         JpegThumbnailResult result;
-        const bool success = generateJpegThumbnail(source, output, result, options);
+        bool success = generateJpegThumbnail(source, output, result, options);
+        if(!success && result.unsupported) {
+            RawEmbeddedPreviewResult rawResult;
+            const std::string extracted = output + ".embedded.jpg";
+            if(extractRawEmbeddedJpeg(source, extracted, rawResult)) {
+                result = {};
+                success = generateJpegThumbnail(extracted, output, result, options);
+            } else {
+                result = {};
+                result.unsupported = rawResult.unsupported;
+                result.error = rawResult.error;
+            }
+            std::error_code ignored;
+            std::filesystem::remove(extracted, ignored);
+        }
         if(auto self = weakSelf.lock()) {
             self->loop_->queueInLoop([weakSelf, success, unsupported = result.unsupported,
                                       error = std::move(result.error)]() mutable {

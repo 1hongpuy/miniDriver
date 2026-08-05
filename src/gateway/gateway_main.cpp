@@ -7,6 +7,7 @@
 #include "utils/Util.hpp"
 #include "http/DeferredResponse.hpp"
 #include "http/AsyncHttpClient.hpp"
+#include "media/RawEmbeddedPreview.hpp"
 #include "media/RedisTaskPublisher.hpp"
 #include "utils/AsyncLogger.hpp"
 
@@ -86,14 +87,15 @@ miniKV::media::RedisTaskPublisherConfig configuredRedisPublisher()
     return config;
 }
 
-bool isJpegFileName(const std::string& fileName)
+bool isDerivedImageSourceFileName(const std::string& fileName)
 {
     const size_t dot = fileName.rfind('.');
     if(dot == std::string::npos) return false;
     std::string suffix = fileName.substr(dot);
     std::transform(suffix.begin(), suffix.end(), suffix.begin(),
                    [](unsigned char value) { return static_cast<char>(std::tolower(value)); });
-    return suffix == ".jpg" || suffix == ".jpeg";
+    return suffix == ".jpg" || suffix == ".jpeg" ||
+           miniKV::media::isRawEmbeddedPreviewFileName(fileName);
 }
 
 constexpr std::array<const char*, 2> kJpegDerivedProfiles = {
@@ -674,7 +676,7 @@ int main(int argc, char** argv) {
                 json(response, 400, jsonError("all chunks with at least one replica are required"));
                 return;
             }
-            if(isJpegFileName(file.fileName)) {
+            if(isDerivedImageSourceFileName(file.fileName)) {
                 for(const char* profile : kJpegDerivedProfiles) {
                     const auto derived = state.enqueueThumbnail(file.fileHash, profile, unixSeconds());
                     if(derived.publishRequired) enqueueMediaJob(derived.job);

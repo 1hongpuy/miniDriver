@@ -47,6 +47,11 @@ def catalog():
                     "state": "READY",
                     "objectId": "thumbnail-ready",
                 },
+                "preview": {
+                    "profile": "preview-2048-jpeg-v1",
+                    "state": "READY",
+                    "objectId": "preview-ready",
+                },
             },
             {
                 "objectId": "source-pending",
@@ -58,6 +63,10 @@ def catalog():
                     "profile": "thumb-512-jpeg-v1",
                     "state": "PENDING",
                 },
+                "preview": {
+                    "profile": "preview-2048-jpeg-v1",
+                    "state": "PENDING",
+                },
             },
         ],
     }
@@ -66,7 +75,8 @@ def catalog():
 def object_metadata(object_id):
     return {
         "objectId": object_id,
-        "name": "thumb-512-jpeg-v1.jpg" if object_id == "thumbnail-ready" else "sunset.jpg",
+        "name": "thumb-512-jpeg-v1.jpg" if object_id == "thumbnail-ready" else
+                "preview-2048-jpeg-v1.jpg" if object_id == "preview-ready" else "sunset.jpg",
         "fileSize": len(THUMBNAIL_BYTES),
         "state": "AVAILABLE",
     }
@@ -105,9 +115,16 @@ def main():
                                 "replicas": [{"address": "node-test", "httpPort": 9002}],
                             }],
                         }))
-                    elif parsed.path == "/api/v2/objects/source-ready":
+                    elif parsed.path == "/api/v2/objects/preview-ready":
                         route.fulfill(status=200, content_type="application/json",
-                                      body=json.dumps(object_metadata("source-ready")))
+                                      body=json.dumps(object_metadata("preview-ready")))
+                    elif parsed.path == "/api/v2/objects/preview-ready/manifest":
+                        route.fulfill(status=200, content_type="application/json", body=json.dumps({
+                            "fileSize": len(THUMBNAIL_BYTES), "chunks": [{
+                                "index": 0, "hash": THUMBNAIL_HASH,
+                                "replicas": [{"address": "node-test", "httpPort": 9002}],
+                            }],
+                        }))
                     else:
                         route.fulfill(status=404, content_type="application/json", body='{"error":"unexpected"}')
 
@@ -135,7 +152,9 @@ def main():
 
                 ready_card.click()
                 page.locator("#object-preview").wait_for(state="visible")
-                assert "/api/v2/objects/source-ready" in requested_paths
+                assert "/api/v2/objects/preview-ready" in requested_paths
+                assert "/api/v2/objects/preview-ready/manifest" in requested_paths
+                assert "/api/v2/objects/source-ready/manifest" not in requested_paths
             finally:
                 browser.close()
     finally:

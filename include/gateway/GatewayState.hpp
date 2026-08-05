@@ -193,6 +193,7 @@ struct CatalogSnapshot {
     std::vector<DirectoryMeta> directories;
     std::vector<ObjectMeta> files;
     std::map<std::string, media::ThumbnailMeta> thumbnailsByFileHash;
+    std::map<std::string, media::ThumbnailMeta> previewsByFileHash;
 };
 
 struct ManifestSnapshot {
@@ -358,12 +359,6 @@ private:
 
 }
 }
-
-
-
-
-
-
 
 
 

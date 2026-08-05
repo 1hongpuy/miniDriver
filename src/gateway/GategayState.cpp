@@ -206,11 +206,15 @@ size_t estimatedCatalogBytes(const CatalogSnapshot& catalog)
     for (const auto& breadcrumb : catalog.breadcrumbs) bytes += sizeof(Breadcrumb) + breadcrumb.name.size() + breadcrumb.path.size();
     for (const auto& directory : catalog.directories) bytes += sizeof(DirectoryMeta) + directory.ownerId.size() + directory.path.size();
     for (const auto& object : catalog.files) bytes += estimatedObjectBytes(object);
-    for (const auto& [fileHash, thumbnail] : catalog.thumbnailsByFileHash) {
-        bytes += fileHash.size() + sizeof(media::ThumbnailMeta) + thumbnail.profile.size() +
-                 thumbnail.derivedObjectId.size() + thumbnail.derivedFileHash.size() +
-                 thumbnail.jobId.size() + thumbnail.lastError.size();
-    }
+    const auto addDerivedBytes = [&bytes](const auto& records) {
+        for (const auto& [fileHash, record] : records) {
+            bytes += fileHash.size() + sizeof(media::ThumbnailMeta) + record.profile.size() +
+                     record.derivedObjectId.size() + record.derivedFileHash.size() +
+                     record.jobId.size() + record.lastError.size();
+        }
+    };
+    addDerivedBytes(catalog.thumbnailsByFileHash);
+    addDerivedBytes(catalog.previewsByFileHash);
     return bytes;
 }
 
@@ -1458,6 +1462,10 @@ bool GatewayState::buildCatalogSnapshotLocked(const std::string& normalized,
             media::ThumbnailMeta thumbnail;
             if(getThumbnailLocked(object.fileHash, "thumb-512-jpeg-v1", thumbnail)) {
                 snapshot.thumbnailsByFileHash.emplace(object.fileHash, std::move(thumbnail));
+            }
+            media::ThumbnailMeta preview;
+            if(getThumbnailLocked(object.fileHash, "preview-2048-jpeg-v1", preview)) {
+                snapshot.previewsByFileHash.emplace(object.fileHash, std::move(preview));
             }
             snapshot.files.push_back(std::move(object));
         }

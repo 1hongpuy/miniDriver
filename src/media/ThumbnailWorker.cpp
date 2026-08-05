@@ -21,7 +21,7 @@ namespace {
 
 constexpr uint32_t kDerivedChunkSize = 4U * 1024U * 1024U;
 constexpr size_t kMaxQueuedJobs = 64;
-constexpr size_t kMaxThumbnailBytes = 8U * 1024U * 1024U;
+constexpr size_t kMaxDerivedImageBytes = 16U * 1024U * 1024U;
 
 bool isSuccess(int status) { return status >= 200 && status < 300; }
 
@@ -149,10 +149,13 @@ void ThumbnailWorker::claimCurrentInLoop()
         self->current_->sourceFileHash = miniKV::util::jsonString(body, "sourceFileHash");
         const std::string profile = miniKV::util::jsonString(body, "profile");
         if(self->current_->jobId.empty() || self->current_->leaseToken.empty() ||
-           self->current_->sourceFileHash.empty() || profile != "thumb-512-jpeg-v1") {
+           self->current_->sourceFileHash.empty() ||
+           !jpegDerivedProfile(profile, self->current_->jpegOptions,
+                               self->current_->derivedFileName)) {
             self->failCurrentInLoop(false, "invalid thumbnail claim response");
             return;
         }
+        self->current_->profile = profile;
         self->fetchSourceManifestInLoop();
     });
 }
@@ -200,7 +203,7 @@ void ThumbnailWorker::fetchSourceManifestInLoop()
         self->current_->sourcePath = (std::filesystem::path(self->config_.tempDir) /
                                       (self->current_->jobId + ".source.jpg")).string();
         self->current_->thumbnailPath = (std::filesystem::path(self->config_.tempDir) /
-                                         (self->current_->jobId + ".thumb.jpg")).string();
+                                         (self->current_->jobId + "." + self->current_->profile + ".jpg")).string();
         self->current_->sourceOutput.open(self->current_->sourcePath, std::ios::binary | std::ios::trunc);
         if(!self->current_->sourceOutput) {
             self->failCurrentInLoop(false, "cannot create source temporary file");
@@ -258,10 +261,11 @@ void ThumbnailWorker::generateThumbnailInExecutor()
     if(conversionThread_.joinable()) conversionThread_.join();
     const std::string source = current_->sourcePath;
     const std::string output = current_->thumbnailPath;
+    const JpegThumbnailOptions options = current_->jpegOptions;
     const std::weak_ptr<ThumbnailWorker> weakSelf(shared_from_this());
-    conversionThread_ = std::thread([weakSelf, source, output] {
+    conversionThread_ = std::thread([weakSelf, source, output, options] {
         JpegThumbnailResult result;
-        const bool success = generateJpegThumbnail(source, output, result);
+        const bool success = generateJpegThumbnail(source, output, result, options);
         if(auto self = weakSelf.lock()) {
             self->loop_->queueInLoop([weakSelf, success, unsupported = result.unsupported,
                                       error = std::move(result.error)]() mutable {
@@ -287,7 +291,7 @@ bool ThumbnailWorker::buildUploadManifest(const std::string& path, std::string& 
     std::ostringstream content;
     content << input.rdbuf();
     bytes = content.str();
-    if(bytes.empty() || bytes.size() > kMaxThumbnailBytes) { error = "thumbnail output size is invalid"; return false; }
+    if(bytes.empty() || bytes.size() > kMaxDerivedImageBytes) { error = "derived image output size is invalid"; return false; }
     chunks.clear();
     for(size_t offset = 0, index = 0; offset < bytes.size(); offset += kDerivedChunkSize, ++index) {
         const size_t count = std::min<size_t>(kDerivedChunkSize, bytes.size() - offset);
@@ -327,7 +331,8 @@ void ThumbnailWorker::beginDerivedUploadInLoop()
         return;
     }
     const std::string body = "{\"leaseToken\":\"" + miniKV::util::jsonEscape(current_->leaseToken) +
-        "\",\"fileName\":\"thumb-512-jpeg-v1.jpg\",\"fileSize\":" +
+        "\",\"fileName\":\"" + miniKV::util::jsonEscape(current_->derivedFileName) +
+        "\",\"fileSize\":" +
         std::to_string(current_->thumbnailBytes.size()) + ",\"chunkSize\":" +
         std::to_string(kDerivedChunkSize) + ",\"manifestHash\":\"" + manifestHash +
         "\",\"chunks\":" + chunksJson(current_->uploadChunks) + "}";
@@ -453,7 +458,8 @@ void ThumbnailWorker::commitDerivedUploadInLoop()
             self->failCurrentInLoop(false, error.empty() ? "derived upload commit failed" : error);
             return;
         }
-        miniKV::utils::logInfo("event=thumbnail_ready job=" + self->current_->jobId);
+        miniKV::utils::logInfo("event=derived_image_ready job=" + self->current_->jobId +
+                               " profile=" + self->current_->profile);
         self->finishCurrentInLoop(true);
     });
 }

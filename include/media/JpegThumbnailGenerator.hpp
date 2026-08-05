@@ -22,6 +22,11 @@ struct JpegThumbnailResult {
     std::string error;
 };
 
+// Maps a stable derived-object profile to its image-generation settings.
+// Returns false for profiles this JPEG-only generator cannot produce.
+bool jpegDerivedProfile(const std::string& profile, JpegThumbnailOptions& options,
+                        std::string& derivedFileName);
+
 bool generateJpegThumbnail(const std::string& sourcePath, const std::string& outputPath,
                            JpegThumbnailResult& result,
                            const JpegThumbnailOptions& options = {});

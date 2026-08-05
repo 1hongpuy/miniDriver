@@ -119,6 +119,37 @@ int main()
     MINIKV_CHECK(thumbnail.derivedObjectId == derivedFile.objectId);
     MINIKV_CHECK(thumbnail.derivedFileHash == derivedFile.fileHash);
 
+    const auto previewEnqueued = state.enqueueThumbnail(sourceFile.fileHash,
+                                                        "preview-2048-jpeg-v1", now + 1);
+    MINIKV_CHECK(previewEnqueued.publishRequired);
+    miniKV::media::MediaJob previewJob;
+    MINIKV_CHECK(state.claimMediaJob(previewEnqueued.job.jobId, now + 1, 120, previewJob));
+
+    DerivedUploadRequest previewRequest;
+    previewRequest.fileName = "preview-2048-jpeg-v1.jpg";
+    previewRequest.fileSize = kChunkSize;
+    previewRequest.chunkSize = kChunkSize;
+    previewRequest.chunks = {{0, "preview-derived-chunk", kChunkSize}};
+    previewRequest.manifestHash = GatewayState::manifestHash(previewRequest.fileSize,
+                                                              previewRequest.chunkSize,
+                                                              previewRequest.chunks);
+    DerivedUploadResult previewDerived;
+    MINIKV_CHECK(state.createDerivedUpload(previewJob.jobId, previewJob.leaseToken,
+                                           previewRequest, previewDerived));
+    MINIKV_CHECK(commitAll(state, previewDerived.session.sessionId, previewDerived.missingChunks));
+    FileMeta previewFile;
+    MINIKV_CHECK(state.commitDerivedUpload(previewJob.jobId, previewJob.leaseToken,
+                                           previewDerived.session.sessionId, previewFile) ==
+                 FileCommitStatus::kCommitted);
+
+    MINIKV_CHECK(state.listCatalog("/shoots", catalog));
+    MINIKV_CHECK(catalog.previewsByFileHash.count(sourceFile.fileHash) == 1);
+    const auto& preview = catalog.previewsByFileHash.at(sourceFile.fileHash);
+    MINIKV_CHECK(preview.profile == "preview-2048-jpeg-v1");
+    MINIKV_CHECK(preview.state == miniKV::media::JobState::kReady);
+    MINIKV_CHECK(preview.derivedObjectId == previewFile.objectId);
+    MINIKV_CHECK(preview.derivedObjectId != thumbnail.derivedObjectId);
+
     std::filesystem::remove_all(directory, error);
     return 0;
 }

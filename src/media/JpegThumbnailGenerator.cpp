@@ -43,6 +43,27 @@ void fail(JpegThumbnailResult& result, const std::string& error, bool unsupporte
 
 }  // namespace
 
+bool jpegDerivedProfile(const std::string& profile, JpegThumbnailOptions& options,
+                        std::string& derivedFileName)
+{
+    JpegThumbnailOptions selected;
+    std::string selectedFileName;
+    if(profile == "thumb-512-jpeg-v1") {
+        selected.maxEdge = 512;
+        selected.jpegQuality = 82;
+        selectedFileName = "thumb-512-jpeg-v1.jpg";
+    } else if(profile == "preview-2048-jpeg-v1") {
+        selected.maxEdge = 2048;
+        selected.jpegQuality = 88;
+        selectedFileName = "preview-2048-jpeg-v1.jpg";
+    } else {
+        return false;
+    }
+    options = selected;
+    derivedFileName = std::move(selectedFileName);
+    return true;
+}
+
 bool generateJpegThumbnail(const std::string& sourcePath, const std::string& outputPath,
                            JpegThumbnailResult& result, const JpegThumbnailOptions& options)
 {

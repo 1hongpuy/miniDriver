@@ -1,6 +1,7 @@
 #pragma once
 
 #include "media/RedisTaskConsumer.hpp"
+#include "media/JpegThumbnailGenerator.hpp"
 
 #include <cstdint>
 #include <deque>
@@ -47,6 +48,9 @@ private:
         std::string jobId;
         std::string leaseToken;
         std::string sourceFileHash;
+        std::string profile;
+        std::string derivedFileName;
+        JpegThumbnailOptions jpegOptions;
         std::string sourcePath;
         std::string thumbnailPath;
         std::ofstream sourceOutput;

@@ -43,6 +43,30 @@ int main()
     MINIKV_CHECK(height == 256);
     stbi_image_free(decoded);
 
+    miniKV::media::JpegThumbnailOptions previewOptions;
+    std::string previewFileName;
+    MINIKV_CHECK(miniKV::media::jpegDerivedProfile("preview-2048-jpeg-v1",
+                                                   previewOptions, previewFileName));
+    MINIKV_CHECK(previewOptions.maxEdge == 2048);
+    MINIKV_CHECK(previewOptions.jpegQuality == 88);
+    MINIKV_CHECK(previewFileName == "preview-2048-jpeg-v1.jpg");
+    MINIKV_CHECK(!miniKV::media::jpegDerivedProfile("invalid-profile", previewOptions,
+                                                    previewFileName));
+
+    const std::filesystem::path largeSource = directory / "large-source.jpg";
+    const std::filesystem::path preview = directory / "preview.jpg";
+    std::vector<unsigned char> largePixels(4096 * 1024 * 3, 0);
+    for(size_t index = 0; index < largePixels.size(); index += 3) {
+        largePixels[index] = 40;
+        largePixels[index + 1] = 140;
+        largePixels[index + 2] = 220;
+    }
+    MINIKV_CHECK(stbi_write_jpg(largeSource.c_str(), 4096, 1024, 3, largePixels.data(), 90) != 0);
+    MINIKV_CHECK(miniKV::media::generateJpegThumbnail(largeSource.string(), preview.string(), result,
+                                                       previewOptions));
+    MINIKV_CHECK(result.width == 2048);
+    MINIKV_CHECK(result.height == 512);
+
     const std::filesystem::path nonJpeg = directory / "not-image.txt";
     std::FILE* invalid = std::fopen(nonJpeg.c_str(), "wb");
     MINIKV_CHECK(invalid != nullptr);

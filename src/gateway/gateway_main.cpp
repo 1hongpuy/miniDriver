@@ -11,6 +11,7 @@
 #include "utils/AsyncLogger.hpp"
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cctype>
 #include <cstdlib>
@@ -94,6 +95,11 @@ bool isJpegFileName(const std::string& fileName)
                    [](unsigned char value) { return static_cast<char>(std::tolower(value)); });
     return suffix == ".jpg" || suffix == ".jpeg";
 }
+
+constexpr std::array<const char*, 2> kJpegDerivedProfiles = {
+    "thumb-512-jpeg-v1",
+    "preview-2048-jpeg-v1",
+};
 
 const char* mediaJobStateName(miniKV::media::JobState state)
 {
@@ -194,14 +200,21 @@ std::string catalogJson(const CatalogSnapshot& snapshot) {
             << jsonEscape(file.name) << "\",\"fileHash\":\"" << jsonEscape(file.fileHash)
             << "\",\"fileSize\":" << file.fileSize << ",\"state\":\""
             << fileStateName(file.state) << "\",\"createdAt\":" << file.createdAt;
-        const auto thumbnail = snapshot.thumbnailsByFileHash.find(file.fileHash);
-        if(thumbnail != snapshot.thumbnailsByFileHash.end()) {
-            out << ",\"thumbnail\":{\"profile\":\"" << jsonEscape(thumbnail->second.profile)
-                << "\",\"state\":\"" << mediaJobStateName(thumbnail->second.state) << "\"";
-            if(thumbnail->second.state == miniKV::media::JobState::kReady) {
-                out << ",\"objectId\":\"" << jsonEscape(thumbnail->second.derivedObjectId) << "\"";
+        const auto appendDerived = [&out](const char* field, const miniKV::media::ThumbnailMeta& derived) {
+            out << ",\"" << field << "\":{\"profile\":\"" << jsonEscape(derived.profile)
+                << "\",\"state\":\"" << mediaJobStateName(derived.state) << "\"";
+            if(derived.state == miniKV::media::JobState::kReady) {
+                out << ",\"objectId\":\"" << jsonEscape(derived.derivedObjectId) << "\"";
             }
             out << "}";
+        };
+        if(const auto thumbnail = snapshot.thumbnailsByFileHash.find(file.fileHash);
+           thumbnail != snapshot.thumbnailsByFileHash.end()) {
+            appendDerived("thumbnail", thumbnail->second);
+        }
+        if(const auto preview = snapshot.previewsByFileHash.find(file.fileHash);
+           preview != snapshot.previewsByFileHash.end()) {
+            appendDerived("preview", preview->second);
         }
         out << "}";
     }
@@ -662,9 +675,10 @@ int main(int argc, char** argv) {
                 return;
             }
             if(isJpegFileName(file.fileName)) {
-                const auto thumbnail = state.enqueueThumbnail(
-                    file.fileHash, "thumb-512-jpeg-v1", unixSeconds());
-                if(thumbnail.publishRequired) enqueueMediaJob(thumbnail.job);
+                for(const char* profile : kJpegDerivedProfiles) {
+                    const auto derived = state.enqueueThumbnail(file.fileHash, profile, unixSeconds());
+                    if(derived.publishRequired) enqueueMediaJob(derived.job);
+                }
             }
             json(response, 200, "{\"objectId\":\"" + jsonEscape(file.objectId) + "\",\"fileHash\":\"" +
                 jsonEscape(file.fileHash) + "\",\"state\":\"" + fileStateName(file.state) + "\"}");

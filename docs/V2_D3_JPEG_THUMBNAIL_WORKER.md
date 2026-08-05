@@ -2,8 +2,13 @@
 
 ## 已实现边界
 
-本阶段只处理已经提交的 `.jpg` 和 `.jpeg` 对象，输出一个
-`thumb-512-jpeg-v1` 派生对象：最长边不超过 512px、不会放大、小图 JPEG 质量为 82。
+本阶段只处理已经提交的 `.jpg` 和 `.jpeg` 对象，并为每个源对象创建两个独立、幂等的
+派生任务：
+
+| Profile | 最大边长 | JPEG 质量 | 用途 |
+| --- | ---: | ---: | --- |
+| `thumb-512-jpeg-v1` | 512px | 82 | 目录瀑布流/缩略图 |
+| `preview-2048-jpeg-v1` | 2048px | 88 | 浏览器预览弹窗 |
 
 它不会阻塞 Gateway 或 DataNode 的上传路径。Worker 是 Node Agent 启动的独立进程：
 
@@ -13,7 +18,7 @@ Gateway LevelDB job + ThumbnailMeta
   -> thumbnail_worker Redis consumer thread
   -> Gateway claim lease
   -> manifest / DataNode Chunk GET / 临时源文件
-  -> JPEG CPU thread
+  -> JPEG CPU thread（按 profile 缩放）
   -> internal derived-upload / DataNode Chunk PUT
   -> Gateway atomic READY update / XACK
 ```
@@ -93,7 +98,7 @@ Worker 进程即可，它们作为同一 Redis consumer group 的竞争消费者
 
 ## 状态和失败语义
 
-目录 API 的文件项现在会带有：
+目录 API 的文件项会分别带有 `thumbnail` 和 `preview` 元数据。两者使用相同的状态字段：
 
 ```json
 "thumbnail": {
@@ -109,17 +114,23 @@ Worker 进程即可，它们作为同一 Redis consumer group 的竞争消费者
 - `FAILED`：网络、Redis、DataNode 或临时 I/O 的可重试错误；Gateway 稍后重新发布。
 - `UNSUPPORTED`：不是可解码 JPEG、超过输入/像素限制等，相同源字节重试没有意义。
 
-缩略图派生对象不会出现在用户目录；它只由源文件的 `ThumbnailMeta` 引用。相同源内容
-出现在多个逻辑目录时，仍只生成一份缩略图。
+派生对象不会出现在用户目录；它只由源文件的 `ThumbnailMeta` 引用。相同源内容出现在
+多个逻辑目录时，每种 profile 仍只生成一份派生图。
+
+源对象始终是“下载原始文件”的目标。预览弹窗在 `preview.state=READY` 时读取 2048px
+派生 JPEG，但下载按钮仍读取源对象。对于新上传对象，`PENDING/RUNNING` 预览会显示
+生成中，不会退回下载原图作为预览；旧对象没有 `preview` 元数据时保持原有预览行为，
+以后由回填任务补齐。
 
 ## 手动验证
 
 1. 用 Node Agent 启动 Gateway、至少一个 DataNode 和一个 `thumbnail_worker`。
 2. 上传一个新的 JPEG，等待数秒。
-3. 检查 Worker 日志中是否有 `event=thumbnail_ready`。
-4. 查询 `GET /api/v2/catalog?path=/目标目录`，确认源文件的 `thumbnail.state` 为 `READY`。
-5. 用 `thumbnail.objectId` 请求 `/api/v2/objects/{objectId}/manifest`，然后按普通 Chunk
-   下载流程读取 JPEG；它应为不超过 512px 的图像。
+3. 检查 Worker 日志中是否有两条 `event=derived_image_ready`，profile 分别为 512 和 2048。
+4. 查询 `GET /api/v2/catalog?path=/目标目录`，确认源文件的 `thumbnail.state`、
+   `preview.state` 都为 `READY`。
+5. 用对应的 `objectId` 请求 `/api/v2/objects/{objectId}/manifest`，按普通 Chunk 下载流程
+   读取 JPEG；最长边分别不超过 512px 和 2048px。
 
-当前不支持 RAW、PNG、HEIC 或视频。它们不会由 Gateway 投递缩略图任务；后续加入各自
+当前不支持 RAW、PNG、HEIC 或视频。它们不会由 Gateway 投递派生图任务；后续加入各自
 解码器后沿用同一任务、派生对象和状态模型。

@@ -586,7 +586,7 @@
       meta.textContent = `${formatBytes(file.fileSize)} · ${thumbnailLabel(file.thumbnail)}`;
       const previewButton = document.createElement("button");
       previewButton.type = "button"; previewButton.className = "catalog-row__command"; previewButton.textContent = "预览";
-      previewButton.addEventListener("click", (event) => { event.stopPropagation(); selectObject(file.objectId); });
+      previewButton.addEventListener("click", (event) => { event.stopPropagation(); selectObject(file); });
       const downloadButton = document.createElement("button");
       downloadButton.type = "button"; downloadButton.className = "catalog-row__command"; downloadButton.textContent = "下载";
       downloadButton.addEventListener("click", async (event) => {
@@ -602,10 +602,10 @@
       actions.append(previewButton, downloadButton, deleteButton);
       body.append(name, meta, actions);
       card.append(surface, body);
-      card.addEventListener("click", () => selectObject(file.objectId));
+      card.addEventListener("click", () => selectObject(file));
       card.addEventListener("keydown", (event) => {
         if (event.key === "Enter" || event.key === " ") {
-          event.preventDefault(); selectObject(file.objectId);
+          event.preventDefault(); selectObject(file);
         }
       });
       fileGrid.append(card);
@@ -646,20 +646,35 @@
     previewState.object = null;
   }
 
-  async function openObjectPreview(objectId) {
+  async function openObjectPreview(file) {
     const requestId = previewState.requestId + 1;
     previewState.requestId = requestId;
-    const object = await request(`/objects/${encodeURIComponent(objectId)}`, { method: "GET" });
-    if (requestId !== previewState.requestId) return;
-    catalogState.selectedObject = object;
+    const hasPreview = Object.prototype.hasOwnProperty.call(file, "preview");
+    const derivedPreview = file.preview;
+    const previewReady = derivedPreview?.state === "READY" && derivedPreview.objectId;
+
+    catalogState.selectedObject = file;
     releasePreviewUrl();
-    previewState.object = object; previewState.scale = 1;
+    previewState.object = file; previewState.scale = 1;
     preview.hidden = false;
-    previewTitle.textContent = object.name;
-    previewMeta.textContent = `${formatBytes(object.fileSize)} · ${object.state}`;
-    previewStatus.textContent = previewableImage(object.name) ? "正在读取预览。" : "此格式不能在浏览器中直接预览，可下载原始文件。";
+    previewTitle.textContent = file.name;
+    previewMeta.textContent = `${formatBytes(file.fileSize)} · ${file.state}`;
     previewStage.replaceChildren(previewStatus);
     previewDownload.disabled = false; previewDownload.textContent = "下载原始文件";
+
+    if (hasPreview && !previewReady) {
+      previewStatus.textContent = derivedPreview?.state === "FAILED"
+        ? "预览图生成失败，可下载原始文件。"
+        : "预览图正在生成，可下载原始文件。";
+      return;
+    }
+
+    const previewObjectId = previewReady ? derivedPreview.objectId : file.objectId;
+    const object = await request(`/objects/${encodeURIComponent(previewObjectId)}`, { method: "GET" });
+    if (requestId !== previewState.requestId) return;
+    previewStatus.textContent = previewableImage(object.name)
+      ? "正在读取预览。"
+      : "此格式不能在浏览器中直接预览，可下载原始文件。";
     if (!previewableImage(object.name)) return;
 
     const manifest = await request(`/objects/${object.objectId}/manifest`, { method: "GET" });
@@ -692,8 +707,8 @@
     previewStage.append(image);
   }
 
-  async function selectObject(objectId) {
-    await openObjectPreview(objectId);
+  async function selectObject(file) {
+    await openObjectPreview(file);
   }
 
   async function loadCatalog(path = catalogState.activeDirectory) {

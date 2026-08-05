@@ -29,7 +29,10 @@
   const previewStatus = $("#preview-status");
   const previewDownload = $("#preview-download");
   const entries = new Map();
-  const catalogState = { activeDirectory: "/", catalog: null, selectedObject: null };
+  const catalogState = {
+    activeDirectory: "/", catalog: null, selectedObject: null,
+    requestId: 0, renderId: 0, thumbnailUrls: new Map(),
+  };
   const previewState = { object: null, url: null, scale: 1, image: null, requestId: 0 };
 
   function formatBytes(bytes) {
@@ -437,6 +440,71 @@
     return paragraph;
   }
 
+  function releaseCatalogThumbnails() {
+    for (const url of catalogState.thumbnailUrls.values()) URL.revokeObjectURL(url);
+    catalogState.thumbnailUrls.clear();
+  }
+
+  function thumbnailLabel(thumbnail) {
+    const state = thumbnail?.state || "UNSUPPORTED";
+    return {
+      READY: "缩略图就绪",
+      PENDING: "缩略图生成中",
+      RUNNING: "缩略图生成中",
+      FAILED: "缩略图生成失败",
+      UNSUPPORTED: "暂无缩略图",
+    }[state] || "暂无缩略图";
+  }
+
+  async function loadThumbnailUrl(objectId, renderId) {
+    const cached = catalogState.thumbnailUrls.get(objectId);
+    if (cached) return cached;
+    const manifest = await request(`/objects/${encodeURIComponent(objectId)}/manifest`, { method: "GET" });
+    const blobs = [];
+    for (const chunk of manifest.chunks || []) blobs.push(await fetchVerifiedChunk(chunk));
+    const url = URL.createObjectURL(new Blob(blobs, { type: "image/jpeg" }));
+    if (renderId !== catalogState.renderId) {
+      URL.revokeObjectURL(url);
+      return null;
+    }
+    catalogState.thumbnailUrls.set(objectId, url);
+    return url;
+  }
+
+  function createThumbnailSurface(file, renderId) {
+    const surface = document.createElement("div");
+    surface.className = "catalog-card__media";
+    const thumbnail = file.thumbnail;
+    const state = thumbnail?.state || "UNSUPPORTED";
+    surface.dataset.state = state.toLowerCase();
+
+    if (state !== "READY" || !thumbnail?.objectId) {
+      const placeholder = document.createElement("span");
+      placeholder.className = "catalog-card__placeholder";
+      placeholder.textContent = state === "PENDING" || state === "RUNNING" ? "◇" : "—";
+      surface.append(placeholder);
+      return surface;
+    }
+
+    const image = document.createElement("img");
+    image.className = "catalog-card__image";
+    image.alt = `${file.name} 的缩略图`;
+    surface.append(image);
+    loadThumbnailUrl(thumbnail.objectId, renderId).then((url) => {
+      if (!url || renderId !== catalogState.renderId || !image.isConnected) return;
+      image.src = url;
+    }).catch(() => {
+      if (renderId !== catalogState.renderId || !surface.isConnected) return;
+      surface.dataset.state = "failed";
+      image.remove();
+      const placeholder = document.createElement("span");
+      placeholder.className = "catalog-card__placeholder";
+      placeholder.textContent = "—";
+      surface.append(placeholder);
+    });
+    return surface;
+  }
+
   function pathName(path) {
     if (path === "/") return "根目录";
     const parts = path.split("/").filter(Boolean);
@@ -497,29 +565,52 @@
       row.addEventListener("click", () => loadCatalog(directory.path));
       catalogEntries.append(row);
     }
-    for (const file of catalog.files || []) {
-      const row = document.createElement("article");
-      row.className = "catalog-row";
-      const name = document.createElement("strong"); name.textContent = file.name;
-      const meta = document.createElement("span"); meta.textContent = `${formatBytes(file.fileSize)} · ${file.state}`;
+    const files = catalog.files || [];
+    if (!files.length) return;
+    const fileGrid = document.createElement("div");
+    fileGrid.className = "catalog-files";
+    const renderId = catalogState.renderId;
+    for (const file of files) {
+      const card = document.createElement("article");
+      card.className = "catalog-card";
+      card.dataset.objectId = file.objectId;
+      card.dataset.thumbnailState = file.thumbnail?.state || "UNSUPPORTED";
+      card.tabIndex = 0;
+      card.setAttribute("role", "button");
+      card.setAttribute("aria-label", `预览 ${file.name}`);
+      const surface = createThumbnailSurface(file, renderId);
+      const body = document.createElement("div");
+      body.className = "catalog-card__body";
+      const name = document.createElement("strong"); name.className = "catalog-card__name"; name.textContent = file.name;
+      const meta = document.createElement("span"); meta.className = "catalog-card__meta";
+      meta.textContent = `${formatBytes(file.fileSize)} · ${thumbnailLabel(file.thumbnail)}`;
       const previewButton = document.createElement("button");
       previewButton.type = "button"; previewButton.className = "catalog-row__command"; previewButton.textContent = "预览";
-      previewButton.addEventListener("click", () => selectObject(file.objectId));
+      previewButton.addEventListener("click", (event) => { event.stopPropagation(); selectObject(file.objectId); });
       const downloadButton = document.createElement("button");
       downloadButton.type = "button"; downloadButton.className = "catalog-row__command"; downloadButton.textContent = "下载";
-      downloadButton.addEventListener("click", async () => {
+      downloadButton.addEventListener("click", async (event) => {
+        event.stopPropagation();
         try { await downloadFile(file, downloadButton); }
         catch (error) { window.alert(error.message); }
       });
       const deleteButton = document.createElement("button");
       deleteButton.type = "button"; deleteButton.className = "catalog-row__command catalog-row__command--danger";
       deleteButton.textContent = "删除"; deleteButton.setAttribute("aria-label", `删除 ${file.name}`);
-      deleteButton.addEventListener("click", () => deleteObject(file, deleteButton));
+      deleteButton.addEventListener("click", (event) => { event.stopPropagation(); deleteObject(file, deleteButton); });
       const actions = document.createElement("div"); actions.className = "catalog-row__actions";
       actions.append(previewButton, downloadButton, deleteButton);
-      row.append(name, meta, actions);
-      catalogEntries.append(row);
+      body.append(name, meta, actions);
+      card.append(surface, body);
+      card.addEventListener("click", () => selectObject(file.objectId));
+      card.addEventListener("keydown", (event) => {
+        if (event.key === "Enter" || event.key === " ") {
+          event.preventDefault(); selectObject(file.objectId);
+        }
+      });
+      fileGrid.append(card);
     }
+    catalogEntries.append(fileGrid);
   }
 
   function previewableImage(name) {
@@ -606,7 +697,12 @@
   }
 
   async function loadCatalog(path = catalogState.activeDirectory) {
+    const requestId = catalogState.requestId + 1;
+    catalogState.requestId = requestId;
     const catalog = await request(`/catalog?path=${encodeURIComponent(path)}`, { method: "GET" });
+    if (requestId !== catalogState.requestId) return;
+    releaseCatalogThumbnails();
+    catalogState.renderId += 1;
     catalogState.activeDirectory = catalog.path;
     catalogState.catalog = catalog;
     catalogState.selectedObject = null;

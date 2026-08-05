@@ -196,6 +196,35 @@ h2 { margin: 0; font: 24px/1.1 var(--serif); letter-spacing: 0; }
 .catalog-row__command { border: 0; padding: 3px 4px; color: var(--muted); background: transparent; font-size: 10px; text-decoration: underline; text-underline-offset: 3px; }
 .catalog-row__command:hover { color: var(--safe); }
 .catalog-row__command--danger:hover { color: var(--danger); }
+.catalog-files {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(154px, 1fr));
+  gap: 10px;
+  padding: 14px 0 2px;
+}
+.catalog-card {
+  display: grid;
+  grid-template-rows: 112px auto;
+  min-width: 0;
+  overflow: hidden;
+  border: 1px solid #303833;
+  border-radius: 2px;
+  background: #151a17;
+  color: var(--paper);
+  cursor: pointer;
+}
+.catalog-card:hover, .catalog-card:focus-visible { border-color: var(--safe); outline: 0; }
+.catalog-card__media { position: relative; display: grid; min-height: 0; place-items: center; overflow: hidden; background: #090d0b; }
+.catalog-card__media::after { position: absolute; inset: 0; border: 1px solid rgb(255 255 255 / .03); content: ""; pointer-events: none; }
+.catalog-card__image { width: 100%; height: 100%; object-fit: cover; }
+.catalog-card__placeholder { color: var(--slate); font: 28px/1 var(--serif); }
+.catalog-card__media[data-state="pending"] .catalog-card__placeholder,
+.catalog-card__media[data-state="running"] .catalog-card__placeholder { color: var(--amber); }
+.catalog-card__body { display: grid; gap: 6px; min-width: 0; padding: 9px; }
+.catalog-card__name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 11px; }
+.catalog-card__meta { overflow: hidden; color: var(--muted); font-size: 9px; text-overflow: ellipsis; white-space: nowrap; }
+.catalog-card .catalog-row__actions { justify-content: flex-start; }
+.catalog-card .catalog-row__command { padding: 2px 0; }
 .object-detail { margin-top: 18px; padding-top: 14px; border-top: 1px solid var(--line); }
 .object-detail p { margin: 7px 0 0; color: var(--muted); font-size: 11px; }
 .recent-file, .node-row { border-top: 1px solid #303833; }
@@ -250,6 +279,7 @@ h2 { margin: 0; font: 24px/1.1 var(--serif); letter-spacing: 0; }
   .directory-tree { grid-template-columns: 1fr; }
   .catalog-row { grid-template-columns: minmax(0, 1fr) auto; }
   .catalog-row__actions { grid-column: 1 / -1; }
+  .catalog-files { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .object-preview { padding: 10px; }
   .object-preview__surface { max-height: calc(100vh - 20px); }
   .object-preview__footer { align-items: flex-start; flex-direction: column; }

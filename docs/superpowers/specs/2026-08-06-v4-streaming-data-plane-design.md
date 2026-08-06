@@ -86,6 +86,28 @@ lanes allow two Chunks to the same replica to proceed concurrently without
 opening a new TCP connection for every Chunk. A failed lane fails only its
 active Chunk, closes, and reconnects with bounded exponential backoff.
 
+### Lane Liveness and Half-Open Connections
+
+`Idle` means that this process has no assigned request. It does not prove that
+the peer or the network path is still alive. Each outbound lane therefore:
+
+- enables `SO_KEEPALIVE`; on Linux it configures `TCP_KEEPIDLE`,
+  `TCP_KEEPINTVL`, and `TCP_KEEPCNT` from configuration;
+- treats `EPOLLRDHUP`, `EPOLLHUP`, `EPOLLERR`, `read() == 0`, and a send error
+  as an immediate transition to `Failed`;
+- uses `send(..., MSG_NOSIGNAL)` for normal socket writes so a peer close
+  cannot terminate the process with `SIGPIPE`;
+- closes the fd, releases queued blocks, and reconnects with bounded backoff
+  after a failure.
+
+The pool does not rely on a pre-assignment socket-health probe. `SO_ERROR` or
+a successful probe cannot prove that a peer will still be alive at the later
+write, so such a check creates a false guarantee and a race. Instead, a lane
+is event-driven while idle; if its first real write fails, the uncommitted
+Chunk is retried through the existing idempotent route/commit semantics after
+the lane is recreated. Optional application-level idle probes may reduce the
+first-request reconnect delay, but are not a correctness requirement.
+
 The existing upload token, replica chain, `X-Replica-Position`, content length,
 and Chunk hash headers are sent for every request. Keep-Alive changes socket
 lifetime, not authorization scope.
@@ -145,10 +167,68 @@ write records the current block offset and retains the block reference until
 the remaining bytes are sent. No output queue may retain raw pointers into an
 HTTP input Buffer after that Buffer consumes its bytes.
 
+The lane owns a FIFO of references, rather than a concatenated byte string:
+
+```cpp
+struct SharedWriteSlice {
+    std::shared_ptr<SharedBodyBlock> block;
+    size_t offset;
+    size_t length;
+};
+```
+
+On each `EPOLLOUT`, the lane creates a temporary `iovec` array for the leading
+slices and calls `writev`. If it returns `n > 0`, the lane consumes exactly
+`n` bytes: it removes fully written slices and advances the first remaining
+slice's offset for a partial write. `EAGAIN` retains the queue unchanged and
+keeps `EPOLLOUT` enabled; `EINTR` retries; any terminal error releases all
+references and fails only the affected Chunk. A block cannot return to the
+pool until both its disk reference and every unsent replica reference are
+gone.
+
 High/low watermarks apply to bytes retained by unsent SharedBodyBlocks, not
 only a `std::string` output buffer. If any required downstream consumer is
 above its high watermark, the upstream connection pauses reading. It resumes
 only once the owning loop observes all relevant low-watermark conditions.
+
+### Shared-Block Capacity and Liveness Invariants
+
+The current V2 disk pool has `128 * 64 KiB = 8 MiB`. V4 shared blocks use a
+similarly bounded pool. A block held by both the disk worker and a replica
+lane counts once, not twice: the pool budget is the union of uniquely leased
+blocks, while the following per-consumer counters diagnose who retains them:
+
+```text
+unique leased shared bytes <= pool capacity - reserved free capacity
+
+diagnostic counters: disk queued, disk in-flight, replica unsent,
+                     and retained bytes per stream
+```
+
+The exact values are configuration, but V4 must enforce all of the following
+at admission time:
+
+- a global shared-block byte/block limit below pool capacity;
+- a per-upload-stream retained-byte limit;
+- a per-replica-lane unsent-byte limit;
+- a nonzero reserved-free-block count so one noisy stream cannot consume every
+  block;
+- global active-Chunk and route-lease limits consistent with those bounds.
+
+For example, with 128 blocks, a conservative initial configuration may reserve
+16 blocks and cap each of four active Chunk streams at eight retained blocks.
+That admits at most 32 stream blocks, leaving headroom for in-flight work and
+control transitions. The implementation must validate the configuration rather
+than trusting an informal inequality such as `activeChunks * perStreamBytes <
+poolBytes` alone.
+
+Pool exhaustion is backpressure, not an HTTP error: the HTTP parser leaves the
+unconsumed body bytes in its input buffer and pauses `EPOLLIN`. It is not a
+deadlock because releasing an already-held block never needs a new block:
+disk completion, successful socket writes, lane failure, and cancellation all
+release references independently. The implementation must preserve that
+property and test a permanently stalled replica, a full pool, lane failure,
+and subsequent recovery.
 
 ## Metadata Batching
 
@@ -220,6 +300,9 @@ Acceptance proceeds by stage:
    `std::string` copy without use-after-free or buffer corruption.
 6. Multi-loop load has lower EventLoop tail lag than the one-loop baseline at
    the same workload, while preserving end-to-end SHA-256 validation.
+7. A peer closing an idle lane, a partial `writev`, and complete shared-block
+   pool exhaustion each recover without process termination, leaked blocks,
+   duplicate Chunk commit, or permanent upstream pause.
 
 ## Implementation Order
 

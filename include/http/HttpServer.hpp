@@ -38,6 +38,10 @@ public:
 
     using BodyStreamSetup = std::function<void(HttpContext*, const HttpRequest&, 
                                           const network::TcpConnectionPtr&)>;
+    // Applies protocol-specific headers to parser-level errors before the
+    // connection is closed. DataNode uses this to keep CORS visible on a
+    // rejected streaming request.
+    using ErrorResponseDecorator = std::function<void(const HttpRequest&, HttpResponse*)>;
 
     HttpServer(network::EventLoop* loop, utils::ThreadPool* pool, int port)
         : loop_(loop),
@@ -56,6 +60,7 @@ public:
     void setHttpCallback(HttpCallback cb) {httpCallback_ = std::move(cb);}
     void setStreamCheck(StreamCheck cb) { streamCheck_ = std::move(cb); };
     void setBodyStreamSetup(BodyStreamSetup cb) { bodyStreamSetup_ = std::move(cb); }
+    void setErrorResponseDecorator(ErrorResponseDecorator cb) { errorResponseDecorator_ = std::move(cb); }
     void start() { server_.start(); }
 
     network::EventLoop*  loop() { return loop_;}
@@ -97,7 +102,10 @@ private:
                 }
                 if(ctx->isError())
                 {
-                    sendError(conn, HttpResponse::k400BadRequest, "Bad Request");
+                    miniKV::utils::logWarn("event=http_stream_body_aborted method=" +
+                                            ctx->request().methodString() + " path=" +
+                                            ctx->request().path());
+                    sendError(conn, HttpResponse::k400BadRequest, "Bad Request", ctx->request());
                     contexts_.erase(conn->fd());
                     conn->shutdown();
                     return ;
@@ -189,12 +197,14 @@ private:
 
     void sendError(const network::TcpConnectionPtr& conn,
                    HttpResponse::HttpStatusCode code,
-                   const std::string& message)
+                   const std::string& message,
+                   const HttpRequest& request)
     {
         HttpResponse resp;
         resp.setStatusCode(code);
         resp.setBody(message);
         resp.setCloseConnection(true);//传输已经脏了
+        if(errorResponseDecorator_) errorResponseDecorator_(request, &resp);
 
         network::Buffer buf;
         resp.appendToBuffer(&buf);
@@ -218,6 +228,7 @@ private:
     HttpCallback    httpCallback_;
     BodyStreamSetup bodyStreamSetup_;
     StreamCheck     streamCheck_;
+    ErrorResponseDecorator errorResponseDecorator_;
 
     std::map<int, std::shared_ptr<HttpContext>> contexts_;
 };

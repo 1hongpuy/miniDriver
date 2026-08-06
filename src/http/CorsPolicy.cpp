@@ -32,7 +32,7 @@ void CorsPolicy::appendHeaders(http::HttpResponse& response, const std::string& 
     response.addHeader("Access-Control-Allow-Origin", allowedOrigin_);
     response.addHeader("Access-Control-Allow-Methods", kAllowedMethods);
     response.addHeader("Access-Control-Allow-Headers", kAllowedHeaders);
-    response.addHeader("Access-Control-Expose-Headers", "Content-Length, X-Chunk-Hash");
+    response.addHeader("Access-Control-Expose-Headers", "Content-Length, X-Chunk-Hash, Retry-After");
     response.addHeader("Access-Control-Max-Age", "600");
     response.addHeader("Vary", "Origin");
 }

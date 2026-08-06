@@ -232,12 +232,15 @@ public:
     {
         if(firstBodyAt_ == Clock::time_point{}) firstBodyAt_ = Clock::now();
         if(admissionRejected_) return HttpContext::BodyConsumeResult::kContinue;
-        if(!error_.empty() || writer_ == nullptr || diskPipeline_ == nullptr)
+        if(!error_.empty() || writer_ == nullptr || diskPipeline_ == nullptr) {
+            logBodyRejected(error_.empty() ? "stream is not writable" : error_, size);
             return HttpContext::BodyConsumeResult::kAbort;
+        }
 
         const auto diskResult = diskPipeline_->push(bytes, size);
         if(diskResult == HttpContext::BodyConsumeResult::kAbort) {
             error_ = "local disk write queue rejected body bytes";
+            logBodyRejected(error_, size);
             return HttpContext::BodyConsumeResult::kAbort;
         }
         if(replicaPipe_ == nullptr) return diskResult;
@@ -246,7 +249,7 @@ public:
         if(replicaResult == HttpContext::BodyConsumeResult::kAbort) {
             error_ = "replica stream rejected body bytes";
             diskPipeline_->cancel();
-            miniKV::utils::logError("event=chunk_replica_body_rejected chunk=" + chunkHash_);
+            logBodyRejected(error_, size);
             return HttpContext::BodyConsumeResult::kAbort;
         }
         if(replicaResult == HttpContext::BodyConsumeResult::kPause) {
@@ -256,6 +259,15 @@ public:
                replicaResult == HttpContext::BodyConsumeResult::kPause
             ? HttpContext::BodyConsumeResult::kPause
             : HttpContext::BodyConsumeResult::kContinue;
+    }
+
+    void logBodyRejected(const std::string& reason, size_t bodyBytes)
+    {
+        if(bodyRejectedLogged_) return;
+        bodyRejectedLogged_ = true;
+        miniKV::utils::logError("event=chunk_body_rejected chunk=" + chunkHash_ +
+                                 " body_bytes=" + std::to_string(bodyBytes) +
+                                 " reason=" + reason);
     }
 
     void finish(const DeferredResponse::Ptr& deferred)
@@ -498,6 +510,7 @@ private:
     bool alreadyExists_ = false;
     bool activeWriteCounted_ = false;
     bool admissionRejected_ = false;
+    bool bodyRejectedLogged_ = false;
     bool localFinished_ = false;
     bool replicaCompleted_ = false;
     Clock::time_point acceptedAt_{};
@@ -596,6 +609,11 @@ int main(int argc, char** argv)
     };
 
     miniKV::http::HttpServer server(&loop, nullptr, port);
+    server.setErrorResponseDecorator([&](const HttpRequest& request, HttpResponse* response) {
+        if(beginsWith(request.path(), "/v2/chunks/")) {
+            corsPolicy.appendHeaders(*response, request.getHeader("Origin"));
+        }
+    });
     server.setStreamCheck([&](const HttpRequest& request) {
         return request.method() == HttpRequest::kPut &&
                beginsWith(request.path(), "/v2/chunks/") && request.contentLength() > 0 &&

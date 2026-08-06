@@ -62,6 +62,7 @@ private:
     void onFinishComplete(bool success, bool alreadyExists);
     void markPaused();
     void resumeIfDrained();
+    void scheduleBlockAvailabilityCheck();
 
     network::EventLoop* loop_;
     DiskWriteExecutor& executor_;
@@ -77,6 +78,7 @@ private:
     bool failed_ = false;
     bool cancelled_ = false;
     bool paused_ = false;
+    bool blockCheckScheduled_ = false;
     int64_t pauseStartedAtNanoseconds_ = 0;
 };
 

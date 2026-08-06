@@ -50,11 +50,12 @@ http::HttpContext::BodyConsumeResult ChunkDiskWritePipeline::push(const char* by
 
     auto block = executor_.tryAcquireBlock();
     if(!block.has_value()) {
-        // D1 has no "pause without consume" result in HttpContext. Under the
-        // bounded admission configuration this should not happen; fail rather
-        // than claiming bytes were consumed while dropping them.
-        failed_ = true;
-        return http::HttpContext::BodyConsumeResult::kAbort;
+        // A shared pool may briefly be exhausted by another admitted stream.
+        // Keep this body segment in HttpContext's input Buffer; treating this
+        // as a malformed request used to turn temporary contention into 400.
+        markPaused();
+        scheduleBlockAvailabilityCheck();
+        return http::HttpContext::BodyConsumeResult::kPauseBeforeConsume;
     }
 
     std::memcpy(block->data(), bytes, size);
@@ -177,6 +178,30 @@ void ChunkDiskWritePipeline::resumeIfDrained()
     metrics_.pauseNanoseconds += nowNanoseconds() - pauseStartedAtNanoseconds_;
     pauseStartedAtNanoseconds_ = 0;
     if(readyCallback_) readyCallback_();
+}
+
+void ChunkDiskWritePipeline::scheduleBlockAvailabilityCheck()
+{
+    if(blockCheckScheduled_ || cancelled_ || failed_) return;
+    blockCheckScheduled_ = true;
+    const std::weak_ptr<ChunkDiskWritePipeline> weakSelf = shared_from_this();
+    loop_->runAfter(1, [weakSelf] {
+        const auto self = weakSelf.lock();
+        if(!self || self->cancelled_ || self->failed_) return;
+
+        self->blockCheckScheduled_ = false;
+        if(!self->executor_.hasAvailableBlock()) {
+            self->scheduleBlockAvailabilityCheck();
+            return;
+        }
+
+        if(self->paused_) {
+            self->paused_ = false;
+            self->metrics_.pauseNanoseconds += nowNanoseconds() - self->pauseStartedAtNanoseconds_;
+            self->pauseStartedAtNanoseconds_ = 0;
+        }
+        if(self->readyCallback_) self->readyCallback_();
+    });
 }
 
 }  // namespace miniKV::datanode

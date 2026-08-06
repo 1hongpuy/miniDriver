@@ -80,6 +80,12 @@ std::optional<DiskWriteExecutor::BlockLease> DiskWriteExecutor::tryAcquireBlock(
     return BlockLease(this, index);
 }
 
+bool DiskWriteExecutor::hasAvailableBlock() const
+{
+    std::lock_guard<std::mutex> lock(mutex_);
+    return !stopping_ && !freeIds_.empty();
+}
+
 bool DiskWriteExecutor::submit(BlockLease block, Work work)
 {
     if(!block || !work) return false;

@@ -63,6 +63,7 @@ public:
     DiskWriteExecutor& operator=(const DiskWriteExecutor&) = delete;
 
     std::optional<BlockLease> tryAcquireBlock();
+    bool hasAvailableBlock() const;
     bool submit(BlockLease block, Work work);
     bool submitTask(Task task);
     Metrics metrics() const;

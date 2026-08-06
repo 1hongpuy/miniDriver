@@ -36,7 +36,12 @@ public:
 
     enum class BodyConsumeResult {
         kContinue,
+        // The callback consumed the supplied bytes, but cannot accept more
+        // until its downstream queue drains.
         kPause,
+        // The callback could not accept the supplied bytes. Keep them in the
+        // connection input buffer and retry them after the caller resumes.
+        kPauseBeforeConsume,
         kAbort
     };
     using BodyDataCallback = std::function<BodyConsumeResult(const char* data, size_t len)>;
@@ -257,6 +262,12 @@ private:
             return false;
         }
 
+        if(result == BodyConsumeResult::kPauseBeforeConsume)
+        {
+            bodyPaused_ = true;
+            return false;
+        }
+
         buf->retrieve(toFeed);
         bodyReceived_ += toFeed;
 
@@ -307,7 +318,6 @@ private:
 
 } 
 }
-
 
 
 

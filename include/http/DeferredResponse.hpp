@@ -20,8 +20,7 @@ class DeferredResponse : public std::enable_shared_from_this<DeferredResponse> {
 public:
     using Ptr = std::shared_ptr<DeferredResponse>;
 
-    static Ptr create(network::EventLoop* loop,
-                      const network::TcpConnectionPtr& connection,
+    static Ptr create(const network::TcpConnectionPtr& connection,
                       bool closeAfterResponse);
 
     void defer();

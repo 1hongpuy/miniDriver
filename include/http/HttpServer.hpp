@@ -11,6 +11,7 @@
 #include "utils/AsyncLogger.hpp"
 #include "utils/ThreadPool.hpp"
 #include <algorithm>
+#include <any>
 #include <asm-generic/errno-base.h>
 #include <asm-generic/errno.h>
 #include <cctype>
@@ -57,10 +58,13 @@ public:
         });
     }
 
+    ~HttpServer() { server_.stop(); }
+
     void setHttpCallback(HttpCallback cb) {httpCallback_ = std::move(cb);}
     void setStreamCheck(StreamCheck cb) { streamCheck_ = std::move(cb); };
     void setBodyStreamSetup(BodyStreamSetup cb) { bodyStreamSetup_ = std::move(cb); }
     void setErrorResponseDecorator(ErrorResponseDecorator cb) { errorResponseDecorator_ = std::move(cb); }
+    void setThreadNum(size_t count) { server_.setThreadNum(count); }
     void start() { server_.start(); }
 
     network::EventLoop*  loop() { return loop_;}
@@ -71,20 +75,17 @@ private:
     {
         if(conn->connected()) //是否已连接
         {
-            int fd = conn->fd();
-            contexts_[fd] = std::make_shared<HttpContext>();
-        }
-        else {
-            contexts_.erase(conn->fd());
+            conn->setContext(std::make_shared<HttpContext>());
         }
     }
 
     void onMessage(const network::TcpConnectionPtr& conn, network::Buffer* buf)
     {
-        auto it = contexts_.find(conn->fd());
-        if(it == contexts_.end()) return ;
-
-        HttpContext* ctx = it->second.get();
+        const auto* holder =
+            std::any_cast<std::shared_ptr<HttpContext>>(&conn->context());
+        if(holder == nullptr || !*holder) return;
+        auto context = *holder;
+        HttpContext* ctx = context.get();
 
         if(ctx->bodyPause())
         {
@@ -106,7 +107,7 @@ private:
                                             ctx->request().methodString() + " path=" +
                                             ctx->request().path());
                     sendError(conn, HttpResponse::k400BadRequest, "Bad Request", ctx->request());
-                    contexts_.erase(conn->fd());
+                    conn->clearContext();
                     conn->shutdown();
                     return ;
                 }
@@ -139,14 +140,14 @@ private:
 
                 if(httpCallback_ && threadPool_)
                 {
-                    auto deferred = DeferredResponse::create(loop_, conn, !keepAlive);
-                    threadPool_->enqueue([this, conn, req = std::move(req), ctxPtr = it->second, deferred]()mutable {
+                    auto deferred = DeferredResponse::create(conn, !keepAlive);
+                    threadPool_->enqueue([this, conn, req = std::move(req), context, deferred]()mutable {
                         auto resp = std::make_shared<HttpResponse>();
                         resp->setCloseConnection(!isKeepAlive(req));
 
                         httpCallback_(req, resp.get(), conn, deferred);
 
-                        loop_->queueInLoop([this, conn, resp, ctxPtr](){
+                        conn->ownerLoop()->queueInLoop([conn, resp, context](){
                             miniKV::utils::logDebug(
                                 "event=http_response_send file_body=" +
                                 std::to_string(resp->isSendFile()) + " file_size=" +
@@ -159,7 +160,8 @@ private:
                             {
                                 conn->startSendFile(resp->bodyFilePath(), 
                                                     resp->bodyFileOffset(),
-                                                    resp->bodyFileSize());
+                                                    resp->bodyFileSize(),
+                                                    resp->fileCompleteCallback());
                             }
 
                             if(resp->closeConnection())
@@ -172,7 +174,7 @@ private:
                 else if(httpCallback_) {
                     HttpResponse resp;
                     resp.setCloseConnection(!keepAlive);
-                    auto deferred = DeferredResponse::create(loop_, conn, !keepAlive);
+                    auto deferred = DeferredResponse::create(conn, !keepAlive);
                     httpCallback_(req, &resp, conn, deferred);
                     if(deferred->deferred()) return;
 
@@ -182,11 +184,13 @@ private:
                     if(resp.isSendFile())
                     {
                         conn->startSendFile(resp.bodyFilePath(), resp.bodyFileOffset(),
-                                            resp.bodyFileSize());
+                                            resp.bodyFileSize(),
+                                            resp.fileCompleteCallback());
                     }
                     if(resp.closeConnection())
                     {
                         conn->shutdown();
+                        return;
                     }
                 }
                 if(!keepAlive) return;
@@ -230,7 +234,6 @@ private:
     StreamCheck     streamCheck_;
     ErrorResponseDecorator errorResponseDecorator_;
 
-    std::map<int, std::shared_ptr<HttpContext>> contexts_;
 };
 
 }

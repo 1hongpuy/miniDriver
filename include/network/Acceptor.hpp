@@ -23,6 +23,7 @@ public:
     }
 
     void listen();
+    void stop();
 
     bool listening() const{ return listening_; }
 private:
@@ -39,7 +40,6 @@ private:
 }
 
 }
-
 
 
 

@@ -4,7 +4,10 @@
   const API = "/api/v2";
   const SESSION_PREFIX = "minikv-v2:session:";
   const UPLOAD_CHUNK_SIZE = 4 * 1024 * 1024;
-  const MAX_PARALLEL_FILES = 2;
+  const MAX_PARALLEL_FILES = 1;
+  const MAX_INFLIGHT_CHUNKS_PER_FILE = 2;
+  const MAX_ACTIVE_CHUNK_UPLOADS = 2;
+  const MAX_CAPACITY_RETRIES = 120;
   const nodeStates = ["RECOVERING", "ONLINE", "SUSPECT", "OFFLINE", "DRAINING"];
   const $ = (selector) => document.querySelector(selector);
   const fileInput = $("#file-input");
@@ -34,6 +37,7 @@
     requestId: 0, renderId: 0, thumbnailUrls: new Map(),
   };
   const previewState = { object: null, url: null, scale: 1, image: null, requestId: 0 };
+  let mediaRefreshTimer = null;
 
   function formatBytes(bytes) {
     if (!Number.isFinite(bytes)) return "未知容量";
@@ -64,9 +68,53 @@
     const text = await response.text();
     let body = {};
     try { body = text ? JSON.parse(text) : {}; } catch (_) { body = { error: text }; }
-    if (!response.ok) throw new Error(body.error || `Gateway returned HTTP ${response.status}`);
+    if (!response.ok) {
+      const error = new Error(body.error || `Gateway returned HTTP ${response.status}`);
+      error.status = response.status;
+      error.retryAfter = response.headers.get("Retry-After");
+      throw error;
+    }
     return body;
   }
+
+  function retryDelayMilliseconds(error, attempt) {
+    const advertisedSeconds = Number(error.retryAfter);
+    const advertisedDelay = Number.isFinite(advertisedSeconds) && advertisedSeconds >= 0
+      ? advertisedSeconds * 1000 : 1000;
+    const exponentialDelay = 1000 * (2 ** Math.min(attempt - 1, 4));
+    return Math.min(30000, Math.max(advertisedDelay, exponentialDelay));
+  }
+
+  function sleep(milliseconds) {
+    return new Promise((resolve) => window.setTimeout(resolve, milliseconds));
+  }
+
+  class ChunkUploadScheduler {
+    constructor(limit) {
+      this.limit = limit;
+      this.active = 0;
+      this.waiters = [];
+    }
+
+    acquire() {
+      if (this.active < this.limit) {
+        this.active += 1;
+        return Promise.resolve();
+      }
+      return new Promise((resolve) => this.waiters.push(resolve));
+    }
+
+    release() {
+      const next = this.waiters.shift();
+      if (next) {
+        next();
+        return;
+      }
+      this.active -= 1;
+    }
+  }
+
+  const chunkUploadScheduler = new ChunkUploadScheduler(MAX_ACTIVE_CHUNK_UPLOADS);
 
   function makeQueueEntry(file) {
     const element = $("#queue-item-template").content.firstElementChild.cloneNode(true);
@@ -188,7 +236,12 @@
       xhr.onerror = () => reject(new Error("DataNode 网络请求失败；请检查 CORS、Tailscale 地址和节点状态"));
       xhr.onload = () => {
         if (xhr.status >= 200 && xhr.status < 300) resolve();
-        else reject(new Error(`DataNode returned HTTP ${xhr.status}: ${xhr.responseText}`));
+        else {
+          const error = new Error(`DataNode returned HTTP ${xhr.status}: ${xhr.responseText}`);
+          error.status = xhr.status;
+          error.retryAfter = xhr.getResponseHeader("Retry-After");
+          reject(error);
+        }
       };
       xhr.send(chunk);
     });
@@ -259,39 +312,96 @@
 
     let confirmedBytes = 0;
     let sentBytes = 0;
+    let confirmedChunks = 0;
+    const pending = [];
+    const inFlightBytes = new Map();
     for (const descriptor of manifest.chunks) {
       const index = descriptor.index;
       const chunk = file.slice(index * session.chunkSize,
         Math.min(file.size, (index + 1) * session.chunkSize));
       if (session.completed.has(index)) {
         confirmedBytes += chunk.size;
-        setEntry(entry, "uploading", `复用 ${index + 1}/${session.totalChunks}`,
+        confirmedChunks += 1;
+        setEntry(entry, "uploading", `复用 ${confirmedChunks}/${session.totalChunks}`,
           (confirmedBytes / file.size) * 100);
         continue;
       }
-      setEntry(entry, "uploading", `分配 ${index + 1}/${session.totalChunks}`,
-        (confirmedBytes / file.size) * 100);
-      const routeBody = { chunks: [{ index, hash: descriptor.hash, size: descriptor.size }] };
-      const routes = await request(`/upload/sessions/${session.sessionId}/routes`, { method: "POST", body: JSON.stringify(routeBody) });
-      const route = routes.routes && routes.routes[0];
-      if (!route) throw new Error("Gateway 未返回 Chunk 路由");
-      route.sessionId = session.sessionId;
-      const sentBefore = sentBytes;
-      const confirmedBefore = confirmedBytes;
-      await uploadChunk(route, chunk, index, (loaded) => {
-        const transfer = observeTransfer(entry, sentBefore + loaded, sentBefore + chunk.size);
-        const detail = [`${formatBytes(file.size)} / ${dir}`];
-        const rate = formatRate(transfer.rate);
-        if (rate) detail.push(rate);
-        if (transfer.eta !== null) detail.push(`本块剩余约 ${formatDuration(transfer.eta)}`);
-        setEntry(entry, "uploading", `写入 ${index + 1}/${session.totalChunks}`,
-          ((confirmedBefore + loaded) / file.size) * 100, detail.join(" · "));
-      });
-      sentBytes += chunk.size;
-      confirmedBytes += chunk.size;
-      setEntry(entry, "uploading", `已确认 ${index + 1}/${session.totalChunks}`,
-        (confirmedBytes / file.size) * 100);
+      pending.push({ descriptor, chunk });
     }
+
+    const updateProgress = (label) => {
+      let activeBytes = 0;
+      for (const loaded of inFlightBytes.values()) activeBytes += loaded;
+      const visibleBytes = confirmedBytes + activeBytes;
+      const transfer = observeTransfer(entry, visibleBytes, file.size);
+      const detail = [`${formatBytes(file.size)} / ${dir}`];
+      const rate = formatRate(transfer.rate);
+      if (rate) detail.push(rate);
+      if (transfer.eta !== null) detail.push(`剩余约 ${formatDuration(transfer.eta)}`);
+      setEntry(entry, "uploading", `${label} ${confirmedChunks}/${session.totalChunks} · 并发 ${inFlightBytes.size}/${MAX_INFLIGHT_CHUNKS_PER_FILE}`,
+        (visibleBytes / file.size) * 100, detail.join(" · "));
+    };
+
+    const uploadPendingChunk = async ({ descriptor, chunk }, shouldStop) => {
+      const index = descriptor.index;
+      for (let retryCount = 0;;) {
+        if (shouldStop()) return false;
+        updateProgress("等待传输槽位");
+        await chunkUploadScheduler.acquire();
+        inFlightBytes.set(index, 0);
+        updateProgress("分配");
+        let uploadError = null;
+        try {
+          const routeBody = { chunks: [{ index, hash: descriptor.hash, size: descriptor.size }] };
+          const routes = await request(`/upload/sessions/${session.sessionId}/routes`, {
+            method: "POST", body: JSON.stringify(routeBody),
+          });
+          const route = routes.routes && routes.routes[0];
+          if (!route) throw new Error("Gateway 未返回 Chunk 路由");
+          route.sessionId = session.sessionId;
+          await uploadChunk(route, chunk, index, (loaded) => {
+            inFlightBytes.set(index, loaded);
+            updateProgress("写入");
+          });
+          inFlightBytes.delete(index);
+          sentBytes += chunk.size;
+          confirmedBytes += chunk.size;
+          confirmedChunks += 1;
+          updateProgress("已确认");
+          return true;
+        } catch (error) {
+          uploadError = error;
+          inFlightBytes.delete(index);
+        } finally {
+          chunkUploadScheduler.release();
+        }
+        if (shouldStop()) return false;
+        if (uploadError.status !== 503 || retryCount >= MAX_CAPACITY_RETRIES) throw uploadError;
+        retryCount += 1;
+        const delay = retryDelayMilliseconds(uploadError, retryCount);
+        updateProgress(`等待存储节点（重试 ${retryCount}）`);
+        await sleep(delay);
+      }
+    };
+
+    let nextPending = 0;
+    let fatalUploadError = null;
+    const worker = async () => {
+      while (!fatalUploadError && nextPending < pending.length) {
+        const item = pending[nextPending++];
+        try {
+          const uploaded = await uploadPendingChunk(item, () => fatalUploadError !== null);
+          if (!uploaded) return;
+        } catch (error) {
+          fatalUploadError = error;
+          return;
+        }
+      }
+    };
+    const workerCount = Math.min(MAX_INFLIGHT_CHUNKS_PER_FILE, pending.length);
+    await Promise.all(Array.from({ length: workerCount }, worker));
+    if (fatalUploadError) throw fatalUploadError;
+
     const result = await request(`/upload/sessions/${session.sessionId}/commit`, { method: "POST", body: "{}" });
     localStorage.removeItem(sessionKey(file, dir));
     const completion = finishTransfer(entry, sentBytes);
@@ -711,6 +821,31 @@
     await openObjectPreview(file);
   }
 
+  function hasPendingDerivedMedia(catalog) {
+    return (catalog?.files || []).some((file) => {
+      const states = [file.thumbnail?.state, file.preview?.state];
+      return states.includes("PENDING") || states.includes("RUNNING");
+    });
+  }
+
+  function scheduleMediaRefresh(catalog) {
+    if (mediaRefreshTimer !== null) {
+      window.clearTimeout(mediaRefreshTimer);
+      mediaRefreshTimer = null;
+    }
+    if (!hasPendingDerivedMedia(catalog)) return;
+
+    mediaRefreshTimer = window.setTimeout(async () => {
+      mediaRefreshTimer = null;
+      try {
+        await loadCatalog(catalogState.activeDirectory);
+      } catch (_) {
+        // Keep trying while the current catalog still has unfinished derived media.
+        scheduleMediaRefresh(catalogState.catalog);
+      }
+    }, 3000);
+  }
+
   async function loadCatalog(path = catalogState.activeDirectory) {
     const requestId = catalogState.requestId + 1;
     catalogState.requestId = requestId;
@@ -726,6 +861,7 @@
     deleteDirectoryButton.disabled = false;
     objectDetail.hidden = true;
     renderDirectoryTree(); renderBreadcrumbs(); renderCatalogEntries();
+    scheduleMediaRefresh(catalog);
   }
 
   async function createDirectory() {

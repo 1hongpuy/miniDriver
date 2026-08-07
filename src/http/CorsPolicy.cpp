@@ -11,7 +11,7 @@ constexpr char kAllowedMethods[] = "GET, HEAD, PUT, OPTIONS";
 constexpr char kAllowedHeaders[] =
     "Content-Type, X-Session-Id, X-Chunk-Index, X-Commit-Owner, "
     "X-Gateway-Address, X-Gateway-Port, X-Replica-Chain, "
-    "X-Replica-Position, X-Upload-Token";
+    "X-Replica-Position, X-Upload-Token, X-Client-Instance-Id";
 
 CorsPolicy::CorsPolicy(std::string allowedOrigin)
     : allowedOrigin_(std::move(allowedOrigin)) {}

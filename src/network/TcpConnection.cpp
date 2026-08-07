@@ -5,9 +5,11 @@
 #include <asm-generic/errno.h>
 #include <cassert>
 #include <cerrno>
+#include <csignal>
 #include <cstddef>
 #include <fcntl.h>
 #include <memory>
+#include <mutex>
 #include <sys/sendfile.h>
 #include <sys/socket.h>
 #include <sys/types.h>
@@ -19,9 +21,25 @@
 namespace miniKV {
 namespace network {
 
+namespace {
+
+void ignoreSigPipe()
+{
+    static std::once_flag once;
+    std::call_once(once, [] {
+        struct sigaction action {};
+        action.sa_handler = SIG_IGN;
+        ::sigemptyset(&action.sa_mask);
+        ::sigaction(SIGPIPE, &action, nullptr);
+    });
+}
+
+}  // namespace
+
 TcpConnection::TcpConnection(EventLoop* loop, int fd, int id)
 : loop_(loop), fd_(fd), id_(id), state_(kConnectiong), channel_(new Channel(loop, fd))
 {
+    ignoreSigPipe();
     channel_->setReadCallback([this](){handleRead();});
     channel_->setCloseCallback([this](){handleClose();});
     channel_->setErrorCallback([this](){handleError();});
@@ -31,6 +49,24 @@ TcpConnection::TcpConnection(EventLoop* loop, int fd, int id)
 TcpConnection::~TcpConnection(){
     assert(state_ == kDisconnected);
     close(fd_); //这里式不是太简陋了？？
+}
+
+void TcpConnection::setContext(std::any context)
+{
+    assert(loop_->isInLoopThread());
+    context_ = std::move(context);
+}
+
+const std::any& TcpConnection::context() const
+{
+    assert(loop_->isInLoopThread());
+    return context_;
+}
+
+void TcpConnection::clearContext()
+{
+    assert(loop_->isInLoopThread());
+    context_.reset();
 }
 
 void TcpConnection::handleRead(){
@@ -60,7 +96,8 @@ void TcpConnection::handleWrite(){
     if(channel_->isWriting() && outputBuffer_.readableBytes() > 0) //设置了写监控
     {
         const size_t oldQueuedBytes = outputBuffer_.readableBytes();
-        ssize_t n = write(fd(), outputBuffer_.peek(), outputBuffer_.readableBytes());
+        ssize_t n = ::send(fd(), outputBuffer_.peek(), outputBuffer_.readableBytes(),
+                           MSG_NOSIGNAL);
         if(n > 0)
         {
             outputBuffer_.retrieve(n);
@@ -90,31 +127,41 @@ void TcpConnection::handleWrite(){
     }
     if(sendFileCtx_ && sendFileCtx_->fd >= 0 && outputBuffer_.readableBytes() == 0)
     {
-        while(sendFileCtx_->remaining > 0)
+        const size_t requestedBytes = std::min(sendFileCtx_->remaining, sendFileQuantum_);
+        const ssize_t sent = ::sendfile(fd_, sendFileCtx_->fd,
+                                        &sendFileCtx_->offset,
+                                        requestedBytes);
+        if(sent > 0)
         {
-            ssize_t sent = ::sendfile(fd_, sendFileCtx_->fd, 
-                                      &sendFileCtx_->offset,
-                                       sendFileCtx_->remaining);
-            if(sent > 0)
-            {
-                sendFileCtx_->remaining -= sent;
-            }                           
-            else if (errno == EAGAIN || errno == EWOULDBLOCK) {
+            const size_t sentBytes = static_cast<size_t>(sent);
+            sendFileCtx_->remaining -= sentBytes;
+            ++sendFileCtx_->writeCalls;
+            sendFileCtx_->maxBytesPerCall = std::max(sendFileCtx_->maxBytesPerCall,
+                                                      sentBytes);
+            if(sendFileCtx_->remaining > 0) {
                 channel_->enableWriteing();
-                return ;
+                return;
             }
-            else {
-                break;
+            channel_->disableWriting();
+            finishSendFile(true);
+            if(state_ == kDisconnecting)
+            {
+                shutdownInLoop();
             }
+            return;
         }
-        ::close(sendFileCtx_->fd);
-        sendFileCtx_.reset();
-        channel_->disableWriting();
-        if(state_ == kDisconnecting)
-        {
-            shutdownInLoop();
+        else if(sent < 0 && errno == EINTR) {
+            channel_->enableWriteing();
+            return;
         }
-        return ;
+        else if(sent < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+            channel_->enableWriteing();
+            return;
+        }
+        else {
+            handleError();
+            return;
+        }
     }
 }
 
@@ -232,7 +279,7 @@ void TcpConnection::sendInLoop(const std::string& buf)
     if(!channel_->isWriting() && outputBuffer_.readableBytes() == 0)
     {
         //这里没有监听epoll 写事件，并且buffer没有要发送的数据
-        nwrote = write(fd(), buf.data(), buf.size());
+        nwrote = ::send(fd(), buf.data(), buf.size(), MSG_NOSIGNAL);
         if(nwrote >= 0) //写入成功的字节数
         {
             remaining -= static_cast<size_t>(nwrote);
@@ -293,10 +340,12 @@ void TcpConnection::connectDestroyed() //整个TCP连接断开最后调用的函
         setState(kDisconnected);
     }
     channel_->disableAll();
+    finishSendFile(false);
     if(connectionCallback_)
     {
         connectionCallback_(shared_from_this());
     }
+    clearContext();
     channel_->remove();
 }
 
@@ -307,6 +356,7 @@ void TcpConnection::handleClose(){//对方断开连接的报警机制
     }
     setState(kDisconnected);
     channel_->disableAll();
+    finishSendFile(false);
     TcpConnectionPtr guardThis(shared_from_this());
     if(internalCloseCallback_)
     {
@@ -323,33 +373,38 @@ void TcpConnection::handleError(){
     handleClose();
 }
 
-void TcpConnection::startSendFile(const std::string &filePath, size_t fileSize)
+void TcpConnection::startSendFile(const std::string &filePath, size_t fileSize,
+                                  SendFileCompleteCallback callback)
 {
-    startSendFile(filePath, 0, fileSize);
+    startSendFile(filePath, 0, fileSize, std::move(callback));
 }
 
-void TcpConnection::startSendFile(const std::string& filePath, off_t offset, size_t fileSize)
+void TcpConnection::startSendFile(const std::string& filePath, off_t offset, size_t fileSize,
+                                  SendFileCompleteCallback callback)
 {
     TcpConnectionPtr self(shared_from_this());
-    loop_->runInLoop([self, filePath, offset, fileSize](){
-        self->startSendFileInLoop(filePath, offset, fileSize);
+    loop_->runInLoop([self, filePath, offset, fileSize, callback = std::move(callback)]() mutable {
+        self->startSendFileInLoop(filePath, offset, fileSize, std::move(callback));
     });
 }
 
-void TcpConnection::startSendFileInLoop(const std::string& filePath, size_t fileSize)
-{
-    startSendFileInLoop(filePath, 0, fileSize);
-}
-
-void TcpConnection::startSendFileInLoop(const std::string& filePath, off_t offset, size_t fileSize)
+void TcpConnection::startSendFileInLoop(const std::string& filePath, off_t offset,
+                                        size_t fileSize,
+                                        SendFileCompleteCallback callback)
 {
     if(state_ != kConnected)
     {
+        if(callback) callback({false, 0, 0, 0});
+        return;
+    }
+    if(sendFileCtx_) {
+        if(callback) callback({false, 0, 0, 0});
         return;
     }
     int fd = ::open(filePath.c_str(), O_RDONLY);
     if(fd < 0)
     {
+        if(callback) callback({false, 0, 0, 0});
         handleClose();
         return;
     }
@@ -358,18 +413,36 @@ void TcpConnection::startSendFileInLoop(const std::string& filePath, off_t offse
     sendFileCtx_->fd = fd;
     sendFileCtx_->offset = offset;
     sendFileCtx_->remaining = fileSize;
+    sendFileCtx_->totalBytes = fileSize;
+    sendFileCtx_->callback = std::move(callback);
+
+    if(fileSize == 0) {
+        finishSendFile(true);
+        return;
+    }
 
     // 先注册 EPOLLOUT，再触发第一次发送
     channel_->enableWriteing();
     handleWrite();
 }
 
+void TcpConnection::finishSendFile(bool success)
+{
+    if(!sendFileCtx_) return;
+    std::unique_ptr<SendFileCtx> context = std::move(sendFileCtx_);
+    if(context->fd >= 0) ::close(context->fd);
+
+    SendFileResult result;
+    result.success = success && context->remaining == 0;
+    result.bytesSent = context->totalBytes - context->remaining;
+    result.writeCalls = context->writeCalls;
+    result.maxBytesPerCall = context->maxBytesPerCall;
+    auto callback = std::move(context->callback);
+    if(callback) callback(result);
+}
+
 }
 }
-
-
-
-
 
 
 

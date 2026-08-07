@@ -2,8 +2,10 @@
 
 
 #include <cstddef>
+#include <functional>
 #include <string>
 #include <map>
+#include <utility>
 #include <sys/types.h>
 #include "sstream"
 #include "network/Buffer.hpp"
@@ -12,9 +14,15 @@
 
 
 namespace miniKV {
+namespace network {
+struct SendFileResult;
+}
 namespace http {
 class HttpResponse{
 public:
+    using FileCompleteCallback =
+        std::function<void(const network::SendFileResult&)>;
+
     enum HttpStatusCode{
         kUnknown,
         k200Ok = 200, //成功
@@ -48,14 +56,21 @@ public:
 
     void setFileBody(const std::string& filePath, size_t fileSize)
     {
-        setFileBody(filePath, 0, fileSize);
+        setFileBody(filePath, 0, fileSize, {});
     }
 
     void setFileBody(const std::string& filePath, off_t fileOffset, size_t fileSize)
     {
+        setFileBody(filePath, fileOffset, fileSize, {});
+    }
+
+    void setFileBody(const std::string& filePath, off_t fileOffset, size_t fileSize,
+                     FileCompleteCallback callback)
+    {
         bodyFilePath_ = filePath;
         bodyFileOffset_ = fileOffset;
         bodyFileSize_ = fileSize;
+        fileCompleteCallback_ = std::move(callback);
         addHeader("Content-Length", std::to_string(fileSize));
     }
 
@@ -63,6 +78,9 @@ public:
     const std::string& bodyFilePath() const { return bodyFilePath_; }
     off_t bodyFileOffset() const { return bodyFileOffset_; }
     size_t bodyFileSize() const { return bodyFileSize_; }
+    const FileCompleteCallback& fileCompleteCallback() const {
+        return fileCompleteCallback_;
+    }
 
     void addHeader(const std::string& key,  const std::string& value)
     {
@@ -127,7 +145,8 @@ private:
     //零拷贝发送变量
     std::string bodyFilePath_;
     off_t       bodyFileOffset_ = 0;
-    size_t      bodyFileSize_;
+    size_t      bodyFileSize_ = 0;
+    FileCompleteCallback fileCompleteCallback_;
 };
     
 

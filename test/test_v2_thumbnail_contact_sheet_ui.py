@@ -30,7 +30,7 @@ class StaticHandler(SimpleHTTPRequestHandler):
         pass
 
 
-def catalog():
+def catalog(pending_ready=False):
     return {
         "path": "/",
         "breadcrumbs": [{"name": "素材库", "path": "/"}],
@@ -61,7 +61,8 @@ def catalog():
                 "state": "AVAILABLE",
                 "thumbnail": {
                     "profile": "thumb-512-jpeg-v1",
-                    "state": "PENDING",
+                    "state": "READY" if pending_ready else "PENDING",
+                    **({"objectId": "thumbnail-pending"} if pending_ready else {}),
                 },
                 "preview": {
                     "profile": "preview-2048-jpeg-v1",
@@ -87,6 +88,7 @@ def main():
     server.daemon_threads = True
     threading.Thread(target=server.serve_forever, daemon=True).start()
     requested_paths = []
+    catalog_requests = 0
 
     try:
         with sync_playwright() as playwright:
@@ -99,16 +101,29 @@ def main():
                 page.set_default_timeout(3000)
 
                 def api(route):
+                    nonlocal catalog_requests
                     parsed = urlparse(route.request.url)
                     requested_paths.append(parsed.path)
                     if parsed.path == "/api/v2/catalog":
-                        route.fulfill(status=200, content_type="application/json", body=json.dumps(catalog()))
+                        catalog_requests += 1
+                        route.fulfill(status=200, content_type="application/json",
+                                      body=json.dumps(catalog(pending_ready=catalog_requests > 1)))
                     elif parsed.path == "/api/v2/admin/nodes":
                         route.fulfill(status=200, content_type="application/json", body='{"nodes":[]}')
                     elif parsed.path == "/api/v2/objects/thumbnail-ready":
                         route.fulfill(status=200, content_type="application/json",
                                       body=json.dumps(object_metadata("thumbnail-ready")))
                     elif parsed.path == "/api/v2/objects/thumbnail-ready/manifest":
+                        route.fulfill(status=200, content_type="application/json", body=json.dumps({
+                            "fileSize": len(THUMBNAIL_BYTES), "chunks": [{
+                                "index": 0, "hash": THUMBNAIL_HASH,
+                                "replicas": [{"address": "node-test", "httpPort": 9002}],
+                            }],
+                        }))
+                    elif parsed.path == "/api/v2/objects/thumbnail-pending":
+                        route.fulfill(status=200, content_type="application/json",
+                                      body=json.dumps(object_metadata("thumbnail-ready")))
+                    elif parsed.path == "/api/v2/objects/thumbnail-pending/manifest":
                         route.fulfill(status=200, content_type="application/json", body=json.dumps({
                             "fileSize": len(THUMBNAIL_BYTES), "chunks": [{
                                 "index": 0, "hash": THUMBNAIL_HASH,
@@ -145,6 +160,11 @@ def main():
                 pending_card = page.locator(".catalog-card[data-object-id='source-pending']")
                 assert "生成中" in pending_card.inner_text()
                 assert "/api/v2/objects/thumbnail-pending" not in requested_paths
+
+                # A media job completes after the initial catalog response. The page must
+                # notice the READY state without a browser reload.
+                pending_card.locator(".catalog-card__image").wait_for(state="visible", timeout=5000)
+                assert pending_card.locator(".catalog-card__image").get_attribute("src").startswith("blob:")
 
                 screenshot = os.environ.get("MINIKV_UI_SCREENSHOT")
                 if screenshot:

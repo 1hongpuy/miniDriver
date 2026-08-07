@@ -8,11 +8,11 @@
 
 namespace miniKV::http {
 
-DeferredResponse::Ptr DeferredResponse::create(network::EventLoop* loop,
-                                                const network::TcpConnectionPtr& connection,
+DeferredResponse::Ptr DeferredResponse::create(const network::TcpConnectionPtr& connection,
                                                 bool closeAfterResponse)
 {
-    return Ptr(new DeferredResponse(loop, connection, closeAfterResponse));
+    return Ptr(new DeferredResponse(connection->ownerLoop(), connection,
+                                    closeAfterResponse));
 }
 
 DeferredResponse::DeferredResponse(network::EventLoop* loop,
@@ -52,7 +52,8 @@ void DeferredResponse::completeInLoop(HttpResponse response)
     if(response.isSendFile())
     {
         connection->startSendFile(response.bodyFilePath(), response.bodyFileOffset(),
-                                  response.bodyFileSize());
+                                  response.bodyFileSize(),
+                                  response.fileCompleteCallback());
     }
     if(response.closeConnection()) connection->shutdown();
 }

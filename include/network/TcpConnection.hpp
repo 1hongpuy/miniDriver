@@ -4,6 +4,7 @@
 #include "Buffer.hpp"
 #include "channel.hpp"
 #include <algorithm>
+#include <any>
 #include <cstddef>
 #include <memory>
 #include <string>
@@ -28,6 +29,15 @@ using WriteCompleteCallback = std::function<void(const TcpConnectionPtr&)>;
 using ErrorCallback = std::function<void(const TcpConnectionPtr&)>;
 using WaterMarkCallback = std::function<void(const TcpConnectionPtr&, size_t)>;
 
+struct SendFileResult {
+    bool success = false;
+    size_t bytesSent = 0;
+    size_t writeCalls = 0;
+    size_t maxBytesPerCall = 0;
+};
+
+using SendFileCompleteCallback = std::function<void(const SendFileResult&)>;
+
 
 
 class TcpConnection : public std::enable_shared_from_this<TcpConnection> {
@@ -40,6 +50,10 @@ public:
     void shutdown();
     bool connected() const{return state_ == kConnected;}
     int fd() const {return fd_;}
+    EventLoop* ownerLoop() const noexcept { return loop_; }
+    void setContext(std::any context);
+    const std::any& context() const;
+    void clearContext();
 
 
     void pauseRead();
@@ -83,8 +97,11 @@ public:
 
     void connectEstablished();
     void connectDestroyed();
-    void startSendFile(const std::string& filePath, size_t fileSize);
-    void startSendFile(const std::string& filePath, off_t offset, size_t fileSize);
+    void setSendFileQuantum(size_t bytes) { sendFileQuantum_ = std::max<size_t>(1, bytes); }
+    void startSendFile(const std::string& filePath, size_t fileSize,
+                       SendFileCompleteCallback callback = {});
+    void startSendFile(const std::string& filePath, off_t offset, size_t fileSize,
+                       SendFileCompleteCallback callback = {});
 
 private:
 
@@ -93,8 +110,9 @@ private:
     void handleClose();
     void handleError();
     void sendInLoop(const std::string& buf);//？
-    void startSendFileInLoop(const std::string& filePath, size_t fileSize);
-    void startSendFileInLoop(const std::string& filePath, off_t offset, size_t fileSize);
+    void startSendFileInLoop(const std::string& filePath, off_t offset, size_t fileSize,
+                             SendFileCompleteCallback callback);
+    void finishSendFile(bool success);
     void shutdownInLoop();
     void pauseReadInLoop();
     void resumeReadInLoop();
@@ -112,8 +130,13 @@ private:
         int fd = -1;
         off_t  offset = 0;
         size_t remaining = 0;
+        size_t totalBytes = 0;
+        size_t writeCalls = 0;
+        size_t maxBytesPerCall = 0;
+        SendFileCompleteCallback callback;
     };
     std::unique_ptr<SendFileCtx> sendFileCtx_;
+    size_t sendFileQuantum_ = 256 * 1024;
 
     void setState(StateE s) {state_ = s;}
     EventLoop* loop_;
@@ -125,6 +148,7 @@ private:
 
     Buffer inputBuffer_;
     Buffer outputBuffer_;
+    std::any context_;
     bool readPaused_ = false;
     size_t highWaterMark_ = 512 * 1024;
     size_t lowWaterMark_ = 256 * 1024;
@@ -142,8 +166,6 @@ private:
 }
 
 }
-
-
 
 
 

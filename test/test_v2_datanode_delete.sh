@@ -3,6 +3,7 @@ set -euo pipefail
 
 binary="$1"
 port="${MINIKV_TEST_DATANODE_DELETE_PORT:-19027}"
+io_threads="${MINIKV_TEST_IO_THREADS:-2}"
 secret="test-delete-secret"
 root="$(mktemp -d)"
 pid=""
@@ -16,7 +17,8 @@ cleanup() {
 }
 trap cleanup EXIT
 
-MINIKV_V2_CLUSTER_SECRET="$secret" "$binary" node-delete 127.0.0.1 "$port" \
+MINIKV_V4_IO_THREADS="$io_threads" MINIKV_V2_CLUSTER_SECRET="$secret" \
+    "$binary" node-delete 127.0.0.1 "$port" \
     "$root/data" 127.0.0.1 6553 >"$root/datanode.out" 2>"$root/datanode.err" &
 pid=$!
 
@@ -27,6 +29,15 @@ for _ in $(seq 1 50); do
     fi
     sleep 0.1
 done
+
+log="$root/data/logs/datanode-node-delete.log"
+for _ in $(seq 1 50); do
+    if [[ -f "$log" ]] && grep -q "event=datanode_started.*io_threads=${io_threads}" "$log"; then
+        break
+    fi
+    sleep 0.1
+done
+grep -q "event=datanode_started.*io_threads=${io_threads}" "$log"
 
 status="$(curl --noproxy '*' -sS --max-time 3 -o /dev/null -w '%{http_code}' \
     -X DELETE "http://127.0.0.1:${port}/internal/v2/chunks/missing")"

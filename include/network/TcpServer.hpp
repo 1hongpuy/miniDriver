@@ -3,6 +3,7 @@
 #include "EventLoop.hpp"
 #include "Acceptor.hpp"
 #include "TcpConnection.hpp"
+#include <cstddef>
 #include <map>
 #include <memory>
 #include <string>
@@ -17,6 +18,8 @@ public:
     ~TcpServer();
 
     void start();
+    void stop();
+    void setThreadNum(size_t count);
 
     void setConnectionCallback(ConnectionCallback cb) {connectionCallback_ = std::move(cb);}
     void setMessageCallback(MessageCallback cb) {messageCallback_ = std::move(cb);}
@@ -25,9 +28,11 @@ private:
     void newConnection(int sockfd, const struct sockaddr_in& peerAddr);
 
     void removeConnection(const TcpConnectionPtr& conn);
+    void removeConnectionInLoop(const TcpConnectionPtr& conn);
 
     EventLoop* loop_;
     std::unique_ptr<Acceptor> acceptor_;
+    std::unique_ptr<class EventLoopThreadPool> threadPool_;
 
     ConnectionCallback connectionCallback_;
     MessageCallback messageCallback_;
@@ -42,8 +47,6 @@ private:
 
 
 }
-
-
 
 
 

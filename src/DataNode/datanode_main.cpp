@@ -11,8 +11,8 @@
 #include "DataNode/ChunkDiskWritePipeline.hpp"
 #include "DataNode/DiskWriteExecutor.hpp"
 #include "DataNode/HttpGatewayControlClient.hpp"
+#include "DataNode/NodeResourceGovernor.hpp"
 #include "DataNode/ReplicaUploadPipe.hpp"
-#include "DataNode/WriteAdmission.hpp"
 #include "utils/AsyncLogger.hpp"
 #include "utils/Util.hpp"
 
@@ -40,7 +40,12 @@ using namespace miniKV::datanode;
 
 namespace {
 
-constexpr uint32_t kMaxConcurrentWrites = 2;
+constexpr uint32_t kDefaultMaxConcurrentWrites = 2;
+constexpr uint32_t kDefaultMaxConcurrentDownloads = 8;
+constexpr uint32_t kDefaultMaxUploadsPerClient = 2;
+constexpr uint32_t kDefaultMaxDownloadsPerClient = 4;
+constexpr uint32_t kDefaultIoThreads = 2;
+constexpr size_t kDefaultSendFileQuantumBytes = 256 * 1024;
 
 struct ReplicaTarget {
     std::string nodeId;
@@ -77,6 +82,45 @@ std::string configuredNodeId(const std::string& fallback)
 {
     if(const char* value = std::getenv("MINIKV_V2_NODE_ID")) return value;
     return fallback;
+}
+
+uint32_t configuredLimit(const char* name, uint32_t fallback)
+{
+    const char* value = std::getenv(name);
+    if(value == nullptr || *value == '\0') return fallback;
+    try {
+        const unsigned long parsed = std::stoul(value);
+        if(parsed == 0 || parsed > UINT32_MAX) return fallback;
+        return static_cast<uint32_t>(parsed);
+    } catch(...) {
+        return fallback;
+    }
+}
+
+size_t configuredByteLimit(const char* name, size_t fallback)
+{
+    const char* value = std::getenv(name);
+    if(value == nullptr || *value == '\0') return fallback;
+    try {
+        const unsigned long long parsed = std::stoull(value);
+        if(parsed == 0 || parsed > static_cast<unsigned long long>(SIZE_MAX)) return fallback;
+        return static_cast<size_t>(parsed);
+    } catch(...) {
+        return fallback;
+    }
+}
+
+uint32_t configuredIoThreads()
+{
+    const char* value = std::getenv("MINIKV_V4_IO_THREADS");
+    if(value == nullptr || *value == '\0') return kDefaultIoThreads;
+    try {
+        const unsigned long parsed = std::stoul(value);
+        if(parsed <= 32) return static_cast<uint32_t>(parsed);
+    } catch(...) {
+    }
+    miniKV::utils::logWarn("event=invalid_io_thread_config fallback=2");
+    return kDefaultIoThreads;
 }
 
 std::vector<std::string> configuredCapabilities()
@@ -160,20 +204,25 @@ class ChunkUploadStream : public std::enable_shared_from_this<ChunkUploadStream>
 public:
     using Clock = std::chrono::steady_clock;
 
-    ChunkUploadStream(EventLoop* loop, FastDataStore& store, WriteAdmission& writeAdmission,
+    ChunkUploadStream(EventLoop* loop, FastDataStore& store,
+                      NodeResourceGovernor& resourceGovernor,
                       DiskWriteExecutor& diskExecutor,
-                      std::string nodeId, GatewayControlClient& gatewayControl,
+                      std::string nodeId,
                       std::string gatewayAddress, uint16_t gatewayPort,
                       std::string clusterSecret, CorsPolicy corsPolicy,
                       std::string requestOrigin, const HttpRequest& request, std::string chunkHash)
-        : loop_(loop), store_(store), writeAdmission_(writeAdmission), diskExecutor_(diskExecutor),
+        : loop_(loop), store_(store), resourceGovernor_(resourceGovernor),
+            diskExecutor_(diskExecutor),
             nodeId_(std::move(nodeId)),
-            gatewayControl_(gatewayControl),
             gatewayAddress_(std::move(gatewayAddress)), gatewayPort_(gatewayPort),
-            clusterSecret_(std::move(clusterSecret)), corsPolicy_(std::move(corsPolicy)),
+            clusterSecret_(std::move(clusterSecret)),
+            gatewayControl_(std::make_unique<HttpGatewayControlClient>(
+                loop_, gatewayAddress_, gatewayPort_, clusterSecret_)),
+            corsPolicy_(std::move(corsPolicy)),
             requestOrigin_(std::move(requestOrigin)), chunkHash_(std::move(chunkHash)),
             acceptedAt_(Clock::now())
     {
+        clientId_ = request.getHeader("X-Client-Instance-Id");
         setup(request);
     }
 
@@ -185,6 +234,7 @@ public:
 
     void startReplica(const TcpConnectionPtr& upstream)
     {
+        requireLoopThread();
         if(!error_.empty() || writer_ == nullptr) return;
 
         std::weak_ptr<miniKV::network::TcpConnection> weakUpstream(upstream);
@@ -215,7 +265,8 @@ public:
             {"X-Gateway-Port", std::to_string(gatewayPort_)},
             {"X-Replica-Chain", joinReplicaChain(chain_)},
             {"X-Replica-Position", std::to_string(position_ + 1)},
-            {"X-Upload-Token", uploadToken_}
+            {"X-Upload-Token", uploadToken_},
+            {"X-Client-Instance-Id", clientId_}
         };
         options.resumeUpstream = [weakUpstream] {
             if(auto connection = weakUpstream.lock()) connection->resumeRead();
@@ -230,6 +281,7 @@ public:
 
     HttpContext::BodyConsumeResult consume(const char* bytes, size_t size)
     {
+        requireLoopThread();
         if(firstBodyAt_ == Clock::time_point{}) firstBodyAt_ = Clock::now();
         if(admissionRejected_) return HttpContext::BodyConsumeResult::kContinue;
         if(!error_.empty() || writer_ == nullptr || diskPipeline_ == nullptr) {
@@ -272,6 +324,7 @@ public:
 
     void finish(const DeferredResponse::Ptr& deferred)
     {
+        requireLoopThread();
         if(response_ != nullptr) return;
         response_ = deferred;
         response_->defer();
@@ -318,11 +371,12 @@ private:
             error_ = "request does not match upload token";
             return;
         }
-        if(!writeAdmission_.tryAcquire()) {
+        if(clientId_.empty()) clientId_ = "session:" + capability_.sessionId;
+        uploadLease_ = resourceGovernor_.tryAcquireUpload(clientId_);
+        if(!uploadLease_.has_value()) {
             admissionRejected_ = true;
             return;
         }
-        activeWriteCounted_ = true;
         auto writer = store_.beginPut(chunkHash_, capability_.chunkSize);
         if(writer == nullptr) {
             releaseActiveWrite();
@@ -334,6 +388,7 @@ private:
 
     void onLocalFinish(bool success, bool alreadyExists)
     {
+        requireLoopThread();
         if(response_ == nullptr) return;
         if(!success) {
             miniKV::utils::logError("event=chunk_local_finish_failed chunk=" + chunkHash_ +
@@ -353,6 +408,7 @@ private:
 
     void onReplicaComplete(HttpClientResponse response, std::string error)
     {
+        requireLoopThread();
         if(response_ == nullptr) return;
         replicaFinishedAt_ = Clock::now();
         if(replicaPipe_ != nullptr) replicaMetrics_ = replicaPipe_->metrics();
@@ -391,10 +447,11 @@ private:
                                 " successful_nodes=" + std::to_string(successfulNodes_.size()));
         gatewayCommitStartedAt_ = Clock::now();
         std::weak_ptr<ChunkUploadStream> weakSelf(shared_from_this());
-        gatewayControl_.commitChunk({capability_.sessionId, capability_.chunkIndex, chunkHash_,
+        gatewayControl_->commitChunk({capability_.sessionId, capability_.chunkIndex, chunkHash_,
                                     capability_.chunkSize, successfulNodes_, uploadToken_},
             [weakSelf](RpcResult result) {
             if(auto self = weakSelf.lock()) {
+                self->requireLoopThread();
                 self->gatewayCommitFinishedAt_ = Clock::now();
                 miniKV::utils::logInfo("event=chunk_gateway_commit_result chunk=" + self->chunkHash_ +
                                        " http_status=" + std::to_string(result.httpStatus) +
@@ -410,6 +467,7 @@ private:
 
     void completeClient(int status, const std::string& error)
     {
+        requireLoopThread();
         if(response_ == nullptr) return;
         const auto completedAt = Clock::now();
         if(replicaPipe_ != nullptr) replicaMetrics_ = replicaPipe_->metrics();
@@ -459,7 +517,7 @@ private:
         // as an opaque XHR network error.
         corsPolicy_.appendHeaders(response, requestOrigin_);
         if(status != 200 && position_ == 0 && !uploadToken_.empty()) {
-            gatewayControl_.releaseLease({uploadToken_}, [](RpcResult) {});
+            gatewayControl_->releaseLease({uploadToken_}, [](RpcResult) {});
         }
         releaseActiveWrite();
         auto deferred = std::move(response_);
@@ -471,10 +529,12 @@ private:
 
     void releaseActiveWrite()
     {
-        if(activeWriteCounted_) {
-            writeAdmission_.release();
-            activeWriteCounted_ = false;
-        }
+        uploadLease_.reset();
+    }
+
+    void requireLoopThread() const
+    {
+        if(!loop_->isInLoopThread()) std::abort();
     }
 
     static uint64_t elapsedMilliseconds(Clock::time_point started, Clock::time_point finished)
@@ -486,16 +546,17 @@ private:
 
     EventLoop* loop_;
     FastDataStore& store_;
-    WriteAdmission& writeAdmission_;
+    NodeResourceGovernor& resourceGovernor_;
     DiskWriteExecutor& diskExecutor_;
     std::string nodeId_;
-    GatewayControlClient& gatewayControl_;
     std::string gatewayAddress_;
     uint16_t gatewayPort_ = 0;
     std::string clusterSecret_;
+    std::unique_ptr<GatewayControlClient> gatewayControl_;
     CorsPolicy corsPolicy_;
     std::string requestOrigin_;
     std::string chunkHash_;
+    std::string clientId_;
     std::string uploadToken_;
     UploadCapability capability_;
     std::vector<ReplicaTarget> chain_;
@@ -508,7 +569,7 @@ private:
     std::string error_;
     std::string replicaError_;
     bool alreadyExists_ = false;
-    bool activeWriteCounted_ = false;
+    std::optional<NodeResourceGovernor::UploadLease> uploadLease_;
     bool admissionRejected_ = false;
     bool bodyRejectedLogged_ = false;
     bool localFinished_ = false;
@@ -564,7 +625,23 @@ int main(int argc, char** argv)
         std::cerr << "cannot open DataNode store\n";
         return 1;
     }
-    WriteAdmission writeAdmission(kMaxConcurrentWrites);
+    const uint32_t maxConcurrentWrites = configuredLimit(
+        "MINIKV_V4_MAX_ACTIVE_UPLOADS", kDefaultMaxConcurrentWrites);
+    const uint32_t maxConcurrentDownloads = configuredLimit(
+        "MINIKV_V4_MAX_ACTIVE_DOWNLOADS", kDefaultMaxConcurrentDownloads);
+    const uint32_t maxUploadsPerClient = configuredLimit(
+        "MINIKV_V4_MAX_UPLOADS_PER_CLIENT", kDefaultMaxUploadsPerClient);
+    const uint32_t maxDownloadsPerClient = configuredLimit(
+        "MINIKV_V4_MAX_DOWNLOADS_PER_CLIENT", kDefaultMaxDownloadsPerClient);
+    const size_t sendFileQuantumBytes = configuredByteLimit(
+        "MINIKV_V4_SENDFILE_QUANTUM_BYTES", kDefaultSendFileQuantumBytes);
+    const uint32_t ioThreads = configuredIoThreads();
+    NodeResourceGovernor::Config resourceConfig;
+    resourceConfig.maxActiveUploads = maxConcurrentWrites;
+    resourceConfig.maxActiveDownloads = maxConcurrentDownloads;
+    resourceConfig.maxUploadsPerClient = maxUploadsPerClient;
+    resourceConfig.maxDownloadsPerClient = maxDownloadsPerClient;
+    NodeResourceGovernor resourceGovernor(resourceConfig);
     EventLoop loop;
     DiskWriteExecutor::Config diskConfig;
     diskConfig.workerCount = 2;
@@ -580,7 +657,7 @@ int main(int argc, char** argv)
         if(registered || registrationInFlight) return;
         registrationInFlight = true;
         gatewayControl.registerStorageNode({nodeId, advertiseAddress, port, availableBytes(dataDir), 0,
-                                            kMaxConcurrentWrites, capabilities},
+                                            maxConcurrentWrites, capabilities},
             [&](RpcResult result) {
                 registrationInFlight = false;
                 if(result.ok) {
@@ -597,7 +674,8 @@ int main(int argc, char** argv)
     };
     heartbeat = [&] {
         gatewayControl.sendHeartbeat({nodeId, logicalUsedBytes(store), effectiveFreeBytes(store, dataDir),
-                                      0, 0, 0, 0, writeAdmission.active()},
+                                      0, 0, 0, 0,
+                                      resourceGovernor.snapshot().activeUploads},
             [&](RpcResult result) {
                 if(!result.ok) {
                     miniKV::utils::logDebug("event=datanode_heartbeat_failed node=" + nodeId +
@@ -609,6 +687,7 @@ int main(int argc, char** argv)
     };
 
     miniKV::http::HttpServer server(&loop, nullptr, port);
+    server.setThreadNum(ioThreads);
     server.setErrorResponseDecorator([&](const HttpRequest& request, HttpResponse* response) {
         if(beginsWith(request.path(), "/v2/chunks/")) {
             corsPolicy.appendHeaders(*response, request.getHeader("Origin"));
@@ -623,8 +702,8 @@ int main(int argc, char** argv)
     server.setBodyStreamSetup([&](HttpContext* context, const HttpRequest& request,
         const TcpConnectionPtr& upstream) {
         const std::string hash = request.path().substr(std::string("/v2/chunks/").size());
-        auto stream = std::make_shared<ChunkUploadStream>(&loop, store, writeAdmission, diskExecutor,
-        nodeId, gatewayControl,
+        auto stream = std::make_shared<ChunkUploadStream>(upstream->ownerLoop(), store,
+        resourceGovernor, diskExecutor, nodeId,
         gatewayAddress, gatewayPort, clusterSecret, corsPolicy, request.getHeader("Origin"), request, hash);
         stream->startReplica(upstream);
         context->setUserData(stream);
@@ -633,7 +712,7 @@ int main(int argc, char** argv)
         });
     });
     server.setHttpCallback([&](const HttpRequest& request, HttpResponse* response,
-        const TcpConnectionPtr&, const DeferredResponse::Ptr& deferred) {
+        const TcpConnectionPtr& connection, const DeferredResponse::Ptr& deferred) {
         const std::string& path = request.path();
         const std::string origin = request.getHeader("Origin");
         const bool chunkRequest = beginsWith(path, "/v2/chunks/");
@@ -686,7 +765,36 @@ int main(int argc, char** argv)
             response->addHeader("Content-Length", std::to_string(region.length));
             response->addHeader("X-Chunk-Hash", hash);
             if(request.method() == HttpRequest::kGet) {
-                response->setFileBody(store.dataFilePath(), region.offset, region.length);
+                std::string clientId = request.getHeader("X-Client-Instance-Id");
+                if(clientId.empty()) {
+                    clientId = "connection:" + std::to_string(connection->fd());
+                }
+                auto lease = resourceGovernor.tryAcquireDownload(clientId);
+                if(!lease.has_value()) {
+                    json(response, 503, jsonError("DataNode download capacity reached"));
+                    response->addHeader("Retry-After", "1");
+                    corsPolicy.appendHeaders(*response, origin);
+                    return;
+                }
+                auto sharedLease = std::make_shared<NodeResourceGovernor::DownloadLease>(
+                    std::move(*lease));
+                const auto startedAt = std::chrono::steady_clock::now();
+                connection->setSendFileQuantum(sendFileQuantumBytes);
+                response->setCloseConnection(true);
+                response->addHeader("Connection", "close");
+                response->setFileBody(store.dataFilePath(), region.offset, region.length,
+                    [sharedLease, hash, startedAt](
+                        const miniKV::network::SendFileResult& result) {
+                        (void)sharedLease;
+                        const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+                            std::chrono::steady_clock::now() - startedAt).count();
+                        const std::string line = "event=chunk_download_complete chunk=" + hash +
+                            " success=" + (result.success ? "true" : "false") + " bytes=" +
+                            std::to_string(result.bytesSent) + " total_ms=" +
+                            std::to_string(elapsed);
+                        if(result.success) miniKV::utils::logInfo(line);
+                        else miniKV::utils::logWarn(line);
+                    });
             }
             corsPolicy.appendHeaders(*response, origin);
             return;
@@ -698,6 +806,9 @@ int main(int argc, char** argv)
     server.start();
     miniKV::utils::logInfo("event=datanode_started node=" + nodeId + " port=" +
                            std::to_string(port) + " data_dir=" + dataDir +
-                           " max_writes=" + std::to_string(kMaxConcurrentWrites));
+                           " max_uploads=" + std::to_string(maxConcurrentWrites) +
+                           " max_downloads=" + std::to_string(maxConcurrentDownloads) +
+                           " io_threads=" + std::to_string(ioThreads) +
+                           " sendfile_quantum_bytes=" + std::to_string(sendFileQuantumBytes));
     loop.loop();
 }

@@ -9,6 +9,7 @@
 #include <fcntl.h>
 #include <iostream>
 #include <cstring>
+#include <cerrno>
 
 
 namespace miniKV {
@@ -67,29 +68,35 @@ void Acceptor::listen(){
     acceptChannel_.enableReading();
 }
 
+void Acceptor::stop()
+{
+    if(!listening_) return;
+    listening_ = false;
+    acceptChannel_.disableAll();
+}
+
 void Acceptor::handleRead(){
-    struct sockaddr_in clientAddr;
-    socklen_t addrLen = sizeof(clientAddr);
+    for(;;) {
+        struct sockaddr_in clientAddr {};
+        socklen_t addrLen = sizeof(clientAddr);
+        const int connfd = ::accept4(acceptFd_,
+            reinterpret_cast<struct sockaddr*>(&clientAddr), &addrLen,
+            SOCK_NONBLOCK | SOCK_CLOEXEC);
+        if(connfd >= 0) {
+            int optval = 1;
+            ::setsockopt(connfd, IPPROTO_TCP, TCP_NODELAY, &optval, sizeof(optval));
+            int sndbuf = 256 * 1024;
+            ::setsockopt(connfd, SOL_SOCKET, SO_SNDBUF, &sndbuf, sizeof(sndbuf));
 
-    int connfd = ::accept4(acceptFd_, (struct sockaddr *)&clientAddr, (socklen_t *)&addrLen,  SOCK_NONBLOCK | SOCK_CLOEXEC);
-    if(connfd >= 0)
-    {
-        // 调优：关闭 Nagle + 加大发送缓冲
-        int optval = 1;
-        ::setsockopt(connfd, IPPROTO_TCP, TCP_NODELAY, &optval, sizeof(optval));
-        int sndbuf = 256 * 1024;
-        ::setsockopt(connfd, SOL_SOCKET, SO_SNDBUF, &sndbuf, sizeof(sndbuf));
-
-        if(newConnectionCallback_)//回调存在
-        {
-            newConnectionCallback_(connfd, clientAddr);
+            if(newConnectionCallback_) newConnectionCallback_(connfd, clientAddr);
+            else ::close(connfd);
+            continue;
         }
-        else {
-            ::close(connfd); //没人处理
+        if(errno == EINTR) continue;
+        if(errno != EAGAIN && errno != EWOULDBLOCK) {
+            std::cerr << "Acceptor::accept4 failed errno=" << errno << std::endl;
         }
-    }
-    else {
-        std::cerr << "error: Accept accept4 fail!" << std::endl;
+        break;
     }
 }
 
@@ -97,7 +104,6 @@ void Acceptor::handleRead(){
 
 
 }
-
 
 
 

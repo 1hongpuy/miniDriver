@@ -136,6 +136,26 @@ target_link_libraries(test_async_http_timeout PRIVATE
     pthread
 )
 
+add_executable(test_event_loop_thread test/test_event_loop_thread.cpp)
+target_link_libraries(test_event_loop_thread PRIVATE minikv_net pthread)
+
+add_executable(test_event_loop_thread_pool test/test_event_loop_thread_pool.cpp)
+target_link_libraries(test_event_loop_thread_pool PRIVATE minikv_net pthread)
+
+add_executable(test_tcp_connection_context test/test_tcp_connection_context.cpp)
+target_link_libraries(test_tcp_connection_context PRIVATE minikv_net pthread)
+
+add_executable(test_tcp_server_multi_reactor test/test_tcp_server_multi_reactor.cpp)
+target_link_libraries(test_tcp_server_multi_reactor PRIVATE minikv_net pthread)
+
+add_executable(test_http_server_multi_reactor test/test_http_server_multi_reactor.cpp)
+target_link_libraries(test_http_server_multi_reactor PRIVATE
+    minikv_http
+    minikv_net
+    minikv_utils
+    pthread
+)
+
 add_executable(test_http_stream_context test/test_http_stream_context.cpp)
 target_link_libraries(test_http_stream_context PRIVATE
     minikv_http
@@ -178,6 +198,9 @@ target_link_libraries(test_tcp_sendfile_offset PRIVATE
     minikv_net
     pthread
 )
+
+add_executable(test_http_file_response test/test_http_file_response.cpp)
+target_include_directories(test_http_file_response PRIVATE include)
 
 add_executable(test_gateway_write_lease test/test_gateway_write_lease.cpp)
 target_include_directories(test_gateway_write_lease PRIVATE ${LEVELDB_INC})
@@ -297,6 +320,10 @@ add_executable(test_write_admission test/test_write_admission.cpp)
 target_include_directories(test_write_admission PRIVATE include)
 target_link_libraries(test_write_admission PRIVATE pthread)
 
+add_executable(test_node_resource_governor test/test_node_resource_governor.cpp)
+target_include_directories(test_node_resource_governor PRIVATE include)
+target_link_libraries(test_node_resource_governor PRIVATE pthread)
+
 add_executable(test_disk_write_executor test/test_disk_write_executor.cpp)
 target_include_directories(test_disk_write_executor PRIVATE include)
 target_link_libraries(test_disk_write_executor PRIVATE minikv_datanode pthread)
@@ -375,11 +402,17 @@ target_link_libraries(minikv_v2_bench PRIVATE minikv_benchmark)
 
 if(BUILD_TESTING)
     add_test(NAME async_http_timeout COMMAND test_async_http_timeout)
+    add_test(NAME event_loop_thread COMMAND test_event_loop_thread)
+    add_test(NAME event_loop_thread_pool COMMAND test_event_loop_thread_pool)
+    add_test(NAME tcp_connection_context COMMAND test_tcp_connection_context)
+    add_test(NAME tcp_server_multi_reactor COMMAND test_tcp_server_multi_reactor)
+    add_test(NAME http_server_multi_reactor COMMAND test_http_server_multi_reactor)
     add_test(NAME http_stream_context COMMAND test_http_stream_context)
     add_test(NAME fast_data_store_read COMMAND test_fast_data_store_read)
     add_test(NAME fast_data_store_region COMMAND test_fast_data_store_region)
     add_test(NAME fast_data_store_delete COMMAND test_fast_data_store_delete)
     add_test(NAME tcp_sendfile_offset COMMAND test_tcp_sendfile_offset)
+    add_test(NAME http_file_response COMMAND test_http_file_response)
     add_test(NAME gateway_write_lease COMMAND test_gateway_write_lease)
     add_test(NAME gateway_manifest_snapshot COMMAND test_gateway_manifest_snapshot)
     add_test(NAME gateway_catalog COMMAND test_gateway_catalog)
@@ -403,6 +436,7 @@ if(BUILD_TESTING)
     add_test(NAME v2_thumbnail_contact_sheet_ui
              COMMAND python3 ${CMAKE_CURRENT_SOURCE_DIR}/test/test_v2_thumbnail_contact_sheet_ui.py)
     add_test(NAME write_admission COMMAND test_write_admission)
+    add_test(NAME node_resource_governor COMMAND test_node_resource_governor)
     add_test(NAME disk_write_executor COMMAND test_disk_write_executor)
     add_test(NAME chunk_disk_write_pipeline COMMAND test_chunk_disk_write_pipeline)
     add_test(NAME media_job COMMAND test_media_job)

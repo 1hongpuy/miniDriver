@@ -66,6 +66,10 @@ public:
     void setErrorResponseDecorator(ErrorResponseDecorator cb) { errorResponseDecorator_ = std::move(cb); }
     void setThreadNum(size_t count) { server_.setThreadNum(count); }
     void start() { server_.start(); }
+    std::vector<network::EventLoop*> eventLoops() const { return server_.eventLoops(); }
+    network::TcpConnection::OutputMetrics outputBufferMetrics() const noexcept {
+        return server_.outputBufferMetrics();
+    }
 
     network::EventLoop*  loop() { return loop_;}
     utils::ThreadPool*   threadPool()  {return threadPool_; }

@@ -38,7 +38,8 @@ bool parseSizes(const std::string& text, std::vector<uint64_t>& sizes) {
 
 std::string benchmarkUsage() {
     return "usage: minikv_v2_bench local --gateway HOST:PORT --work-dir ABSOLUTE_PATH "
-           "[--sizes 4MiB,32MiB,256MiB,1GiB] [--runs 3] [--concurrency 1] [--remote-dir /benchmark]";
+           "[--sizes 4MiB,32MiB,256MiB,1GiB] [--runs 3] [--concurrency 1] [--chunk-window 1|2] [--global-chunk-budget 2] "
+           "[--mode end-to-end|upload|download|mixed] [--remote-dir /benchmark]";
 }
 
 bool parseBenchmarkOptions(const std::vector<std::string>& args,
@@ -48,6 +49,8 @@ bool parseBenchmarkOptions(const std::vector<std::string>& args,
                      256ULL * 1024ULL * 1024ULL, 1024ULL * 1024ULL * 1024ULL};
     options.runs = 3;
     options.concurrency = 1;
+    options.chunkWindow = 1;
+    options.globalChunkBudget = 2;
     options.remoteDir = "/benchmark";
     if (args.empty() || args.front() != "local") { error = "only the local command is supported"; return false; }
     bool gatewaySet = false;
@@ -70,6 +73,20 @@ bool parseBenchmarkOptions(const std::vector<std::string>& args,
             if (!parseRuns(value, options.runs)) { error = "invalid --runs count"; return false; }
         } else if (flag == "--concurrency") {
             if (!parseRuns(value, options.concurrency)) { error = "invalid --concurrency count"; return false; }
+        } else if (flag == "--chunk-window") {
+            if (!parseRuns(value, options.chunkWindow) || options.chunkWindow > 2) {
+                error = "--chunk-window must be 1 or 2"; return false;
+            }
+        } else if (flag == "--global-chunk-budget") {
+            if (!parseRuns(value, options.globalChunkBudget)) {
+                error = "invalid --global-chunk-budget"; return false;
+            }
+        } else if (flag == "--mode") {
+            if(value == "end-to-end") options.mode = BenchmarkMode::kEndToEnd;
+            else if(value == "upload") options.mode = BenchmarkMode::kUploadOnly;
+            else if(value == "download") options.mode = BenchmarkMode::kDownloadOnly;
+            else if(value == "mixed") options.mode = BenchmarkMode::kMixed;
+            else { error = "invalid --mode"; return false; }
         } else if (flag == "--remote-dir") {
             if (value.empty()) { error = "invalid --remote-dir"; return false; }
             options.remoteDir = value.front() == '/' ? value : "/" + value;
@@ -79,6 +96,10 @@ bool parseBenchmarkOptions(const std::vector<std::string>& args,
         }
     }
     if (!gatewaySet || !workDirSet) { error = "--gateway and --work-dir are required"; return false; }
+    if (options.mode == BenchmarkMode::kMixed && options.concurrency < 2) {
+        error = "--mode mixed requires --concurrency >= 2";
+        return false;
+    }
     return true;
 }
 

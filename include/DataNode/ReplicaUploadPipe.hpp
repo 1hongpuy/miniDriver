@@ -2,13 +2,16 @@
 
 #include "http/HttpContext.hpp"
 #include "http/AsyncHttpClient.hpp"
+#include "http/PersistentHttpSession.hpp"
+#include "DataNode/ReplicaConnectionPool.hpp"
+#include "DataNode/DiskWriteExecutor.hpp"
 
 #include <cstddef>
 #include <chrono>
+#include <deque>
 #include <functional>
 #include <memory>
 #include <string>
-#include <vector>
 
 
 
@@ -54,6 +57,10 @@ private:
 struct ReplicaUploadPipeOptions {
     AsyncHttpRequestOptions request;
     size_t maxPendingBytes = 256 * 1024;
+    // A pool is optional so existing callers retain the one-shot client as a
+    // safe fallback.  The supplied key is valid only for this owner loop.
+    ReplicaConnectionPool::Ptr connectionPool;
+    ReplicaPoolKey connectionKey;
 
     // Called on the owning EventLoop after the downstream request becomes
     // writable again. The owner normally calls upstreamConnection->resumeRead().
@@ -80,6 +87,8 @@ public:
     // was accepted by the pipe but more upstream bytes must wait. kAbort means
     // this segment was not accepted and the HTTP stream must fail.
     miniKV::http::HttpContext::BodyConsumeResult push(const char* data, size_t size);
+    miniKV::http::HttpContext::BodyConsumeResult pushShared(
+        DiskWriteExecutor::SharedBlockPtr block, size_t size);
 
     // Signals that the upstream HTTP body is complete. Final success still
     // arrives later through CompletionCallback after the replica HTTP ACK.
@@ -97,10 +106,23 @@ private:
     explicit ReplicaUploadPipe(network::EventLoop* loop);
 
     void startInLoop(ReplicaUploadPipeOptions options, CompletionCallback completion);
+    void startShortRequestInLoop();
+    void startPersistentRequestInLoop(http::PersistentHttpSession::Ptr session);
+    AsyncWriteResult writeDownstreamInLoop(const char* data, size_t size);
+    void finishDownstreamInLoop();
     miniKV::http::HttpContext::BodyConsumeResult pushInLoop(const char* data, size_t size);
     void finishInLoop();
     void abortInLoop();
+    struct PendingBlock {
+        std::string copied;
+        DiskWriteExecutor::SharedBlockPtr shared;
+        size_t size = 0;
+        const char* data() const { return shared ? shared->data() : copied.data(); }
+    };
     bool enqueuePendingInLoop(const char* data, size_t size);
+    bool enqueueSharedPendingInLoop(DiskWriteExecutor::SharedBlockPtr block, size_t size);
+    miniKV::http::HttpContext::BodyConsumeResult pushSharedInLoop(
+        DiskWriteExecutor::SharedBlockPtr block, size_t size);
     bool flushPendingInLoop();
     void tryResumeUpstreamInLoop();
     void failInLoop(std::string error);
@@ -111,9 +133,10 @@ private:
 
     network::EventLoop* loop_;
     AsyncHttpRequest::Ptr request_;
+    http::PersistentHttpSession::Ptr persistentRequest_;
     ReplicaUploadPipeOptions options_;
     CompletionCallback completionCallback_;
-    std::vector<std::string> pendingBlocks_;
+    std::deque<PendingBlock> pendingBlocks_;
     size_t pendingBytes_ = 0;
     ReplicaUploadMetrics metrics_;
     bool requestReady_ = false;

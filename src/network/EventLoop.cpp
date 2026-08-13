@@ -64,6 +64,7 @@ void EventLoop::loop(){
     //原子操作没有人quit的时候才进行
     while(!quit_)
     {
+        loopIterations_.fetch_add(1, std::memory_order_relaxed);
         activeChannels_.clear();
 
         poller_->poll(activeChannels_);
@@ -98,6 +99,12 @@ void EventLoop::runInLoop(Functor cb)
 
 void EventLoop::queueInLoop(Functor cb)
 {
+    pendingFunctorsQueued_.fetch_add(1, std::memory_order_relaxed);
+    if(!isInLoopThread()) crossThreadQueued_.fetch_add(1, std::memory_order_relaxed);
+    const uint64_t depth = pendingFunctorDepth_.fetch_add(1, std::memory_order_relaxed) + 1;
+    uint64_t peak = pendingFunctorPeakDepth_.load(std::memory_order_relaxed);
+    while(peak < depth && !pendingFunctorPeakDepth_.compare_exchange_weak(
+        peak, depth, std::memory_order_relaxed)) {}
     {
         std::lock_guard<std::mutex> lock(mutex_);
         pendingFunctors_.push_back(std::move(cb));
@@ -147,11 +154,13 @@ void EventLoop::doPendingFunctors()
         std::lock_guard<std::mutex> lock(mutex_);
         functors.swap(pendingFunctors_);
     }
+    pendingFunctorDepth_.fetch_sub(functors.size(), std::memory_order_relaxed);
 
     for(auto f : functors)
     {
         f();//这里没有锁，所以这里可以让工作进程，接着运行，并且这里的函数必须轻量化
     }
+    pendingFunctorsExecuted_.fetch_add(functors.size(), std::memory_order_relaxed);
     callingPendingFunctors_ = false;
 }  
 
@@ -189,6 +198,15 @@ void EventLoop::handleTimerRead(int timerFd_,  std::map<int, TimerEntry>& timers
     {
         if(timer.expiration <= now)
         {
+            const uint64_t lagMs = static_cast<uint64_t>(now - timer.expiration);
+            timerCallbacks_.fetch_add(1, std::memory_order_relaxed);
+            if(lagMs > 0) {
+                timerLateCallbacks_.fetch_add(1, std::memory_order_relaxed);
+                timerLagTotalMs_.fetch_add(lagMs, std::memory_order_relaxed);
+                uint64_t previous = timerLagMaxMs_.load(std::memory_order_relaxed);
+                while(previous < lagMs && !timerLagMaxMs_.compare_exchange_weak(
+                    previous, lagMs, std::memory_order_relaxed)) {}
+            }
             toRun.push_back(timer.callback);
             if(timer.interval > 0)
             {
@@ -270,6 +288,20 @@ int EventLoop::runAfter(int64_t delayMs, Functor cb)
     });
     return t.id;
 }
+
+EventLoop::Metrics EventLoop::metrics() const noexcept
+{
+    return {loopIterations_.load(std::memory_order_relaxed),
+            pendingFunctorsQueued_.load(std::memory_order_relaxed),
+            crossThreadQueued_.load(std::memory_order_relaxed),
+            pendingFunctorsExecuted_.load(std::memory_order_relaxed),
+            pendingFunctorDepth_.load(std::memory_order_relaxed),
+            pendingFunctorPeakDepth_.load(std::memory_order_relaxed),
+            timerCallbacks_.load(std::memory_order_relaxed),
+            timerLateCallbacks_.load(std::memory_order_relaxed),
+            timerLagTotalMs_.load(std::memory_order_relaxed),
+            timerLagMaxMs_.load(std::memory_order_relaxed)};
+}
 int EventLoop::runEvery(int64_t intervalMs, Functor cb)
 {
     int64_t now = currentTimeMs();
@@ -297,8 +329,6 @@ void EventLoop::cancel(int timerId) //取消定时器
 }
 
 }
-
-
 
 
 

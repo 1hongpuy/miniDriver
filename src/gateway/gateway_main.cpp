@@ -458,7 +458,12 @@ int main(int argc, char** argv) {
         }
         if (request.method() == HttpRequest::kGet && beginsWith(path, "/api/v2/upload/sessions/")) {
             SessionState session; const std::string id = pathTail(path, "/api/v2/upload/sessions/");
-            if (!state.getSession(id, session)) { json(response, 404, jsonError("session not found")); return; }
+            const auto sessionLookupStarted = Clock::now();
+            const bool found = state.getSession(id, session);
+            miniKV::utils::logInfo("event=upload_session_get found=" +
+                                   std::string(found ? "true" : "false") + " elapsed_us=" +
+                                   std::to_string(elapsedMicroseconds(sessionLookupStarted, Clock::now())));
+            if (!found) { json(response, 404, jsonError("session not found")); return; }
             std::ostringstream out; out << "{\"sessionId\":\"" << session.sessionId << "\",\"fileSize\":" << session.fileSize << ",\"chunkSize\":" << session.chunkSize << ",\"totalChunks\":" << session.totalChunks << ",\"manifestHash\":\"" << jsonEscape(session.manifestHash) << "\",\"completed\":["; bool first = true; for (const auto& [index, chunk] : session.completed) { if (!first) out << ','; first = false; out << index; } out << "]}"; json(response, 200, out.str()); return;
         }
         if (request.method() == HttpRequest::kPost && beginsWith(path, "/api/v2/upload/sessions/") && path.size() > 7 && path.rfind("/routes") == path.size() - 7) {
@@ -741,8 +746,13 @@ int main(int argc, char** argv) {
             return;
         }
         if (request.method() == HttpRequest::kGet && beginsWith(path, "/api/v2/files/") && path.size() > 9 && path.rfind("/manifest") == path.size() - 9) {
+            const auto manifestStarted = Clock::now();
             ManifestSnapshot snapshot;
-            if (!state.buildManifestSnapshot(pathTail(path, "/api/v2/files/", "/manifest"), snapshot)) {
+            const bool found = state.buildManifestSnapshot(pathTail(path, "/api/v2/files/", "/manifest"), snapshot);
+            miniKV::utils::logInfo("event=file_manifest found=" +
+                                   std::string(found ? "true" : "false") + " elapsed_us=" +
+                                   std::to_string(elapsedMicroseconds(manifestStarted, Clock::now())));
+            if (!found) {
                 json(response, 404, jsonError("file not found or manifest is incomplete"));
                 return;
             }

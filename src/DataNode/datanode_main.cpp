@@ -207,12 +207,14 @@ public:
     ChunkUploadStream(EventLoop* loop, FastDataStore& store,
                       NodeResourceGovernor& resourceGovernor,
                       DiskWriteExecutor& diskExecutor,
+                      ReplicaConnectionPool::Ptr replicaConnectionPool,
                       std::string nodeId,
                       std::string gatewayAddress, uint16_t gatewayPort,
                       std::string clusterSecret, CorsPolicy corsPolicy,
                       std::string requestOrigin, const HttpRequest& request, std::string chunkHash)
         : loop_(loop), store_(store), resourceGovernor_(resourceGovernor),
             diskExecutor_(diskExecutor),
+            replicaConnectionPool_(std::move(replicaConnectionPool)),
             nodeId_(std::move(nodeId)),
             gatewayAddress_(std::move(gatewayAddress)), gatewayPort_(gatewayPort),
             clusterSecret_(std::move(clusterSecret)),
@@ -268,6 +270,8 @@ public:
             {"X-Upload-Token", uploadToken_},
             {"X-Client-Instance-Id", clientId_}
         };
+        options.connectionPool = replicaConnectionPool_;
+        options.connectionKey = {target.nodeId, target.address, target.port};
         options.resumeUpstream = [weakUpstream] {
             if(auto connection = weakUpstream.lock()) connection->resumeRead();
         };
@@ -289,15 +293,20 @@ public:
             return HttpContext::BodyConsumeResult::kAbort;
         }
 
-        const auto diskResult = diskPipeline_->push(bytes, size);
+        DiskWriteExecutor::SharedBlockPtr sharedBlock;
+        const auto diskResult = diskPipeline_->push(bytes, size,
+                                                     replicaPipe_ == nullptr ? nullptr : &sharedBlock);
         if(diskResult == HttpContext::BodyConsumeResult::kAbort) {
             error_ = "local disk write queue rejected body bytes";
             logBodyRejected(error_, size);
             return HttpContext::BodyConsumeResult::kAbort;
         }
+        if(diskResult == HttpContext::BodyConsumeResult::kPauseBeforeConsume) {
+            return diskResult;
+        }
         if(replicaPipe_ == nullptr) return diskResult;
 
-        const auto replicaResult = replicaPipe_->push(bytes, size);
+        const auto replicaResult = replicaPipe_->pushShared(std::move(sharedBlock), size);
         if(replicaResult == HttpContext::BodyConsumeResult::kAbort) {
             error_ = "replica stream rejected body bytes";
             diskPipeline_->cancel();
@@ -479,6 +488,7 @@ private:
             " chunk=" + chunkHash_ + " session=" + capability_.sessionId +
             " index=" + std::to_string(capability_.chunkIndex) + " http_status=" +
             std::to_string(status) + " bytes=" + std::to_string(capability_.chunkSize) +
+            " role=" + std::string(position_ == 0 ? "primary" : "replica") +
             " replicas=" + std::to_string(successfulNodes_.size()) +
             " total_ms=" + std::to_string(elapsedMilliseconds(acceptedAt_, completedAt)) +
             " body_receive_ms=" + std::to_string(elapsedMilliseconds(firstBodyAt_, localFinishedAt_)) +
@@ -548,6 +558,7 @@ private:
     FastDataStore& store_;
     NodeResourceGovernor& resourceGovernor_;
     DiskWriteExecutor& diskExecutor_;
+    ReplicaConnectionPool::Ptr replicaConnectionPool_;
     std::string nodeId_;
     std::string gatewayAddress_;
     uint16_t gatewayPort_ = 0;
@@ -688,6 +699,7 @@ int main(int argc, char** argv)
 
     miniKV::http::HttpServer server(&loop, nullptr, port);
     server.setThreadNum(ioThreads);
+    std::vector<std::pair<EventLoop*, ReplicaConnectionPool::Ptr>> replicaPools;
     server.setErrorResponseDecorator([&](const HttpRequest& request, HttpResponse* response) {
         if(beginsWith(request.path(), "/v2/chunks/")) {
             corsPolicy.appendHeaders(*response, request.getHeader("Origin"));
@@ -702,8 +714,15 @@ int main(int argc, char** argv)
     server.setBodyStreamSetup([&](HttpContext* context, const HttpRequest& request,
         const TcpConnectionPtr& upstream) {
         const std::string hash = request.path().substr(std::string("/v2/chunks/").size());
+        ReplicaConnectionPool::Ptr replicaPool;
+        for(const auto& item : replicaPools) {
+            if(item.first == upstream->ownerLoop()) {
+                replicaPool = item.second;
+                break;
+            }
+        }
         auto stream = std::make_shared<ChunkUploadStream>(upstream->ownerLoop(), store,
-        resourceGovernor, diskExecutor, nodeId,
+        resourceGovernor, diskExecutor, std::move(replicaPool), nodeId,
         gatewayAddress, gatewayPort, clusterSecret, corsPolicy, request.getHeader("Origin"), request, hash);
         stream->startReplica(upstream);
         context->setUserData(stream);
@@ -803,7 +822,55 @@ int main(int argc, char** argv)
     });
     loop.runAfter(0, [&] { registerNode(); heartbeat(); });
     loop.runEvery(8000, heartbeat);
+    loop.runEvery(1000, [&] {
+        const NodeResourceGovernor::Snapshot resources = resourceGovernor.snapshot();
+        const DiskWriteExecutor::Metrics disk = diskExecutor.metrics();
+        const miniKV::network::TcpConnection::OutputMetrics output = server.outputBufferMetrics();
+        miniKV::utils::logInfo("event=resource_snapshot"
+            " active_uploads=" + std::to_string(resources.activeUploads) +
+            " active_downloads=" + std::to_string(resources.activeDownloads) +
+            " disk_queued_tasks=" + std::to_string(disk.queuedTasks) +
+            " disk_queue_peak_tasks=" + std::to_string(disk.peakQueuedTasks) +
+            " block_available=" + std::to_string(disk.availableBlocks) +
+            " block_total=" + std::to_string(disk.totalBlocks) +
+            " block_leased_bytes=" + std::to_string(disk.leasedBytes) +
+            " block_peak_leased_bytes=" + std::to_string(disk.peakLeasedBytes) +
+            " disk_active_workers=" + std::to_string(disk.activeWorkers) +
+            " disk_total_workers=" + std::to_string(disk.totalWorkers) +
+            " disk_completed_tasks=" + std::to_string(disk.completedTasks) +
+            " output_buffer_current_bytes=" + std::to_string(output.currentBytes) +
+            " output_buffer_peak_bytes=" + std::to_string(output.peakBytes) +
+            " output_buffer_high_water_events=" + std::to_string(output.highWaterEvents));
+        const auto eventLoops = server.eventLoops();
+        for(size_t index = 0; index < eventLoops.size(); ++index) {
+            const miniKV::network::EventLoop::Metrics metrics = eventLoops[index]->metrics();
+            miniKV::utils::logInfo("event=event_loop_snapshot"
+                " loop_index=" + std::to_string(index) +
+                " loop_role=" + std::string(index == 0 ? "acceptor" : "io") +
+                " loop_iterations=" + std::to_string(metrics.loopIterations) +
+                " pending_queued=" + std::to_string(metrics.pendingFunctorsQueued) +
+                " cross_thread_queued=" + std::to_string(metrics.crossThreadQueued) +
+                " pending_executed=" + std::to_string(metrics.pendingFunctorsExecuted) +
+                " pending_depth=" + std::to_string(metrics.pendingFunctorDepth) +
+                " pending_peak_depth=" + std::to_string(metrics.pendingFunctorPeakDepth) +
+                " timer_callbacks=" + std::to_string(metrics.timerCallbacks) +
+                " timer_late_callbacks=" + std::to_string(metrics.timerLateCallbacks) +
+                " timer_lag_total_ms=" + std::to_string(metrics.timerLagTotalMs) +
+                " timer_lag_max_ms=" + std::to_string(metrics.timerLagMaxMs));
+        }
+    });
     server.start();
+    for(miniKV::network::EventLoop* eventLoop : server.eventLoops()) {
+        // The base loop never owns accepted data connections when I/O worker
+        // loops are enabled, but giving it a shard also keeps the zero-worker
+        // configuration correct.
+        replicaPools.emplace_back(eventLoop, ReplicaConnectionPool::create(eventLoop));
+    }
+    // Every I/O loop needs its own timer probe.  A probe on only the accept
+    // loop cannot describe worker-loop scheduling under Multi-Reactor load.
+    for(miniKV::network::EventLoop* eventLoop : server.eventLoops()) {
+        eventLoop->runEvery(1000, [] {});
+    }
     miniKV::utils::logInfo("event=datanode_started node=" + nodeId + " port=" +
                            std::to_string(port) + " data_dir=" + dataDir +
                            " max_uploads=" + std::to_string(maxConcurrentWrites) +
@@ -811,4 +878,5 @@ int main(int argc, char** argv)
                            " io_threads=" + std::to_string(ioThreads) +
                            " sendfile_quantum_bytes=" + std::to_string(sendFileQuantumBytes));
     loop.loop();
+    for(const auto& item : replicaPools) item.second->shutdown();
 }

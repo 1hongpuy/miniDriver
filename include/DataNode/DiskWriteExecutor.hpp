@@ -26,6 +26,12 @@ public:
         uint64_t leasedBytes = 0;
         uint64_t peakLeasedBytes = 0;
         uint64_t queuedTasks = 0;
+        uint64_t peakQueuedTasks = 0;
+        uint64_t availableBlocks = 0;
+        uint64_t totalBlocks = 0;
+        uint64_t activeWorkers = 0;
+        uint64_t totalWorkers = 0;
+        uint64_t completedTasks = 0;
     };
 
     class BlockLease {
@@ -52,7 +58,22 @@ public:
         uint16_t index_ = UINT16_MAX;
     };
 
+    // A bounded block that may be retained by more than one asynchronous
+    // consumer.  The underlying pool slot returns only after the last owner
+    // releases this object.
+    class SharedBlock {
+    public:
+        char* data() { return lease_.data(); }
+        explicit operator bool() const { return static_cast<bool>(lease_); }
+    private:
+        friend class DiskWriteExecutor;
+        explicit SharedBlock(BlockLease lease) : lease_(std::move(lease)) {}
+        BlockLease lease_;
+    };
+    using SharedBlockPtr = std::shared_ptr<SharedBlock>;
+
     using Work = std::function<void(BlockLease)>;
+    using SharedWork = std::function<void(SharedBlockPtr)>;
     using Task = std::function<void()>;
 
     DiskWriteExecutor();
@@ -63,8 +84,10 @@ public:
     DiskWriteExecutor& operator=(const DiskWriteExecutor&) = delete;
 
     std::optional<BlockLease> tryAcquireBlock();
+    SharedBlockPtr tryAcquireSharedBlock();
     bool hasAvailableBlock() const;
     bool submit(BlockLease block, Work work);
+    bool submit(SharedBlockPtr block, SharedWork work);
     bool submitTask(Task task);
     Metrics metrics() const;
     void stop();
@@ -77,6 +100,8 @@ private:
     struct WorkItem {
         BlockLease block;
         Work work;
+        SharedBlockPtr sharedBlock;
+        SharedWork sharedWork;
         Task task;
     };
 
@@ -92,6 +117,9 @@ private:
     bool stopping_ = false;
     uint64_t leasedBytes_ = 0;
     uint64_t peakLeasedBytes_ = 0;
+    uint64_t peakQueuedTasks_ = 0;
+    uint64_t activeWorkers_ = 0;
+    uint64_t completedTasks_ = 0;
 };
 
 }  // namespace miniKV::datanode

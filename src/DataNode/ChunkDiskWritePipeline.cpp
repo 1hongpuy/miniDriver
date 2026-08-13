@@ -38,7 +38,8 @@ ChunkDiskWritePipeline::ChunkDiskWritePipeline(
 {
 }
 
-http::HttpContext::BodyConsumeResult ChunkDiskWritePipeline::push(const char* bytes, size_t size)
+http::HttpContext::BodyConsumeResult ChunkDiskWritePipeline::push(
+    const char* bytes, size_t size, DiskWriteExecutor::SharedBlockPtr* sharedBlock)
 {
     if(failed_ || cancelled_ || bytes == nullptr || size == 0 ||
        size > DiskWriteExecutor::kBlockBytes) {
@@ -48,8 +49,8 @@ http::HttpContext::BodyConsumeResult ChunkDiskWritePipeline::push(const char* by
 
     if(!selfHold_) selfHold_ = shared_from_this();
 
-    auto block = executor_.tryAcquireBlock();
-    if(!block.has_value()) {
+    auto block = executor_.tryAcquireSharedBlock();
+    if(!block) {
         // A shared pool may briefly be exhausted by another admitted stream.
         // Keep this body segment in HttpContext's input Buffer; treating this
         // as a malformed request used to turn temporary contention into 400.
@@ -63,7 +64,8 @@ http::HttpContext::BodyConsumeResult ChunkDiskWritePipeline::push(const char* by
     if(metrics_.queuedBytes > metrics_.peakQueuedBytes) {
         metrics_.peakQueuedBytes = metrics_.queuedBytes;
     }
-    pendingBlocks_.push_back({std::move(*block), size});
+    pendingBlocks_.push_back({block, size});
+    if(sharedBlock != nullptr) *sharedBlock = std::move(block);
     scheduleNextAppend();
     if(failed_) return http::HttpContext::BodyConsumeResult::kAbort;
 
@@ -98,8 +100,8 @@ void ChunkDiskWritePipeline::scheduleNextAppend()
     pendingBlocks_.pop_front();
     appendInFlight_ = true;
     const auto self = shared_from_this();
-    if(!executor_.submit(std::move(pending.block), [self, size = pending.size](DiskWriteExecutor::BlockLease workBlock) {
-        const bool success = self->writer_->append(workBlock.data(), size);
+    if(!executor_.submit(std::move(pending.block), [self, size = pending.size](DiskWriteExecutor::SharedBlockPtr workBlock) {
+        const bool success = self->writer_->append(workBlock->data(), size);
         const std::weak_ptr<ChunkDiskWritePipeline> weakSelf = self;
         self->loop_->queueInLoop([weakSelf, success, size] {
             if(const auto pipeline = weakSelf.lock()) {

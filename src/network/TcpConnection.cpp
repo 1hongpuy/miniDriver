@@ -36,8 +36,10 @@ void ignoreSigPipe()
 
 }  // namespace
 
-TcpConnection::TcpConnection(EventLoop* loop, int fd, int id)
-: loop_(loop), fd_(fd), id_(id), state_(kConnectiong), channel_(new Channel(loop, fd))
+TcpConnection::TcpConnection(EventLoop* loop, int fd, int id,
+                             std::shared_ptr<OutputBufferStats> processOutputStats)
+: loop_(loop), fd_(fd), id_(id), state_(kConnectiong), channel_(new Channel(loop, fd)),
+  processOutputStats_(std::move(processOutputStats))
 {
     ignoreSigPipe();
     channel_->setReadCallback([this](){handleRead();});
@@ -48,6 +50,7 @@ TcpConnection::TcpConnection(EventLoop* loop, int fd, int id)
 
 TcpConnection::~TcpConnection(){
     assert(state_ == kDisconnected);
+    resetOutputBytes();
     close(fd_); //这里式不是太简陋了？？
 }
 
@@ -101,6 +104,7 @@ void TcpConnection::handleWrite(){
         if(n > 0)
         {
             outputBuffer_.retrieve(n);
+            removeOutputBytes(static_cast<size_t>(n));
             checkLowWaterMark(oldQueuedBytes);
             if(outputBuffer_.readableBytes() == 0)
             {
@@ -297,6 +301,7 @@ void TcpConnection::sendInLoop(const std::string& buf)
     {
         const size_t oldQueuedBytes = outputBuffer_.readableBytes();
         outputBuffer_.append((buf.data()+nwrote), remaining);
+        addOutputBytes(remaining);
         checkHighWaterMark(oldQueuedBytes);
         if(!channel_->isWriting())
         {
@@ -311,6 +316,10 @@ void TcpConnection::checkHighWaterMark(size_t oldQueuedBytes)
     if(highWaterMarkCallback_ && highWaterMark_ > 0 && oldQueuedBytes < highWaterMark_ && queuedBytes >= highWaterMark_)
     {
         highWaterMarkCallback_(shared_from_this(), queuedBytes);
+    }
+    if(highWaterMark_ > 0 && oldQueuedBytes < highWaterMark_ && queuedBytes >= highWaterMark_) {
+        outputHighWaterEvents_.fetch_add(1, std::memory_order_relaxed);
+        if(processOutputStats_) processOutputStats_->highWaterEvents.fetch_add(1, std::memory_order_relaxed);
     }
 }
 
@@ -346,6 +355,7 @@ void TcpConnection::connectDestroyed() //整个TCP连接断开最后调用的函
         connectionCallback_(shared_from_this());
     }
     clearContext();
+    resetOutputBytes();
     channel_->remove();
 }
 
@@ -356,6 +366,7 @@ void TcpConnection::handleClose(){//对方断开连接的报警机制
     }
     setState(kDisconnected);
     channel_->disableAll();
+    resetOutputBytes();
     finishSendFile(false);
     TcpConnectionPtr guardThis(shared_from_this());
     if(internalCloseCallback_)
@@ -363,6 +374,36 @@ void TcpConnection::handleClose(){//对方断开连接的报警机制
         internalCloseCallback_(guardThis);
     }
     //这样的guardThis的生命周期会到这个函数运行完成之后，才会结束，这样才会析构
+}
+
+TcpConnection::OutputMetrics TcpConnection::outputMetrics() const noexcept
+{
+    return {outputCurrentBytes_.load(std::memory_order_relaxed),
+            outputPeakBytes_.load(std::memory_order_relaxed),
+            outputHighWaterEvents_.load(std::memory_order_relaxed)};
+}
+
+void TcpConnection::addOutputBytes(size_t bytes)
+{
+    const uint64_t current = outputCurrentBytes_.fetch_add(bytes, std::memory_order_relaxed) + bytes;
+    uint64_t peak = outputPeakBytes_.load(std::memory_order_relaxed);
+    while(peak < current && !outputPeakBytes_.compare_exchange_weak(peak, current, std::memory_order_relaxed)) {}
+    if(!processOutputStats_) return;
+    const uint64_t processCurrent = processOutputStats_->currentBytes.fetch_add(bytes, std::memory_order_relaxed) + bytes;
+    peak = processOutputStats_->peakBytes.load(std::memory_order_relaxed);
+    while(peak < processCurrent && !processOutputStats_->peakBytes.compare_exchange_weak(peak, processCurrent, std::memory_order_relaxed)) {}
+}
+
+void TcpConnection::removeOutputBytes(size_t bytes)
+{
+    outputCurrentBytes_.fetch_sub(bytes, std::memory_order_relaxed);
+    if(processOutputStats_) processOutputStats_->currentBytes.fetch_sub(bytes, std::memory_order_relaxed);
+}
+
+void TcpConnection::resetOutputBytes()
+{
+    const uint64_t bytes = outputCurrentBytes_.exchange(0, std::memory_order_relaxed);
+    if(bytes > 0 && processOutputStats_) processOutputStats_->currentBytes.fetch_sub(bytes, std::memory_order_relaxed);
 }
 
 void TcpConnection::handleError(){
@@ -443,7 +484,6 @@ void TcpConnection::finishSendFile(bool success)
 
 }
 }
-
 
 
 

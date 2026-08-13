@@ -136,6 +136,13 @@ target_link_libraries(test_async_http_timeout PRIVATE
     pthread
 )
 
+add_executable(test_persistent_http_session test/test_persistent_http_session.cpp)
+target_link_libraries(test_persistent_http_session PRIVATE
+    minikv_http
+    minikv_net
+    pthread
+)
+
 add_executable(test_event_loop_thread test/test_event_loop_thread.cpp)
 target_link_libraries(test_event_loop_thread PRIVATE minikv_net pthread)
 
@@ -312,6 +319,14 @@ add_executable(test_replica_upload_metrics test/test_replica_upload_metrics.cpp)
 target_include_directories(test_replica_upload_metrics PRIVATE include)
 target_link_libraries(test_replica_upload_metrics PRIVATE pthread)
 
+add_executable(test_replica_connection_pool test/test_replica_connection_pool.cpp)
+target_link_libraries(test_replica_connection_pool PRIVATE
+    minikv_datanode
+    minikv_http
+    minikv_net
+    pthread
+)
+
 add_executable(test_process_supervisor test/test_process_supervisor.cpp)
 target_include_directories(test_process_supervisor PRIVATE include)
 target_link_libraries(test_process_supervisor PRIVATE minikv_agent pthread)
@@ -402,6 +417,7 @@ target_link_libraries(minikv_v2_bench PRIVATE minikv_benchmark)
 
 if(BUILD_TESTING)
     add_test(NAME async_http_timeout COMMAND test_async_http_timeout)
+    add_test(NAME persistent_http_session COMMAND test_persistent_http_session)
     add_test(NAME event_loop_thread COMMAND test_event_loop_thread)
     add_test(NAME event_loop_thread_pool COMMAND test_event_loop_thread_pool)
     add_test(NAME tcp_connection_context COMMAND test_tcp_connection_context)
@@ -427,6 +443,7 @@ if(BUILD_TESTING)
     add_test(NAME node_agent_logging_config COMMAND test_node_agent_logging_config)
     add_test(NAME node_agent_thumbnail_worker_config COMMAND test_node_agent_thumbnail_worker_config)
     add_test(NAME replica_upload_metrics COMMAND test_replica_upload_metrics)
+    add_test(NAME replica_connection_pool COMMAND test_replica_connection_pool)
     add_test(NAME process_supervisor COMMAND test_process_supervisor)
     add_test(NAME datanode_delete
              COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/test/test_v2_datanode_delete.sh

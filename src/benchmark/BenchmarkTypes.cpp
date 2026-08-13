@@ -81,7 +81,7 @@ double mibPerSecond(uint64_t bytes, double elapsedMs) {
 }
 
 SizeSummary summarize(uint64_t sizeBytes, uint32_t requestedRuns,
-                      const std::vector<RunRecord>& records) {
+                      const std::vector<RunRecord>& records, BenchmarkMode mode) {
     SizeSummary summary;
     summary.sizeBytes = sizeBytes;
     summary.requestedRuns = requestedRuns;
@@ -89,21 +89,32 @@ SizeSummary summarize(uint64_t sizeBytes, uint32_t requestedRuns,
     std::vector<double> downloads;
     for (const RunRecord& record : records) {
         if (record.sizeBytes != sizeBytes || !record.uploadOk || !record.downloadOk || !record.error.empty()) continue;
-        uploads.push_back(record.uploadMs);
-        downloads.push_back(record.downloadMs);
+        if (mode != BenchmarkMode::kDownloadOnly && record.operation != "download") {
+            uploads.push_back(record.uploadMs);
+        }
+        if (mode != BenchmarkMode::kUploadOnly && record.operation != "upload") {
+            downloads.push_back(record.downloadMs);
+        }
     }
-    summary.successCount = static_cast<uint32_t>(uploads.size());
-    if (uploads.empty()) return summary;
-    summary.uploadMinMs = *std::min_element(uploads.begin(), uploads.end());
-    summary.uploadMedianMs = median(uploads);
-    summary.uploadP95Ms = percentile(uploads, 0.95);
-    summary.uploadP99Ms = percentile(uploads, 0.99);
-    summary.uploadMeanMs = mean(uploads);
-    summary.downloadMinMs = *std::min_element(downloads.begin(), downloads.end());
-    summary.downloadMedianMs = median(downloads);
-    summary.downloadP95Ms = percentile(downloads, 0.95);
-    summary.downloadP99Ms = percentile(downloads, 0.99);
-    summary.downloadMeanMs = mean(downloads);
+    summary.successCount = static_cast<uint32_t>(std::count_if(records.begin(), records.end(),
+        [sizeBytes](const RunRecord& record) {
+            return record.sizeBytes == sizeBytes && record.uploadOk && record.downloadOk &&
+                   record.error.empty();
+        }));
+    if (!uploads.empty()) {
+        summary.uploadMinMs = *std::min_element(uploads.begin(), uploads.end());
+        summary.uploadMedianMs = median(uploads);
+        summary.uploadP95Ms = percentile(uploads, 0.95);
+        summary.uploadP99Ms = percentile(uploads, 0.99);
+        summary.uploadMeanMs = mean(uploads);
+    }
+    if (!downloads.empty()) {
+        summary.downloadMinMs = *std::min_element(downloads.begin(), downloads.end());
+        summary.downloadMedianMs = median(downloads);
+        summary.downloadP95Ms = percentile(downloads, 0.95);
+        summary.downloadP99Ms = percentile(downloads, 0.99);
+        summary.downloadMeanMs = mean(downloads);
+    }
     return summary;
 }
 
@@ -119,10 +130,11 @@ bool writeReports(const BenchmarkOptions& options, const std::vector<RunRecord>&
         error = std::make_error_code(std::errc::io_error);
         return false;
     }
-    runs << "run_id,size_bytes,upload_ms,upload_mib_per_s,download_ms,download_mib_per_s,chunk_count,upload_ok,download_ok,error\n";
+    runs << "run_id,operation,size_bytes,upload_ms,upload_mib_per_s,download_ms,download_mib_per_s,chunk_count,upload_ok,download_ok,error\n";
     runs << std::fixed << std::setprecision(3);
     for (const RunRecord& record : records) {
-        runs << csvEscape(record.runId) << ',' << record.sizeBytes << ',' << record.uploadMs << ','
+        runs << csvEscape(record.runId) << ',' << csvEscape(record.operation) << ','
+             << record.sizeBytes << ',' << record.uploadMs << ','
              << mibPerSecond(record.sizeBytes, record.uploadMs) << ',' << record.downloadMs << ','
              << mibPerSecond(record.sizeBytes, record.downloadMs) << ',' << record.chunkCount << ','
              << (record.uploadOk ? "true" : "false") << ',' << (record.downloadOk ? "true" : "false")
@@ -139,7 +151,13 @@ bool writeReports(const BenchmarkOptions& options, const std::vector<RunRecord>&
     }
     json << "{\"gateway\":\"" << options.gateway.host << ':' << options.gateway.port
          << "\",\"requestedRuns\":" << options.runs
-         << ",\"concurrency\":" << options.concurrency << ",\"sizes\":[";
+         << ",\"concurrency\":" << options.concurrency
+         << ",\"chunkWindow\":" << options.chunkWindow
+         << ",\"globalChunkBudget\":" << options.globalChunkBudget << ",\"mode\":\""
+         << (options.mode == BenchmarkMode::kEndToEnd ? "end-to-end" :
+             options.mode == BenchmarkMode::kUploadOnly ? "upload" :
+             options.mode == BenchmarkMode::kDownloadOnly ? "download" : "mixed")
+         << "\",\"sizes\":[";
     for (size_t i = 0; i < options.sizes.size(); ++i) {
         if (i) json << ',';
         json << options.sizes[i];

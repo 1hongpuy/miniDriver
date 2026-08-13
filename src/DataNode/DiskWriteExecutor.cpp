@@ -1,5 +1,6 @@
 #include "DataNode/DiskWriteExecutor.hpp"
 
+#include <algorithm>
 #include <stdexcept>
 #include <utility>
 
@@ -80,6 +81,13 @@ std::optional<DiskWriteExecutor::BlockLease> DiskWriteExecutor::tryAcquireBlock(
     return BlockLease(this, index);
 }
 
+DiskWriteExecutor::SharedBlockPtr DiskWriteExecutor::tryAcquireSharedBlock()
+{
+    auto lease = tryAcquireBlock();
+    if(!lease.has_value()) return nullptr;
+    return SharedBlockPtr(new SharedBlock(std::move(*lease)));
+}
+
 bool DiskWriteExecutor::hasAvailableBlock() const
 {
     std::lock_guard<std::mutex> lock(mutex_);
@@ -93,6 +101,23 @@ bool DiskWriteExecutor::submit(BlockLease block, Work work)
         std::lock_guard<std::mutex> lock(mutex_);
         if(stopping_) return false;
         readyQueue_.push_back({std::move(block), std::move(work)});
+        peakQueuedTasks_ = std::max<uint64_t>(peakQueuedTasks_, readyQueue_.size());
+    }
+    cv_.notify_one();
+    return true;
+}
+
+bool DiskWriteExecutor::submit(SharedBlockPtr block, SharedWork work)
+{
+    if(!block || !work) return false;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if(stopping_) return false;
+        WorkItem item;
+        item.sharedBlock = std::move(block);
+        item.sharedWork = std::move(work);
+        readyQueue_.push_back(std::move(item));
+        peakQueuedTasks_ = std::max<uint64_t>(peakQueuedTasks_, readyQueue_.size());
     }
     cv_.notify_one();
     return true;
@@ -107,6 +132,7 @@ bool DiskWriteExecutor::submitTask(Task task)
         WorkItem item;
         item.task = std::move(task);
         readyQueue_.push_back(std::move(item));
+        peakQueuedTasks_ = std::max<uint64_t>(peakQueuedTasks_, readyQueue_.size());
     }
     cv_.notify_one();
     return true;
@@ -115,7 +141,10 @@ bool DiskWriteExecutor::submitTask(Task task)
 DiskWriteExecutor::Metrics DiskWriteExecutor::metrics() const
 {
     std::lock_guard<std::mutex> lock(mutex_);
-    return {leasedBytes_, peakLeasedBytes_, static_cast<uint64_t>(readyQueue_.size())};
+    return {leasedBytes_, peakLeasedBytes_, static_cast<uint64_t>(readyQueue_.size()),
+            peakQueuedTasks_, static_cast<uint64_t>(freeIds_.size()),
+            static_cast<uint64_t>(freeIds_.size() + leasedBytes_ / kBlockBytes),
+            activeWorkers_, static_cast<uint64_t>(workers_.size()), completedTasks_};
 }
 
 void DiskWriteExecutor::stop()
@@ -148,13 +177,20 @@ void DiskWriteExecutor::workerMain()
             if(stopping_ && readyQueue_.empty()) return;
             item = std::move(readyQueue_.front());
             readyQueue_.pop_front();
+            ++activeWorkers_;
         }
 
         try {
             if(item.work) item.work(std::move(item.block));
+            else if(item.sharedWork) item.sharedWork(std::move(item.sharedBlock));
             else item.task();
         } catch(...) {
             // The owning upload pipeline reports its own write failure.
+        }
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            if(activeWorkers_ > 0) --activeWorkers_;
+            ++completedTasks_;
         }
     }
 }

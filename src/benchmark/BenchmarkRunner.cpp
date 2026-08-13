@@ -6,11 +6,14 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
 #include <iostream>
+#include <mutex>
 #include <openssl/evp.h>
 #include <set>
 #include <sstream>
@@ -22,6 +25,45 @@ namespace {
 constexpr size_t kBufferBytes = 64 * 1024;
 constexpr int kGatewayTimeoutMs = 30000;
 constexpr int kDataNodeTimeoutMs = 60000;
+
+class ChunkBudget {
+public:
+    explicit ChunkBudget(uint32_t limit) : limit_(limit) {}
+    void acquire() {
+        std::unique_lock<std::mutex> lock(mutex_);
+        cv_.wait(lock, [&] { return active_ < limit_; });
+        ++active_;
+    }
+    void release() {
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            --active_;
+        }
+        cv_.notify_one();
+    }
+private:
+    const uint32_t limit_;
+    uint32_t active_ = 0;
+    std::mutex mutex_;
+    std::condition_variable cv_;
+};
+
+class ChunkBudgetLease {
+public:
+    explicit ChunkBudgetLease(ChunkBudget* budget) : budget_(budget) { if(budget_) budget_->acquire(); }
+    ~ChunkBudgetLease() { if(budget_) budget_->release(); }
+    ChunkBudgetLease(const ChunkBudgetLease&) = delete;
+    ChunkBudgetLease& operator=(const ChunkBudgetLease&) = delete;
+private:
+    ChunkBudget* budget_;
+};
+
+std::string benchmarkInvocationId() {
+    static const std::string value = std::to_string(
+        std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count());
+    return value;
+}
 
 std::string endpointString(const Endpoint& endpoint) {
     return endpoint.host + ':' + std::to_string(endpoint.port);
@@ -174,6 +216,41 @@ bool uploadRange(std::ifstream& input, uint64_t offset, uint64_t length,
     return true;
 }
 
+bool uploadOneChunk(const BenchmarkOptions& options, const std::filesystem::path& inputPath,
+                    const std::string& sessionId, uint64_t fileSize, uint64_t chunkSize,
+                    uint32_t index, std::string& error) {
+    const uint64_t offset = static_cast<uint64_t>(index) * chunkSize;
+    const uint64_t bytes = std::min<uint64_t>(chunkSize, fileSize - offset);
+    std::ifstream input(inputPath, std::ios::binary);
+    if (!input) { error = "cannot reopen benchmark input for chunk"; return false; }
+    std::string chunkHash;
+    if (!sha256Range(input, offset, bytes, chunkHash, error)) return false;
+    HttpResponse routeResponse;
+    const std::string routeBody = "{\"chunks\":[{\"index\":" + std::to_string(index) +
+        ",\"hash\":\"" + chunkHash + "\",\"size\":" + std::to_string(bytes) + "}]}";
+    if (!gatewayRequest(options.gateway, "POST", "/api/v2/upload/sessions/" + sessionId + "/routes",
+                        routeBody, routeResponse, error)) return false;
+    const std::vector<std::string> routes = miniKV::util::jsonObjectArray(routeResponse.body, "routes");
+    if (routes.size() != 1) { error = "Gateway returned invalid routes response"; return false; }
+    const std::string primaryNodeId = miniKV::util::jsonString(routes[0], "primaryNodeId");
+    Endpoint primary{miniKV::util::jsonString(routes[0], "primaryAddress"),
+                     static_cast<uint16_t>(miniKV::util::jsonUint(routes[0], "primaryPort"))};
+    const std::string uploadToken = miniKV::util::jsonString(routes[0], "uploadToken");
+    std::string chain;
+    if (primaryNodeId.empty() || primary.host.empty() || primary.port == 0 || uploadToken.empty() ||
+        !makeRouteChain(routes[0], chain, error)) {
+        if (error.empty()) error = "Gateway returned invalid route";
+        return false;
+    }
+    const std::map<std::string, std::string> headers{
+        {"Content-Type", "application/octet-stream"}, {"X-Session-Id", sessionId},
+        {"X-Chunk-Index", std::to_string(index)}, {"X-Commit-Owner", primaryNodeId},
+        {"X-Gateway-Address", options.gateway.host}, {"X-Gateway-Port", std::to_string(options.gateway.port)},
+        {"X-Replica-Chain", chain}, {"X-Replica-Position", "0"}, {"X-Upload-Token", uploadToken},
+    };
+    return uploadRange(input, offset, bytes, primary, "/v2/chunks/" + chunkHash, headers, error);
+}
+
 bool downloadFile(const Endpoint& gateway, const std::string& fileHash,
                   const std::filesystem::path& outputPath, uint32_t& chunkCount,
                   std::string& error) {
@@ -220,10 +297,47 @@ bool downloadFile(const Endpoint& gateway, const std::string& fileHash,
     return true;
 }
 
-RunRecord runOne(const BenchmarkOptions& options, uint64_t size, uint32_t runIndex,
-                 std::ostream& console) {
+RunRecord runDownloadOne(const BenchmarkOptions& options, const RunRecord& fixture,
+                         std::ostream& console) {
     RunRecord record;
-    record.runId = "size-" + std::to_string(size) + "-run-" + std::to_string(runIndex + 1);
+    record.runId = fixture.runId;
+    record.operation = "download";
+    record.sizeBytes = fixture.sizeBytes;
+    record.chunkCount = fixture.chunkCount;
+    record.fileHash = fixture.fileHash;
+    record.inputHash = fixture.inputHash;
+    // The fixture is deliberately prepared before the timed download interval.
+    record.uploadOk = true;
+    if (record.fileHash.empty() || record.inputHash.empty()) {
+        record.error = "download fixture is incomplete";
+        return record;
+    }
+    const std::filesystem::path outputPath = options.workDir / (record.runId + ".download");
+    std::string error;
+    const auto start = std::chrono::steady_clock::now();
+    uint32_t downloadedChunks = 0;
+    if (!downloadFile(options.gateway, record.fileHash, outputPath, downloadedChunks, error)) {
+        record.error = error;
+        return record;
+    }
+    std::string outputHash;
+    if (!sha256File(outputPath, outputHash, error)) { record.error = error; return record; }
+    if (outputHash != record.inputHash) { record.error = "downloaded file SHA-256 mismatch"; return record; }
+    record.downloadMs = std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - start).count();
+    record.downloadOk = downloadedChunks == record.chunkCount;
+    if (!record.downloadOk) record.error = "manifest chunk count changed during benchmark";
+    console << record.runId << " download=" << std::fixed << std::setprecision(2)
+            << mibPerSecond(record.sizeBytes, record.downloadMs) << " MiB/s\n";
+    return record;
+}
+
+RunRecord runOne(const BenchmarkOptions& options, uint64_t size, uint32_t runIndex,
+                 std::ostream& console, ChunkBudget* chunkBudget = nullptr) {
+    RunRecord record;
+    record.runId = "size-" + std::to_string(size) + "-run-" + std::to_string(runIndex + 1) +
+        "-" + benchmarkInvocationId();
+    record.operation = options.mode == BenchmarkMode::kUploadOnly ? "upload" : "end-to-end";
     record.sizeBytes = size;
     const std::filesystem::path inputPath = options.workDir / (record.runId + ".input");
     const std::filesystem::path outputPath = options.workDir / (record.runId + ".download");
@@ -231,6 +345,7 @@ RunRecord runOne(const BenchmarkOptions& options, uint64_t size, uint32_t runInd
     if (!makeInputFile(inputPath, size, runIndex, error)) { record.error = error; return record; }
     std::string inputHash;
     if (!sha256File(inputPath, inputHash, error)) { record.error = error; return record; }
+    record.inputHash = inputHash;
 
     const auto uploadStart = std::chrono::steady_clock::now();
     HttpResponse created;
@@ -254,53 +369,60 @@ RunRecord runOne(const BenchmarkOptions& options, uint64_t size, uint32_t runInd
     const auto completedValues = miniKV::util::jsonUIntArray(session.body, "completed");
     const std::set<uint32_t> completed(completedValues.begin(), completedValues.end());
 
-    std::ifstream input(inputPath, std::ios::binary);
-    if (!input) { record.error = "cannot reopen benchmark input"; return record; }
+    std::vector<uint32_t> pendingChunks;
     for (uint32_t index = 0; index < totalChunks; ++index) {
-        if (completed.count(index)) continue;
-        const uint64_t offset = static_cast<uint64_t>(index) * chunkSize;
-        const uint64_t bytes = std::min<uint64_t>(chunkSize, size - offset);
-        std::string chunkHash;
-        if (!sha256Range(input, offset, bytes, chunkHash, error)) { record.error = error; return record; }
-        HttpResponse routeResponse;
-        const std::string routeBody = "{\"chunks\":[{\"index\":" + std::to_string(index) +
-            ",\"hash\":\"" + chunkHash + "\",\"size\":" + std::to_string(bytes) + "}]}";
-        if (!gatewayRequest(options.gateway, "POST", "/api/v2/upload/sessions/" + sessionId + "/routes",
-                            routeBody, routeResponse, error)) { record.error = error; return record; }
-        const std::vector<std::string> routes = miniKV::util::jsonObjectArray(routeResponse.body, "routes");
-        if (routes.size() != 1) { record.error = "Gateway returned invalid routes response"; return record; }
-        const std::string primaryNodeId = miniKV::util::jsonString(routes[0], "primaryNodeId");
-        Endpoint primary{miniKV::util::jsonString(routes[0], "primaryAddress"),
-                         static_cast<uint16_t>(miniKV::util::jsonUint(routes[0], "primaryPort"))};
-        const std::string uploadToken = miniKV::util::jsonString(routes[0], "uploadToken");
-        std::string chain;
-        if (primaryNodeId.empty() || primary.host.empty() || primary.port == 0 || uploadToken.empty() ||
-            !makeRouteChain(routes[0], chain, error)) { record.error = error.empty() ? "Gateway returned invalid route" : error; return record; }
-        const std::map<std::string, std::string> headers{
-            {"Content-Type", "application/octet-stream"},
-            {"X-Session-Id", sessionId},
-            {"X-Chunk-Index", std::to_string(index)},
-            {"X-Commit-Owner", primaryNodeId},
-            {"X-Gateway-Address", options.gateway.host},
-            {"X-Gateway-Port", std::to_string(options.gateway.port)},
-            {"X-Replica-Chain", chain},
-            {"X-Replica-Position", "0"},
-            {"X-Upload-Token", uploadToken},
-        };
-        if (!uploadRange(input, offset, bytes, primary, "/v2/chunks/" + chunkHash, headers, error)) {
-            record.error = "chunk " + std::to_string(index) + ": " + error;
-            return record;
-        }
-        console << record.runId << " uploaded chunk " << index + 1 << '/' << totalChunks << '\n';
+        if (!completed.count(index)) pendingChunks.push_back(index);
     }
+    std::atomic<size_t> nextChunk{0};
+    std::atomic<bool> failed{false};
+    std::mutex errorMutex;
+    std::mutex consoleMutex;
+    std::string uploadError;
+    const uint32_t workerCount = std::min<uint32_t>(options.chunkWindow,
+        static_cast<uint32_t>(pendingChunks.size()));
+    std::vector<std::thread> chunkWorkers;
+    chunkWorkers.reserve(workerCount);
+    for (uint32_t worker = 0; worker < workerCount; ++worker) {
+        chunkWorkers.emplace_back([&] {
+            for (;;) {
+                if (failed.load()) return;
+                const size_t task = nextChunk.fetch_add(1);
+                if (task >= pendingChunks.size()) return;
+                const uint32_t index = pendingChunks[task];
+                std::string chunkError;
+                ChunkBudgetLease budgetLease(chunkBudget);
+                if (failed.load()) return;
+                if (!uploadOneChunk(options, inputPath, sessionId, size, chunkSize, index, chunkError)) {
+                    std::lock_guard<std::mutex> lock(errorMutex);
+                    if (!failed.exchange(true)) uploadError = "chunk " + std::to_string(index) + ": " + chunkError;
+                    return;
+                }
+                std::lock_guard<std::mutex> lock(consoleMutex);
+                console << record.runId << " uploaded chunk " << index + 1 << '/' << totalChunks << '\n';
+            }
+        });
+    }
+    for (auto& worker : chunkWorkers) worker.join();
+    if (failed.load()) { record.error = uploadError; return record; }
     HttpResponse committed;
     if (!gatewayRequest(options.gateway, "POST", "/api/v2/upload/sessions/" + sessionId + "/commit", "{}", committed, error)) {
         record.error = error; return record;
     }
     const std::string fileHash = miniKV::util::jsonString(committed.body, "fileHash");
     if (fileHash.empty()) { record.error = "Gateway returned no fileHash"; return record; }
+    record.fileHash = fileHash;
     record.uploadMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - uploadStart).count();
     record.uploadOk = true;
+
+    if(options.mode == BenchmarkMode::kUploadOnly) {
+        // The upload-capacity mode intentionally stops after durable Gateway
+        // commit. Mark the unused download half successful so the existing
+        // per-run reporting pipeline can represent a valid upload-only run.
+        record.downloadOk = true;
+        console << record.runId << " upload=" << std::fixed << std::setprecision(2)
+                << mibPerSecond(size, record.uploadMs) << " MiB/s\n";
+        return record;
+    }
 
     const auto downloadStart = std::chrono::steady_clock::now();
     uint32_t downloadedChunks = 0;
@@ -337,6 +459,27 @@ int BenchmarkRunner::run(std::ostream& console) {
                     << " concurrency=" << options_.concurrency << '\n';
             std::vector<RunRecord> roundRecords(options_.concurrency);
             std::vector<std::string> workerLogs(options_.concurrency);
+            const uint32_t downloadWorkers = options_.mode == BenchmarkMode::kDownloadOnly
+                ? options_.concurrency
+                : options_.mode == BenchmarkMode::kMixed ? options_.concurrency / 2 : 0;
+            ChunkBudget chunkBudget(options_.globalChunkBudget);
+            std::vector<RunRecord> downloadFixtures(downloadWorkers);
+            if (downloadWorkers > 0) {
+                BenchmarkOptions fixtureOptions = options_;
+                fixtureOptions.mode = BenchmarkMode::kUploadOnly;
+                for (uint32_t index = 0; index < downloadWorkers; ++index) {
+                    std::ostringstream fixtureLog;
+                    const uint32_t fixtureRunIndex = 1000000U + runIndex * options_.concurrency + index;
+                    downloadFixtures[index] = runOne(fixtureOptions, size, fixtureRunIndex, fixtureLog);
+                    downloadFixtures[index].operation = "download";
+                    std::error_code removeError;
+                    std::filesystem::remove(options_.workDir /
+                        (downloadFixtures[index].runId + ".input"), removeError);
+                    if (!downloadFixtures[index].error.empty()) {
+                        console << "download fixture FAILED: " << downloadFixtures[index].error << '\n';
+                    }
+                }
+            }
             std::vector<std::thread> workers;
             workers.reserve(options_.concurrency);
             const auto roundStart = std::chrono::steady_clock::now();
@@ -344,7 +487,21 @@ int BenchmarkRunner::run(std::ostream& console) {
                 workers.emplace_back([&, workerIndex] {
                     std::ostringstream workerConsole;
                     const uint32_t uniqueRunIndex = runIndex * options_.concurrency + workerIndex;
-                    roundRecords[workerIndex] = runOne(options_, size, uniqueRunIndex, workerConsole);
+                    if (workerIndex < downloadWorkers) {
+                        if (downloadFixtures[workerIndex].uploadOk &&
+                            downloadFixtures[workerIndex].error.empty()) {
+                            roundRecords[workerIndex] = runDownloadOne(options_, downloadFixtures[workerIndex], workerConsole);
+                        } else {
+                            roundRecords[workerIndex] = downloadFixtures[workerIndex];
+                        }
+                    } else {
+                        BenchmarkOptions workerOptions = options_;
+                        if (workerOptions.mode == BenchmarkMode::kMixed) {
+                            workerOptions.mode = BenchmarkMode::kUploadOnly;
+                        }
+                        roundRecords[workerIndex] = runOne(workerOptions, size, uniqueRunIndex, workerConsole,
+                                                          &chunkBudget);
+                    }
                     workerLogs[workerIndex] = workerConsole.str();
                 });
             }
@@ -365,14 +522,14 @@ int BenchmarkRunner::run(std::ostream& console) {
                 }
                 records.push_back(std::move(record));
             }
-            console << "round end-to-end aggregate=" << std::fixed << std::setprecision(2)
+            console << "round aggregate=" << std::fixed << std::setprecision(2)
                     << mibPerSecond(size * completedWorkers, roundMs) << " MiB/s"
                     << " completed=" << completedWorkers << '/' << options_.concurrency << '\n';
         }
     }
     std::vector<SizeSummary> summaries;
     for (const uint64_t size : options_.sizes) {
-        summaries.push_back(summarize(size, options_.runs * options_.concurrency, records));
+        summaries.push_back(summarize(size, options_.runs * options_.concurrency, records, options_.mode));
     }
     if (!writeReports(options_, records, summaries, filesystemError)) {
         console << "cannot write benchmark reports: " << filesystemError.message() << '\n';

@@ -23,6 +23,19 @@ class EventLoop{
 public:
     using Functor = std::function<void()>;
 
+    struct Metrics {
+        uint64_t loopIterations = 0;
+        uint64_t pendingFunctorsQueued = 0;
+        uint64_t crossThreadQueued = 0;
+        uint64_t pendingFunctorsExecuted = 0;
+        uint64_t pendingFunctorDepth = 0;
+        uint64_t pendingFunctorPeakDepth = 0;
+        uint64_t timerCallbacks = 0;
+        uint64_t timerLateCallbacks = 0;
+        uint64_t timerLagTotalMs = 0;
+        uint64_t timerLagMaxMs = 0;
+    };
+
     EventLoop();
     ~EventLoop();
 
@@ -49,6 +62,7 @@ public:
     int runAfter(int64_t delayMs, Functor cb);
     int runEvery(int64_t intervalMs, Functor cb);
     void cancel(int timerId); //取消定时器
+    Metrics metrics() const noexcept;
 
 private:
     struct TimerEntry{
@@ -93,12 +107,20 @@ private:
     std::unique_ptr<Channel> wakeupChannel_;
     std::mutex mutex_;
     std::vector<Functor> pendingFunctors_;
+    std::atomic<uint64_t> loopIterations_{0};
+    std::atomic<uint64_t> pendingFunctorsQueued_{0};
+    std::atomic<uint64_t> crossThreadQueued_{0};
+    std::atomic<uint64_t> pendingFunctorsExecuted_{0};
+    std::atomic<uint64_t> pendingFunctorDepth_{0};
+    std::atomic<uint64_t> pendingFunctorPeakDepth_{0};
+    std::atomic<uint64_t> timerCallbacks_{0};
+    std::atomic<uint64_t> timerLateCallbacks_{0};
+    std::atomic<uint64_t> timerLagTotalMs_{0};
+    std::atomic<uint64_t> timerLagMaxMs_{0};
 };
 
 }
 }
-
-
 
 
 

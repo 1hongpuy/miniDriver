@@ -22,6 +22,7 @@ public:
     void stop() noexcept;
     EventLoop* nextLoop();
     size_t size() const noexcept { return loops_.size(); }
+    std::vector<EventLoop*> loops() const { return loops_; }
 
 private:
     EventLoop* baseLoop_;

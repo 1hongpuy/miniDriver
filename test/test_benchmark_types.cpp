@@ -40,6 +40,8 @@ int main() {
     options.workDir = std::filesystem::temp_directory_path() / "minikv-benchmark-types-test";
     options.sizes = {4};
     options.runs = 3;
+    options.chunkWindow = 2;
+    options.globalChunkBudget = 2;
     std::error_code error;
     std::filesystem::remove_all(options.workDir, error);
     std::filesystem::create_directories(options.workDir, error);
@@ -50,7 +52,7 @@ int main() {
     std::ifstream csv(options.workDir / "runs.csv");
     std::string line;
     std::getline(csv, line);
-    MINIKV_CHECK(line == "run_id,size_bytes,upload_ms,upload_mib_per_s,download_ms,download_mib_per_s,chunk_count,upload_ok,download_ok,error");
+    MINIKV_CHECK(line == "run_id,operation,size_bytes,upload_ms,upload_mib_per_s,download_ms,download_mib_per_s,chunk_count,upload_ok,download_ok,error");
     std::getline(csv, line);
     MINIKV_CHECK(!line.empty());
     std::getline(csv, line);
@@ -59,6 +61,8 @@ int main() {
     const std::string report((std::istreambuf_iterator<char>(json)), {});
     MINIKV_CHECK(report.find("\"gateway\":\"127.0.0.1:18081\"") != std::string::npos);
     MINIKV_CHECK(report.find("\"sizes\":[4]") != std::string::npos);
+    MINIKV_CHECK(report.find("\"chunkWindow\":2") != std::string::npos);
+    MINIKV_CHECK(report.find("\"globalChunkBudget\":2") != std::string::npos);
     MINIKV_CHECK(report.find("\"successCount\":2") != std::string::npos);
     std::filesystem::remove_all(options.workDir, error);
 

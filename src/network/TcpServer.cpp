@@ -19,7 +19,8 @@ namespace network {
 
 TcpServer::TcpServer(EventLoop* loop, int port)
 :loop_(loop), acceptor_(new Acceptor(loop, port)),
- threadPool_(new EventLoopThreadPool(loop)), started_(false), nextConnId_(1)
+ threadPool_(new EventLoopThreadPool(loop)), started_(false), nextConnId_(1),
+ outputBufferStats_(std::make_shared<OutputBufferStats>())
 {
     acceptor_->setNewConnectionCallback(
         [this](int sockfd, const struct sockaddr_in& peerAddr){
@@ -36,6 +37,22 @@ void TcpServer::setThreadNum(size_t count)
 {
     if(started_) throw std::logic_error("cannot resize a running TcpServer");
     threadPool_->setThreadNum(count);
+}
+
+std::vector<EventLoop*> TcpServer::eventLoops() const
+{
+    std::vector<EventLoop*> loops;
+    loops.push_back(loop_);
+    const auto workers = threadPool_->loops();
+    loops.insert(loops.end(), workers.begin(), workers.end());
+    return loops;
+}
+
+TcpConnection::OutputMetrics TcpServer::outputBufferMetrics() const noexcept
+{
+    return {outputBufferStats_->currentBytes.load(std::memory_order_relaxed),
+            outputBufferStats_->peakBytes.load(std::memory_order_relaxed),
+            outputBufferStats_->highWaterEvents.load(std::memory_order_relaxed)};
 }
 
 void TcpServer::start()
@@ -91,7 +108,7 @@ void TcpServer::newConnection(int sockfd, const struct sockaddr_in& peerAddr)
     assert(loop_->isInLoopThread());
     EventLoop* ioLoop = threadPool_->nextLoop();
 
-    TcpConnectionPtr conn = std::make_shared<TcpConnection>(ioLoop, sockfd, nextConnId_++);
+    TcpConnectionPtr conn = std::make_shared<TcpConnection>(ioLoop, sockfd, nextConnId_++, outputBufferStats_);
 
     connections_[sockfd] = conn;
     
@@ -121,8 +138,6 @@ void TcpServer::removeConnectionInLoop(const TcpConnectionPtr& conn)
 
 }
 }
-
-
 
 
 

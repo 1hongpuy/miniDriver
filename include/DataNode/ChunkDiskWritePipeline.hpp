@@ -37,7 +37,8 @@ public:
                       std::shared_ptr<FastDataStore::WriteSession> writer,
                       ReadyCallback readyCallback);
 
-    http::HttpContext::BodyConsumeResult push(const char* bytes, size_t size);
+    http::HttpContext::BodyConsumeResult push(const char* bytes, size_t size,
+                                               DiskWriteExecutor::SharedBlockPtr* sharedBlock = nullptr);
     void finishInput(FinishCallback callback);
     void cancel();
 
@@ -52,7 +53,7 @@ private:
                            ReadyCallback readyCallback);
 
     struct PendingBlock {
-        DiskWriteExecutor::BlockLease block;
+        DiskWriteExecutor::SharedBlockPtr block;
         size_t size = 0;
     };
 

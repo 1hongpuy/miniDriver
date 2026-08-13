@@ -8,6 +8,7 @@
 #include <memory>
 #include <string>
 #include <functional>
+#include <vector>
 
 namespace miniKV {
 namespace network {
@@ -20,6 +21,8 @@ public:
     void start();
     void stop();
     void setThreadNum(size_t count);
+    std::vector<EventLoop*> eventLoops() const;
+    TcpConnection::OutputMetrics outputBufferMetrics() const noexcept;
 
     void setConnectionCallback(ConnectionCallback cb) {connectionCallback_ = std::move(cb);}
     void setMessageCallback(MessageCallback cb) {messageCallback_ = std::move(cb);}
@@ -40,6 +43,7 @@ private:
     bool started_;
     int nextConnId_;
     std::map<int, TcpConnectionPtr> connections_;
+    std::shared_ptr<OutputBufferStats> outputBufferStats_;
 };    
 
 
@@ -47,8 +51,6 @@ private:
 
 
 }
-
-
 
 
 

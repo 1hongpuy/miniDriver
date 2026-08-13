@@ -9,6 +9,8 @@
 
 namespace miniKV::benchmark {
 
+enum class BenchmarkMode { kEndToEnd, kUploadOnly, kDownloadOnly, kMixed };
+
 struct Endpoint {
     std::string host;
     uint16_t port = 0;
@@ -20,6 +22,11 @@ struct BenchmarkOptions {
     std::vector<uint64_t> sizes;
     uint32_t runs = 3;
     uint32_t concurrency = 1;
+    uint32_t chunkWindow = 1;
+    // Process-wide ceiling across concurrent benchmark files.  It is the
+    // client-side counterpart to the DataNode admission budget.
+    uint32_t globalChunkBudget = 2;
+    BenchmarkMode mode = BenchmarkMode::kEndToEnd;
     std::string remoteDir = "/benchmark";
 };
 
@@ -32,6 +39,9 @@ struct RunRecord {
     bool uploadOk = false;
     bool downloadOk = false;
     std::string error;
+    std::string fileHash;
+    std::string inputHash;
+    std::string operation;
 };
 
 struct SizeSummary {
@@ -54,7 +64,8 @@ bool parseSize(std::string_view text, uint64_t& bytes);
 bool parseEndpoint(std::string_view text, Endpoint& endpoint);
 double mibPerSecond(uint64_t bytes, double elapsedMs);
 SizeSummary summarize(uint64_t sizeBytes, uint32_t requestedRuns,
-                      const std::vector<RunRecord>& records);
+                      const std::vector<RunRecord>& records,
+                      BenchmarkMode mode = BenchmarkMode::kEndToEnd);
 bool writeReports(const BenchmarkOptions& options, const std::vector<RunRecord>& records,
                   const std::vector<SizeSummary>& summaries, std::error_code& error);
 

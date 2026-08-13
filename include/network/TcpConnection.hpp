@@ -9,6 +9,7 @@
 #include <memory>
 #include <string>
 #include <functional> //回调
+#include <atomic>
 #include <sys/types.h>
 #include <type_traits>
 
@@ -36,13 +37,20 @@ struct SendFileResult {
     size_t maxBytesPerCall = 0;
 };
 
+struct OutputBufferStats {
+    std::atomic<uint64_t> currentBytes{0};
+    std::atomic<uint64_t> peakBytes{0};
+    std::atomic<uint64_t> highWaterEvents{0};
+};
+
 using SendFileCompleteCallback = std::function<void(const SendFileResult&)>;
 
 
 
 class TcpConnection : public std::enable_shared_from_this<TcpConnection> {
 public:
-    TcpConnection(EventLoop* loop, int fd, int id);
+    TcpConnection(EventLoop* loop, int fd, int id,
+                  std::shared_ptr<OutputBufferStats> processOutputStats = {});
     ~TcpConnection();
 
     void send(const std::string& buf);
@@ -64,6 +72,8 @@ public:
     size_t queuedBytes() const {
         return outputBuffer_.readableBytes();
     }
+    struct OutputMetrics { uint64_t currentBytes = 0; uint64_t peakBytes = 0; uint64_t highWaterEvents = 0; };
+    OutputMetrics outputMetrics() const noexcept;
 
     void setConnectionCallback(ConnectionCallback cb){
         connectionCallback_ = std::move(cb);
@@ -118,6 +128,9 @@ private:
     void resumeReadInLoop();
     void checkHighWaterMark(size_t oldQueuedBytes);
     void checkLowWaterMark(size_t oldQueuedBytes);
+    void addOutputBytes(size_t bytes);
+    void removeOutputBytes(size_t bytes);
+    void resetOutputBytes();
 
     enum StateE {
         kConnectiong, 
@@ -148,6 +161,10 @@ private:
 
     Buffer inputBuffer_;
     Buffer outputBuffer_;
+    std::shared_ptr<OutputBufferStats> processOutputStats_;
+    std::atomic<uint64_t> outputCurrentBytes_{0};
+    std::atomic<uint64_t> outputPeakBytes_{0};
+    std::atomic<uint64_t> outputHighWaterEvents_{0};
     std::any context_;
     bool readPaused_ = false;
     size_t highWaterMark_ = 512 * 1024;
@@ -166,7 +183,6 @@ private:
 }
 
 }
-
 
 
 

@@ -41,6 +41,27 @@ void ReplicaUploadPipe::startInLoop(ReplicaUploadPipeOptions options, Completion
     state_ = State::kOpening;
     holdLifetimeInLoop();
 
+    if(options_.connectionPool) {
+        std::weak_ptr<ReplicaUploadPipe> weakSelf(shared_from_this());
+        options_.connectionPool->borrow(options_.connectionKey,
+            [weakSelf](http::PersistentHttpSession::Ptr session, std::string error) {
+                if(auto self = weakSelf.lock()) {
+                    if(self->finished_) return;
+                    if(session) self->startPersistentRequestInLoop(std::move(session));
+                    else {
+                        miniKV::utils::logDebug("event=replica_pool_fallback reason=" + error);
+                        self->startShortRequestInLoop();
+                    }
+                }
+            });
+        return;
+    }
+    startShortRequestInLoop();
+}
+
+void ReplicaUploadPipe::startShortRequestInLoop()
+{
+
     request_ = AsyncHttpRequest::create(loop_);
     std::weak_ptr<ReplicaUploadPipe> weakSelf(shared_from_this());
     request_->setHighWaterMarkCallback([weakSelf](size_t) {
@@ -78,11 +99,94 @@ void ReplicaUploadPipe::startInLoop(ReplicaUploadPipeOptions options, Completion
         });
 }
 
+void ReplicaUploadPipe::startPersistentRequestInLoop(http::PersistentHttpSession::Ptr session)
+{
+    persistentRequest_ = std::move(session);
+    std::weak_ptr<ReplicaUploadPipe> weakSelf(shared_from_this());
+    persistentRequest_->setHighWaterMarkCallback([weakSelf](size_t) {
+        if(Ptr self = weakSelf.lock()) {
+            self->downstreamBlocked_ = true;
+            self->markPausedInLoop();
+            self->upstreamPaused_ = true;
+        }
+    });
+    persistentRequest_->setLowWaterMarkCallback([weakSelf](size_t) {
+        if(Ptr self = weakSelf.lock()) {
+            self->downstreamBlocked_ = false;
+            self->flushPendingInLoop();
+            self->tryResumeUpstreamInLoop();
+        }
+    });
+    if(!persistentRequest_->start(options_.request,
+        [weakSelf] {
+            if(Ptr self = weakSelf.lock()) {
+                if(self->finished_) return;
+                self->requestReady_ = true;
+                self->state_ = State::kStreaming;
+                self->flushPendingInLoop();
+                self->tryResumeUpstreamInLoop();
+            }
+        },
+        [weakSelf](HttpClientResponse response, std::string error) {
+            if(Ptr self = weakSelf.lock()) self->completeInLoop(std::move(response), std::move(error));
+        })) {
+        auto failed = std::move(persistentRequest_);
+        if(options_.connectionPool) options_.connectionPool->discard(failed);
+        startShortRequestInLoop();
+    }
+}
+
+AsyncWriteResult ReplicaUploadPipe::writeDownstreamInLoop(const char* data, size_t size)
+{
+    if(persistentRequest_) return persistentRequest_->write(data, size);
+    return request_ ? request_->write(data, size) : AsyncWriteResult::kClosed;
+}
+
+void ReplicaUploadPipe::finishDownstreamInLoop()
+{
+    if(persistentRequest_) persistentRequest_->finishBody();
+    else if(request_) request_->finishBody();
+}
+
 miniKV::http::HttpContext::BodyConsumeResult ReplicaUploadPipe::push(const char* data,
                                                                        size_t size)
 {
     assert(loop_->isInLoopThread());
     return pushInLoop(data, size);
+}
+
+miniKV::http::HttpContext::BodyConsumeResult ReplicaUploadPipe::pushShared(
+    DiskWriteExecutor::SharedBlockPtr block, size_t size)
+{
+    assert(loop_->isInLoopThread());
+    return pushSharedInLoop(std::move(block), size);
+}
+
+miniKV::http::HttpContext::BodyConsumeResult ReplicaUploadPipe::pushSharedInLoop(
+    DiskWriteExecutor::SharedBlockPtr block, size_t size)
+{
+    using Result = miniKV::http::HttpContext::BodyConsumeResult;
+    if(!block || finished_ || inputFinished_ || size == 0) return Result::kAbort;
+    if(!pendingBlocks_.empty()) {
+        if(!enqueueSharedPendingInLoop(std::move(block), size)) return Result::kAbort;
+        flushPendingInLoop();
+        markPausedInLoop();
+        upstreamPaused_ = true;
+        return Result::kPause;
+    }
+    const AsyncWriteResult result = writeDownstreamInLoop(block->data(), size);
+    if(result == AsyncWriteResult::kAccepted) {
+        if(downstreamBlocked_) { upstreamPaused_ = true; return Result::kPause; }
+        return Result::kContinue;
+    }
+    if(result == AsyncWriteResult::kWouldBlock) {
+        if(!enqueueSharedPendingInLoop(std::move(block), size)) return Result::kAbort;
+        markPausedInLoop();
+        upstreamPaused_ = true;
+        return Result::kPause;
+    }
+    failInLoop("replica request stopped accepting shared body bytes");
+    return Result::kAbort;
 }
 
 miniKV::http::HttpContext::BodyConsumeResult ReplicaUploadPipe::pushInLoop(const char* data,
@@ -103,7 +207,7 @@ miniKV::http::HttpContext::BodyConsumeResult ReplicaUploadPipe::pushInLoop(const
         return Result::kPause;
     }
 
-    const AsyncWriteResult writeResult = request_->write(data, size);
+    const AsyncWriteResult writeResult = writeDownstreamInLoop(data, size);
     if(writeResult == AsyncWriteResult::kAccepted)
     {
         if(downstreamBlocked_)
@@ -146,11 +250,11 @@ void ReplicaUploadPipe::finishInLoop()
     {
         // AsyncHttpRequest records finishRequested_ and switches to waiting
         // response only after its non-blocking connect completes.
-        request_->finishBody();
+        finishDownstreamInLoop();
         requestFinishIssued_ = true;
         return;
     }
-    request_->finishBody();
+    finishDownstreamInLoop();
     requestFinishIssued_ = true;
     state_ = State::kWaitingResponse;
 }
@@ -174,7 +278,22 @@ bool ReplicaUploadPipe::enqueuePendingInLoop(const char* data, size_t size)
         failInLoop("replica pending buffer limit reached");
         return false;
     }
-    pendingBlocks_.emplace_back(data, size);
+    PendingBlock pending;
+    pending.copied.assign(data, size);
+    pending.size = size;
+    pendingBlocks_.push_back(std::move(pending));
+    pendingBytes_ += size;
+    if(pendingBytes_ > metrics_.maxPendingBytes) metrics_.maxPendingBytes = pendingBytes_;
+    return true;
+}
+
+bool ReplicaUploadPipe::enqueueSharedPendingInLoop(DiskWriteExecutor::SharedBlockPtr block, size_t size)
+{
+    if(size > options_.maxPendingBytes - pendingBytes_) {
+        failInLoop("replica pending buffer limit reached");
+        return false;
+    }
+    pendingBlocks_.push_back({{}, std::move(block), size});
     pendingBytes_ += size;
     if(pendingBytes_ > metrics_.maxPendingBytes) metrics_.maxPendingBytes = pendingBytes_;
     return true;
@@ -186,8 +305,8 @@ bool ReplicaUploadPipe::flushPendingInLoop()
 
     while(!pendingBlocks_.empty())
     {
-        const std::string& block = pendingBlocks_.front();
-        const AsyncWriteResult writeResult = request_->write(block.data(), block.size());
+        const PendingBlock& block = pendingBlocks_.front();
+        const AsyncWriteResult writeResult = writeDownstreamInLoop(block.data(), block.size);
         if(writeResult == AsyncWriteResult::kWouldBlock)
         {
             upstreamPaused_ = true;
@@ -198,13 +317,13 @@ bool ReplicaUploadPipe::flushPendingInLoop()
             failInLoop("replica request closed while flushing pending body bytes");
             return false;
         }
-        pendingBytes_ -= block.size();
-        pendingBlocks_.erase(pendingBlocks_.begin());
+        pendingBytes_ -= block.size;
+        pendingBlocks_.pop_front();
     }
 
     if(inputFinished_ && !requestFinishIssued_)
     {
-        request_->finishBody();
+        finishDownstreamInLoop();
         requestFinishIssued_ = true;
         state_ = State::kWaitingResponse;
     }
@@ -228,9 +347,14 @@ void ReplicaUploadPipe::failInLoop(std::string error)
     // request. AsyncHttpRequest::cancel() may invoke its response callback
     // synchronously when we already are on the EventLoop.
     auto request = std::move(request_);
+    auto persistentRequest = std::move(persistentRequest_);
     HttpClientResponse empty;
     completeInLoop(std::move(empty), std::move(error));
     if(request) request->cancel();
+    if(persistentRequest) {
+        if(options_.connectionPool) options_.connectionPool->discard(persistentRequest);
+        persistentRequest->cancel();
+    }
 }
 
 void ReplicaUploadPipe::completeInLoop(HttpClientResponse response, std::string error)
@@ -245,6 +369,14 @@ void ReplicaUploadPipe::completeInLoop(HttpClientResponse response, std::string 
     pendingBlocks_.clear();
     pendingBytes_ = 0;
     request_.reset();
+    auto persistentRequest = std::move(persistentRequest_);
+    if(persistentRequest && options_.connectionPool) {
+        if(error.empty() && response.status == 200 && persistentRequest->idle() && persistentRequest->usable()) {
+            options_.connectionPool->release(persistentRequest);
+        } else {
+            options_.connectionPool->discard(persistentRequest);
+        }
+    }
 
     auto completion = std::move(completionCallback_);
     releaseLifetimeInLoop();

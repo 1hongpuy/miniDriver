@@ -2,6 +2,9 @@
   "use strict";
 
   const API = "/api/v2";
+  // AI-App-Lite is intentionally independent from the Gateway data plane. Override
+  // this in a deployment with `window.MINIDRIVE_AI_API = "https://..."` before app.js.
+  const AI_API = (window.MINIDRIVE_AI_API || `${window.location.protocol}//${window.location.hostname}:18290`).replace(/\/$/, "");
   const SESSION_PREFIX = "minikv-v2:session:";
   const UPLOAD_CHUNK_SIZE = 4 * 1024 * 1024;
   const MAX_PARALLEL_FILES = 1;
@@ -31,12 +34,19 @@
   const previewStage = $("#preview-stage");
   const previewStatus = $("#preview-status");
   const previewDownload = $("#preview-download");
+  const aiSearchForm = $("#ai-search-form");
+  const aiSearchInput = $("#ai-search-input");
+  const aiSearchSubmit = $("#ai-search-submit");
+  const aiSearchState = $("#ai-search-state");
+  const aiSearchHint = $("#ai-search-hint");
+  const aiSearchResults = $("#ai-search-results");
   const entries = new Map();
   const catalogState = {
     activeDirectory: "/", catalog: null, selectedObject: null,
     requestId: 0, renderId: 0, thumbnailUrls: new Map(),
   };
   const previewState = { object: null, url: null, scale: 1, image: null, requestId: 0 };
+  const aiSearch = { activeTags: new Set(), requestId: 0, results: [] };
   let mediaRefreshTimer = null;
 
   function formatBytes(bytes) {
@@ -75,6 +85,114 @@
       throw error;
     }
     return body;
+  }
+
+  async function aiRequest(path, options = {}) {
+    const response = await fetch(`${AI_API}${path}`, {
+      headers: { "Content-Type": "application/json", ...(options.headers || {}) },
+      ...options,
+    });
+    const text = await response.text();
+    let body = {};
+    try { body = text ? JSON.parse(text) : {}; } catch (_) { body = { error: text }; }
+    if (!response.ok) throw new Error(body.error || `AI 服务返回 HTTP ${response.status}`);
+    return body;
+  }
+
+  function setAiSearchState(label, state = "idle") {
+    aiSearchState.textContent = label;
+    aiSearchState.dataset.state = state;
+  }
+
+  function updateAiQueryFromTags() {
+    const tags = [...aiSearch.activeTags];
+    if (!tags.length) return;
+    const current = aiSearchInput.value.trim();
+    const words = new Set(current ? current.split(/\s+/) : []);
+    tags.forEach((tag) => words.add(tag));
+    aiSearchInput.value = [...words].join(" ");
+  }
+
+  function relatedCatalogFile(result) {
+    const assetId = String(result.asset_id || result.metadata?.object_id || "");
+    return (catalogState.catalog?.files || []).find((file) => String(file.objectId) === assetId) || null;
+  }
+
+  function metadataSummary(metadata = {}) {
+    const candidates = [metadata.scene, metadata.camera_model, metadata.capture_time, metadata.dir_path]
+      .filter((value) => value !== undefined && value !== null && String(value).trim());
+    return candidates.length ? candidates.join(" · ") : "已建立向量索引";
+  }
+
+  function renderAiSearchResults(results) {
+    aiSearchResults.replaceChildren();
+    if (!results.length) {
+      aiSearchResults.append(emptyState("没有匹配的已索引素材；可换一个描述或先完成素材索引。"));
+      return;
+    }
+    const grid = document.createElement("div");
+    grid.className = "ai-result-grid";
+    for (const result of results) {
+      const card = document.createElement("article");
+      card.className = "ai-result";
+      const title = document.createElement("strong");
+      title.textContent = result.object_key || result.asset_id || "未命名素材";
+      const detail = document.createElement("span");
+      detail.textContent = metadataSummary(result.metadata);
+      const score = document.createElement("span");
+      score.className = "ai-result__score";
+      score.textContent = `相似度 ${(Number(result.score || 0) * 100).toFixed(1)}%`;
+      const file = relatedCatalogFile(result);
+      if (file) {
+        const open = document.createElement("button");
+        open.type = "button";
+        open.className = "catalog-row__command";
+        open.textContent = "在目录中预览";
+        open.addEventListener("click", () => selectObject(file).catch((error) => window.alert(error.message)));
+        card.append(title, detail, score, open);
+      } else {
+        const unavailable = document.createElement("span");
+        unavailable.className = "ai-result__note";
+        unavailable.textContent = "不在当前目录；切换至对应目录后可预览";
+        card.append(title, detail, score, unavailable);
+      }
+      grid.append(card);
+    }
+    aiSearchResults.append(grid);
+  }
+
+  async function runAiSearch() {
+    updateAiQueryFromTags();
+    const query = aiSearchInput.value.trim();
+    if (!query) {
+      aiSearchHint.textContent = "请输入描述，或选择一个快捷标签。";
+      aiSearchInput.focus();
+      return;
+    }
+    const requestId = aiSearch.requestId + 1;
+    aiSearch.requestId = requestId;
+    aiSearchSubmit.disabled = true;
+    setAiSearchState("正在检索", "loading");
+    aiSearchHint.textContent = `正在通过 ${AI_API} 查询已索引素材。`;
+    aiSearchResults.replaceChildren(emptyState("AI 正在比对图文向量与素材元数据。"));
+    try {
+      const response = await aiRequest("/ai/search", {
+        method: "POST",
+        body: JSON.stringify({ query, top_k: 9 }),
+      });
+      if (requestId !== aiSearch.requestId) return;
+      aiSearch.results = response.results || [];
+      setAiSearchState(`${aiSearch.results.length} 个结果`, "ready");
+      aiSearchHint.textContent = `查询“${response.query || query}”完成；结果来自已完成 AI 索引的素材。`;
+      renderAiSearchResults(aiSearch.results);
+    } catch (error) {
+      if (requestId !== aiSearch.requestId) return;
+      setAiSearchState("服务不可用", "error");
+      aiSearchHint.textContent = `无法连接 AI-App-Lite：${error.message}`;
+      aiSearchResults.replaceChildren(emptyState("先启动 ai-app-lite API 与 Worker，再重新检索。"));
+    } finally {
+      if (requestId === aiSearch.requestId) aiSearchSubmit.disabled = false;
+    }
   }
 
   function retryDelayMilliseconds(error, attempt) {
@@ -923,6 +1041,19 @@
   }
 
   fileInput.addEventListener("change", refreshSelection);
+  aiSearchForm.addEventListener("submit", (event) => { event.preventDefault(); runAiSearch(); });
+  document.querySelectorAll(".ai-tag").forEach((button) => {
+    button.addEventListener("click", () => {
+      const tag = button.dataset.tag;
+      if (aiSearch.activeTags.has(tag)) aiSearch.activeTags.delete(tag);
+      else aiSearch.activeTags.add(tag);
+      button.dataset.active = String(aiSearch.activeTags.has(tag));
+      updateAiQueryFromTags();
+      aiSearchHint.textContent = aiSearch.activeTags.size
+        ? `已选择：${[...aiSearch.activeTags].join("、")}；可继续补充描述后检索。`
+        : "标签会合并为查询描述；已建立 AI 索引的素材才会返回结果。";
+    });
+  });
   $("#refresh-nodes").addEventListener("click", refreshNodes);
   $("#open-library").addEventListener("click", () => document.querySelector(".archive-panel").scrollIntoView({ behavior: "smooth", block: "start" }));
   $("#new-directory").addEventListener("click", () => createDirectory().catch((error) => window.alert(error.message)));

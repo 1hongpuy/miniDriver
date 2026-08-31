@@ -1,0 +1,12 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "minidriver"
+version = "0.1.0"
+description = "MiniDriver v3 object storage SDK"
+requires-python = ">=3.10"
+
+[tool.setuptools.packages.find]
+where = ["."]

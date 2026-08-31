@@ -5,12 +5,13 @@
 
 ## 1. 调用方实际拿到什么
 
-MiniDriver 对原生 C++ Worker 暴露 C++ SDK，并提供同一对象协议的原生 Go SDK：
+MiniDriver 对原生 C++ Worker 暴露 C++ SDK，并提供同一对象协议的原生 Go/Python SDK：
 
 ```text
 include/client/MiniDriverClient.hpp
 target: minikv_client
 Go module: sdk/go  (package minidriver)
+Python package: sdk/python  (package minidriver)
 ```
 
 调用方配置 Gateway 地址、集群内部凭据和服务身份；读写数据经 SDK 完成。调用方**不**自行向 DataNode 猜测

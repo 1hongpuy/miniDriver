@@ -148,24 +148,23 @@ void ReplicaUploadPipe::finishDownstreamInLoop()
     else if(request_) request_->finishBody();
 }
 
-miniKV::http::HttpContext::BodyConsumeResult ReplicaUploadPipe::push(const char* data,
-                                                                       size_t size)
+StreamConsumeResult ReplicaUploadPipe::push(const char* data, size_t size)
 {
     assert(loop_->isInLoopThread());
     return pushInLoop(data, size);
 }
 
-miniKV::http::HttpContext::BodyConsumeResult ReplicaUploadPipe::pushShared(
+StreamConsumeResult ReplicaUploadPipe::pushShared(
     DiskWriteExecutor::SharedBlockPtr block, size_t size)
 {
     assert(loop_->isInLoopThread());
     return pushSharedInLoop(std::move(block), size);
 }
 
-miniKV::http::HttpContext::BodyConsumeResult ReplicaUploadPipe::pushSharedInLoop(
+StreamConsumeResult ReplicaUploadPipe::pushSharedInLoop(
     DiskWriteExecutor::SharedBlockPtr block, size_t size)
 {
-    using Result = miniKV::http::HttpContext::BodyConsumeResult;
+    using Result = StreamConsumeResult;
     if(!block || finished_ || inputFinished_ || size == 0) return Result::kAbort;
     if(!pendingBlocks_.empty()) {
         if(!enqueueSharedPendingInLoop(std::move(block), size)) return Result::kAbort;
@@ -189,10 +188,9 @@ miniKV::http::HttpContext::BodyConsumeResult ReplicaUploadPipe::pushSharedInLoop
     return Result::kAbort;
 }
 
-miniKV::http::HttpContext::BodyConsumeResult ReplicaUploadPipe::pushInLoop(const char* data,
-                                                                             size_t size)
+StreamConsumeResult ReplicaUploadPipe::pushInLoop(const char* data, size_t size)
 {
-    using Result = miniKV::http::HttpContext::BodyConsumeResult;
+    using Result = StreamConsumeResult;
     if(finished_ || state_ == State::kIdle || inputFinished_ || data == nullptr) return Result::kAbort;
     if(size == 0) return downstreamBlocked_ ? Result::kPause : Result::kContinue;
 

@@ -34,6 +34,7 @@ public:
         k404NotFound = 404,    //资源不存在
         k405MethodNotAllowed = 405, //方法不被允许，有这个资源，不是不允许这么方法操作
         k413PayloadTooLarge = 413, //请求体过大
+        k416RangeNotSatisfiable = 416,
         k500InternalServerError = 500, //网络内部错误
         k501NotImplemented = 501, //功能为实现
         k503ServiceUnavailable = 503, //暂时无可用容量，可稍后重试
@@ -129,6 +130,7 @@ private:
             case 404: return "Not Found";
             case 405: return "Method Not Allowed";
             case 413: return "Payload Too Large";
+            case 416: return "Range Not Satisfiable";
             case 500: return "Internal Server Error";
             case 501: return "Not Implemented";
             case 503: return "Service Unavailable";

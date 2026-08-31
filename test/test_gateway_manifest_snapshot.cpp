@@ -90,6 +90,15 @@ int main() {
     CHECK(snapshot.nodes.at("node-a").address == "10.0.0.1");
     CHECK(snapshot.nodes.at("node-b").address == "10.0.0.2");
 
+    miniKV::control::ObjectReadDescriptor readDescriptor;
+    CHECK(state.buildObjectReadDescriptor(file.objectId, readDescriptor));
+    CHECK(readDescriptor.objectId == file.objectId);
+    CHECK(readDescriptor.objectVersion == file.objectVersion);
+    CHECK(readDescriptor.metadataVersion == file.metadataVersion);
+    CHECK(readDescriptor.chunks.size() == 2);
+    CHECK(readDescriptor.chunks[0].storageIdentity == "chunk-zero");
+    CHECK(readDescriptor.chunks[0].replicas.size() == 2);
+
     std::filesystem::remove_all(directory, error);
     std::cout << "PASS: Gateway builds a complete manifest snapshot under one lock\n";
     return 0;

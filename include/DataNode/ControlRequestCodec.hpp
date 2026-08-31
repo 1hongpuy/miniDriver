@@ -10,6 +10,7 @@ struct EncodedControlRequest {
     std::string method;
     std::string path;
     std::string body;
+    std::string requestId;
 };
 
 EncodedControlRequest makeNodeRegistrationRequest(const NodeRegistration& request);

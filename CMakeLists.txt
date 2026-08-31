@@ -40,6 +40,7 @@ list(REMOVE_ITEM DATANODE_SRC "${CMAKE_CURRENT_SOURCE_DIR}/src/DataNode/datanode
 
 file(GLOB_RECURSE AGENT_SRC src/agent/*.cpp)
 list(REMOVE_ITEM AGENT_SRC "${CMAKE_CURRENT_SOURCE_DIR}/src/agent/node_agent_main.cpp") # 排除 gateway_main.cpp
+file(GLOB_RECURSE METADATA_SRC src/metadata/*.cpp)
 
 add_library(minikv_net STATIC ${NET_SRC})
 add_library(minikv_storage STATIC ${STORAGE_SRC})
@@ -49,6 +50,9 @@ add_library(minikv_gateway STATIC ${GATEWAY_SRC})
 add_library(minikv_http STATIC ${HTTP_SRC})
 add_library(minikv_agent STATIC ${AGENT_SRC})
 add_library(minikv_datanode STATIC ${DATANODE_SRC})
+add_library(minikv_metadata STATIC ${METADATA_SRC})
+add_library(minikv_client_transport STATIC src/client/HttpTransport.cpp)
+add_library(minikv_client STATIC src/client/MiniDriverClient.cpp)
 
 target_include_directories(minikv_net PUBLIC include)
 target_include_directories(minikv_storage PUBLIC include)
@@ -58,6 +62,9 @@ target_include_directories(minikv_gateway PUBLIC include)
 target_include_directories(minikv_http PUBLIC include)
 target_include_directories(minikv_agent PUBLIC include)
 target_include_directories(minikv_datanode PUBLIC include)
+target_include_directories(minikv_metadata PUBLIC include)
+target_include_directories(minikv_client_transport PUBLIC include)
+target_include_directories(minikv_client PUBLIC include)
 
 find_library(LEVELDB_LIB leveldb REQUIRED)
 find_path(LEVELDB_INC leveldb/db.h REQUIRED)
@@ -75,16 +82,17 @@ target_link_libraries(minikv_media PUBLIC minikv_utils ${HIREDIS_LIB} ${LIBRAW_L
 target_link_libraries(minikv_gateway PUBLIC minikv_media)
 target_link_libraries(minikv_http PUBLIC minikv_utils)
 target_link_libraries(minikv_agent PUBLIC minikv_utils)
+target_link_libraries(minikv_client_transport PUBLIC pthread)
+target_link_libraries(minikv_client PUBLIC minikv_client_transport minikv_utils OpenSSL::Crypto pthread)
 
 add_library(minikv_benchmark STATIC
     src/benchmark/BenchmarkCli.cpp
-    src/benchmark/BenchmarkHttpClient.cpp
     src/benchmark/BenchmarkInput.cpp
     src/benchmark/BenchmarkRunner.cpp
     src/benchmark/BenchmarkTypes.cpp
 )
 target_include_directories(minikv_benchmark PUBLIC include)
-target_link_libraries(minikv_benchmark PUBLIC minikv_utils OpenSSL::Crypto pthread)
+target_link_libraries(minikv_benchmark PUBLIC minikv_client minikv_utils OpenSSL::Crypto pthread)
 
 
 add_executable(minikv_v2_gateway src/gateway/gateway_main.cpp)
@@ -200,6 +208,16 @@ target_link_libraries(test_fast_data_store_delete PRIVATE
     OpenSSL::Crypto
 )
 
+add_executable(test_fast_data_store_durability test/test_fast_data_store_durability.cpp)
+target_include_directories(test_fast_data_store_durability PRIVATE ${LEVELDB_INC})
+target_link_libraries(test_fast_data_store_durability PRIVATE
+    minikv_datanode
+    minikv_utils
+    ${LEVELDB_LIB}
+    pthread
+    OpenSSL::Crypto
+)
+
 add_executable(test_tcp_sendfile_offset test/test_tcp_sendfile_offset.cpp)
 target_link_libraries(test_tcp_sendfile_offset PRIVATE
     minikv_net
@@ -222,6 +240,16 @@ target_link_libraries(test_gateway_write_lease PRIVATE
 add_executable(test_gateway_manifest_snapshot test/test_gateway_manifest_snapshot.cpp)
 target_include_directories(test_gateway_manifest_snapshot PRIVATE ${LEVELDB_INC})
 target_link_libraries(test_gateway_manifest_snapshot PRIVATE
+    minikv_gateway
+    minikv_utils
+    ${LEVELDB_LIB}
+    pthread
+    OpenSSL::Crypto
+)
+
+add_executable(test_gateway_route_retry_identity test/test_gateway_route_retry_identity.cpp)
+target_include_directories(test_gateway_route_retry_identity PRIVATE ${LEVELDB_INC})
+target_link_libraries(test_gateway_route_retry_identity PRIVATE
     minikv_gateway
     minikv_utils
     ${LEVELDB_LIB}
@@ -346,6 +374,32 @@ target_link_libraries(test_disk_write_executor PRIVATE minikv_datanode pthread)
 add_executable(test_chunk_disk_write_pipeline test/test_chunk_disk_write_pipeline.cpp)
 target_include_directories(test_chunk_disk_write_pipeline PRIVATE include)
 
+add_executable(test_chunk_write_protocol test/test_chunk_write_protocol.cpp)
+target_include_directories(test_chunk_write_protocol PRIVATE include test)
+target_link_libraries(test_chunk_write_protocol PRIVATE
+    minikv_datanode
+    minikv_http
+    minikv_utils
+    OpenSSL::Crypto
+)
+
+add_executable(test_read_capability test/test_read_capability.cpp)
+target_include_directories(test_read_capability PRIVATE include test)
+target_link_libraries(test_read_capability PRIVATE minikv_utils OpenSSL::Crypto)
+
+add_executable(test_http_range test/test_http_range.cpp)
+target_link_libraries(test_http_range PRIVATE minikv_http minikv_utils)
+
+add_executable(test_checksum_and_opaque_store test/test_checksum_and_opaque_store.cpp)
+target_include_directories(test_checksum_and_opaque_store PRIVATE ${LEVELDB_INC} test)
+target_link_libraries(test_checksum_and_opaque_store PRIVATE
+    minikv_datanode
+    minikv_utils
+    ${LEVELDB_LIB}
+    pthread
+    OpenSSL::Crypto
+)
+
 add_executable(test_media_job test/test_media_job.cpp)
 target_include_directories(test_media_job PRIVATE include test)
 target_link_libraries(test_media_job PRIVATE minikv_media)
@@ -353,6 +407,17 @@ target_link_libraries(test_media_job PRIVATE minikv_media)
 add_executable(test_gateway_media_jobs test/test_gateway_media_jobs.cpp)
 target_include_directories(test_gateway_media_jobs PRIVATE ${LEVELDB_INC} include test)
 target_link_libraries(test_gateway_media_jobs PRIVATE
+    minikv_gateway
+    minikv_media
+    minikv_utils
+    ${LEVELDB_LIB}
+    pthread
+    OpenSSL::Crypto
+)
+
+add_executable(test_gateway_ai_index_outbox test/test_gateway_ai_index_outbox.cpp)
+target_include_directories(test_gateway_ai_index_outbox PRIVATE ${LEVELDB_INC} include test)
+target_link_libraries(test_gateway_ai_index_outbox PRIVATE
     minikv_gateway
     minikv_media
     minikv_utils
@@ -375,6 +440,10 @@ target_link_libraries(test_gateway_derived_upload PRIVATE
 add_executable(test_redis_task_publisher test/test_redis_task_publisher.cpp)
 target_include_directories(test_redis_task_publisher PRIVATE include test)
 target_link_libraries(test_redis_task_publisher PRIVATE minikv_media pthread)
+
+add_executable(test_redis_ai_event_publisher test/test_redis_ai_event_publisher.cpp)
+target_include_directories(test_redis_ai_event_publisher PRIVATE include test)
+target_link_libraries(test_redis_ai_event_publisher PRIVATE minikv_media pthread)
 
 add_executable(test_jpeg_thumbnail_generator test/test_jpeg_thumbnail_generator.cpp)
 target_include_directories(test_jpeg_thumbnail_generator PRIVATE include third_party test)
@@ -412,8 +481,25 @@ add_executable(test_benchmark_cli test/test_benchmark_cli.cpp)
 target_include_directories(test_benchmark_cli PRIVATE include)
 target_link_libraries(test_benchmark_cli PRIVATE minikv_benchmark)
 
+add_executable(test_minidriver_client test/test_minidriver_client.cpp)
+target_include_directories(test_minidriver_client PRIVATE include test)
+target_link_libraries(test_minidriver_client PRIVATE minikv_client minikv_utils)
+
+add_executable(test_metadata_state_machine test/test_metadata_state_machine.cpp)
+target_include_directories(test_metadata_state_machine PRIVATE include test)
+target_link_libraries(test_metadata_state_machine PRIVATE minikv_metadata)
+
+add_executable(test_metadata_snapshot test/test_metadata_snapshot.cpp)
+target_include_directories(test_metadata_snapshot PRIVATE include test)
+target_link_libraries(test_metadata_snapshot PRIVATE minikv_metadata)
+
 add_executable(minikv_v2_bench src/benchmark/benchmark_main.cpp)
 target_link_libraries(minikv_v2_bench PRIVATE minikv_benchmark)
+
+# Minimal native Worker entry point. It is intentionally a consumer of the
+# public SDK rather than another DataNode/extent reader.
+add_executable(minidriver_client_worker src/client/minidriver_client_worker_main.cpp)
+target_link_libraries(minidriver_client_worker PRIVATE minikv_client)
 
 if(BUILD_TESTING)
     add_test(NAME async_http_timeout COMMAND test_async_http_timeout)
@@ -427,10 +513,12 @@ if(BUILD_TESTING)
     add_test(NAME fast_data_store_read COMMAND test_fast_data_store_read)
     add_test(NAME fast_data_store_region COMMAND test_fast_data_store_region)
     add_test(NAME fast_data_store_delete COMMAND test_fast_data_store_delete)
+    add_test(NAME fast_data_store_durability COMMAND test_fast_data_store_durability)
     add_test(NAME tcp_sendfile_offset COMMAND test_tcp_sendfile_offset)
     add_test(NAME http_file_response COMMAND test_http_file_response)
     add_test(NAME gateway_write_lease COMMAND test_gateway_write_lease)
     add_test(NAME gateway_manifest_snapshot COMMAND test_gateway_manifest_snapshot)
+    add_test(NAME gateway_route_retry_identity COMMAND test_gateway_route_retry_identity)
     add_test(NAME gateway_catalog COMMAND test_gateway_catalog)
     add_test(NAME gateway_delete COMMAND test_gateway_delete)
     add_test(NAME gateway_object_cache COMMAND test_gateway_object_cache)
@@ -456,10 +544,18 @@ if(BUILD_TESTING)
     add_test(NAME node_resource_governor COMMAND test_node_resource_governor)
     add_test(NAME disk_write_executor COMMAND test_disk_write_executor)
     add_test(NAME chunk_disk_write_pipeline COMMAND test_chunk_disk_write_pipeline)
+    add_test(NAME chunk_write_protocol COMMAND test_chunk_write_protocol)
+    add_test(NAME read_capability COMMAND test_read_capability)
+    add_test(NAME http_range COMMAND test_http_range)
+    add_test(NAME checksum_and_opaque_store COMMAND test_checksum_and_opaque_store)
     add_test(NAME media_job COMMAND test_media_job)
     add_test(NAME gateway_media_jobs COMMAND test_gateway_media_jobs)
+    add_test(NAME gateway_ai_index_outbox COMMAND test_gateway_ai_index_outbox)
     add_test(NAME gateway_derived_upload COMMAND test_gateway_derived_upload)
     add_test(NAME redis_task_publisher COMMAND test_redis_task_publisher)
+    add_test(NAME v2_ai_file_event_redis
+             COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/test/test_v2_ai_file_event_redis.sh
+                          ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/test_redis_ai_event_publisher)
     add_test(NAME jpeg_thumbnail_generator COMMAND test_jpeg_thumbnail_generator)
     add_test(NAME raw_embedded_preview COMMAND test_raw_embedded_preview)
     add_test(NAME redis_task_consumer
@@ -472,6 +568,9 @@ if(BUILD_TESTING)
     add_test(NAME benchmark_input COMMAND test_benchmark_input)
     add_test(NAME benchmark_http COMMAND test_benchmark_http)
     add_test(NAME benchmark_cli COMMAND test_benchmark_cli)
+    add_test(NAME minidriver_client COMMAND test_minidriver_client)
+    add_test(NAME metadata_state_machine COMMAND test_metadata_state_machine)
+    add_test(NAME metadata_snapshot COMMAND test_metadata_snapshot)
 endif()
 
 # 链接上面打包好的网络静态库

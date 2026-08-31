@@ -43,11 +43,21 @@ bool hasCapability(const NodeRecord& node, const std::string& wanted)
     return std::find(node.capabilities.begin(), node.capabilities.end(), wanted) != node.capabilities.end();
 }
 
+bool lowerHexDigest(const std::string& value, size_t expectedLength)
+{
+    if(value.size() != expectedLength) return false;
+    return std::all_of(value.begin(), value.end(), [](unsigned char byte) {
+        return (byte >= '0' && byte <= '9') || (byte >= 'a' && byte <= 'f');
+    });
+}
+
 std::string routeRequestKey(const std::string& sessionId,
                             const ChunkRouteRequest& request)
 {
     return sessionId + '\n' + std::to_string(request.chunkIndex) + '\n' +
-           request.chunkHash + '\n' + std::to_string(request.chunkSize);
+           request.chunkHash + '\n' + std::to_string(request.chunkSize) + '\n' +
+           request.identityScheme + '\n' + request.checksumType + '\n' +
+           request.checksumDigest;
 }
 
 std::string catalogPathKey(const std::string& ownerId, const std::string& path)
@@ -140,13 +150,14 @@ std::string objectValue(const ObjectMeta& object)
            hexEncode(object.parentPath) + "|" + hexEncode(object.name) + "|" +
            hexEncode(object.fileHash) + "|" + std::to_string(object.fileSize) + "|" +
            hexEncode(object.contentType) + "|" + std::to_string(static_cast<int>(object.state)) +
-           "|" + std::to_string(object.createdAt);
+           "|" + std::to_string(object.createdAt) + "|" +
+           std::to_string(object.objectVersion) + "|" + std::to_string(object.metadataVersion);
 }
 
 bool parseObject(const std::string& value, ObjectMeta& object)
 {
     const auto fields = split(value, '|');
-    if (fields.size() != 9) return false;
+    if (fields.size() != 9 && fields.size() != 11) return false;
     try {
         if (!hexDecode(fields[0], object.objectId) || !hexDecode(fields[1], object.ownerId) ||
             !hexDecode(fields[2], object.parentPath) || !hexDecode(fields[3], object.name) ||
@@ -156,6 +167,8 @@ bool parseObject(const std::string& value, ObjectMeta& object)
         object.fileSize = std::stoull(fields[5]);
         object.state = static_cast<FileState>(std::stoi(fields[7]));
         object.createdAt = std::stoll(fields[8]);
+        object.objectVersion = fields.size() == 11 ? std::stoull(fields[9]) : 1;
+        object.metadataVersion = fields.size() == 11 ? std::stoull(fields[10]) : 1;
         return true;
     } catch (...) {
         return false;
@@ -195,7 +208,9 @@ size_t estimatedFileBytes(const FileMeta& file)
 
 size_t estimatedRouteBytes(const ChunkRoute& route)
 {
-    size_t bytes = sizeof(ChunkRoute) + route.chunkHash.size();
+    size_t bytes = sizeof(ChunkRoute) + route.chunkHash.size() + route.chunkId.size() +
+                   route.identityScheme.size() + route.checksumType.size() +
+                   route.checksumDigest.size();
     for (const auto& replica : route.replicas) bytes += replica.size();
     return bytes;
 }
@@ -234,15 +249,21 @@ std::string deleteTaskValue(const DeleteTask& task)
     std::vector<std::string> nodes;
     for (const auto& nodeId : task.pendingNodeIds) nodes.push_back(hexEncode(nodeId));
     return hexEncode(task.chunkHash) + "|" + std::to_string(task.createdAt) + "|" +
-           std::to_string(task.updatedAt) + "|" + join(nodes, ',');
+           std::to_string(task.updatedAt) + "|" + join(nodes, ',') + "|" +
+           hexEncode(task.storageIdentity);
 }
 
 bool parseDeleteTask(const std::string& value, DeleteTask& task)
 {
     const auto fields = split(value, '|');
-    if (fields.size() != 4) return false;
+    if (fields.size() != 4 && fields.size() != 5) return false;
     try {
         if (!hexDecode(fields[0], task.chunkHash)) return false;
+        if (fields.size() == 5) {
+            if (!hexDecode(fields[4], task.storageIdentity)) return false;
+        } else {
+            task.storageIdentity = task.chunkHash;
+        }
         task.createdAt = std::stoll(fields[1]);
         task.updatedAt = std::stoll(fields[2]);
         for (const auto& node : split(fields[3], ',')) {
@@ -254,7 +275,8 @@ bool parseDeleteTask(const std::string& value, DeleteTask& task)
         std::sort(task.pendingNodeIds.begin(), task.pendingNodeIds.end());
         task.pendingNodeIds.erase(std::unique(task.pendingNodeIds.begin(), task.pendingNodeIds.end()),
                                   task.pendingNodeIds.end());
-        return !task.chunkHash.empty() && !task.pendingNodeIds.empty();
+        return !task.chunkHash.empty() && !task.storageIdentity.empty() &&
+               !task.pendingNodeIds.empty();
     } catch (...) {
         return false;
     }
@@ -325,16 +347,20 @@ std::string routeValue(const ChunkRoute& route)
         replicas.push_back(hexEncode(node));
     }
 
-    return hexEncode(route.chunkHash) + '|' + std::to_string(route.size) 
+    return hexEncode(route.chunkHash) + '|' + std::to_string(route.size)
             + '|' + std::to_string(route.desiredReplicas) + '|' +  std::to_string(route.updateAt) + '|'
-            + join(replicas, ',');
+            + join(replicas, ',') + '|' + hexEncode(route.identityScheme) + '|' +
+            hexEncode(route.chunkId) + '|' + hexEncode(route.checksumType) + '|' +
+            hexEncode(route.checksumDigest) + '|' + std::to_string(route.objectVersion) + '|' +
+            std::to_string(route.generation);
 }
 
 bool parseRoute(const std::string& value, ChunkRoute& route)
 {
     const auto f = split(value, '|');
-    if(f.size() != 5) return false;
+    if(f.size() != 5 && f.size() != 11) return false;
     try{
+        route = {};
         if(!hexDecode(f[0], route.chunkHash)) return false;
         route.size = std::stoull(f[1]);
         route.desiredReplicas = static_cast<uint32_t>(std::stoul(f[2]));
@@ -347,6 +373,20 @@ bool parseRoute(const std::string& value, ChunkRoute& route)
                 if(!hexDecode(item, node)) return false;
                 route.replicas.push_back(node);
             }
+        }
+        if(f.size() == 11) {
+            if(!hexDecode(f[5], route.identityScheme) ||
+               !hexDecode(f[6], route.chunkId) ||
+               !hexDecode(f[7], route.checksumType) ||
+               !hexDecode(f[8], route.checksumDigest)) return false;
+            route.objectVersion = std::stoull(f[9]);
+            route.generation = std::stoull(f[10]);
+        } else {
+            route.identityScheme = "cas-sha256";
+            route.chunkId = route.chunkHash;
+            route.checksumType = "sha256";
+            route.checksumDigest = route.chunkHash;
+            route.objectVersion = 1;
         }
         return true;
     }catch(...) {
@@ -375,17 +415,20 @@ std::string fileValue(const FileMeta& file)
         hashes.push_back(hexEncode(hash));
     }
     return   hexEncode(file.fileHash) + "|" + hexEncode(file.ownerId) + "|" + hexEncode(file.fileName) + "|" + hexEncode(file.dirPath) + "|" +
-           std::to_string(file.fileSize) + "|" + std::to_string(file.chunkSize) + "|" + std::to_string(static_cast<int>(file.state)) + "|" + std::to_string(file.createdAt) + "|" + join(hashes, ',');
+           std::to_string(file.fileSize) + "|" + std::to_string(file.chunkSize) + "|" + std::to_string(static_cast<int>(file.state)) + "|" + std::to_string(file.createdAt) + "|" + join(hashes, ',') + "|" +
+           std::to_string(file.objectVersion) + "|" + std::to_string(file.metadataVersion);
 
 }
 
 
 bool parseFile(const std::string& value, FileMeta& file) {
-    const auto f = split(value, '|'); if (f.size() != 9) return false;
+    const auto f = split(value, '|'); if (f.size() != 9 && f.size() != 11) return false;
     try {
         if (!hexDecode(f[0], file.fileHash) || !hexDecode(f[1], file.ownerId) || !hexDecode(f[2], file.fileName) || !hexDecode(f[3], file.dirPath)) return false;
         file.fileSize = std::stoull(f[4]); file.chunkSize = static_cast<uint32_t>(std::stoul(f[5])); file.state = static_cast<FileState>(std::stoi(f[6])); file.createdAt = std::stoll(f[7]);
         for (const auto& item : split(f[8], ',')) { if (!item.empty()) { std::string hash; if (!hexDecode(item, hash)) return false; file.chunkHashes.push_back(hash); } }
+        file.objectVersion = f.size() == 11 ? std::stoull(f[9]) : 1;
+        file.metadataVersion = f.size() == 11 ? std::stoull(f[10]) : 1;
         return true;
     } catch (...) { return false; }
 }
@@ -413,11 +456,13 @@ std::string sessionValue(const SessionState& session) {
            hexEncode(session.dirPath) + "|" + std::to_string(session.fileSize) + "|" + std::to_string(session.chunkSize) + "|" +
            std::to_string(session.totalChunks) + "|" + std::to_string(session.createdAt) + "|" + std::to_string(session.lastActivityAt) + "|" + join(chunks, ';') + "|" +
            hexEncode(session.manifestHash) + "|" + hexEncode(session.derivedJobId) + "|" +
-           hexEncode(session.derivedProfile);
+           hexEncode(session.derivedProfile) + "|" + hexEncode(session.objectId) + "|" +
+           std::to_string(session.objectVersion) + "|" +
+           std::to_string(session.metadataVersion);
 }
 bool parseSession(const std::string& value, SessionState& session) {
     const auto f = split(value, '|'); 
-    if (f.size() != 10 && f.size() != 11 && f.size() != 13) return false;
+    if (f.size() != 10 && f.size() != 11 && f.size() != 13 && f.size() != 16) return false;
     try {
         if (!hexDecode(f[0], session.sessionId) || !hexDecode(f[1], session.ownerId) || !hexDecode(f[2], session.fileName) || !hexDecode(f[3], session.dirPath)) return false;
         session.fileSize = std::stoull(f[4]); session.chunkSize = static_cast<uint32_t>(std::stoul(f[5])); session.totalChunks = static_cast<uint32_t>(std::stoul(f[6]));
@@ -426,6 +471,15 @@ bool parseSession(const std::string& value, SessionState& session) {
         if (f.size() >= 11 && !hexDecode(f[10], session.manifestHash)) return false;
         if (f.size() == 13 && (!hexDecode(f[11], session.derivedJobId) ||
                                !hexDecode(f[12], session.derivedProfile))) return false;
+        if (f.size() == 16) {
+            if (!hexDecode(f[11], session.derivedJobId) ||
+                !hexDecode(f[12], session.derivedProfile) ||
+                !hexDecode(f[13], session.objectId)) return false;
+            session.objectVersion = std::stoull(f[14]);
+            session.metadataVersion = std::stoull(f[15]);
+            if (session.objectId.empty() || session.objectVersion == 0 ||
+                session.metadataVersion == 0) return false;
+        }
         return true;
     } catch (...) { return false; }
 }
@@ -613,6 +667,8 @@ bool GatewayState::backfillLegacyCatalogLocked()
         if (status.ok()) continue;
         ObjectMeta object;
         object.objectId = "legacy-" + fileHash;
+        object.objectVersion = file.objectVersion;
+        object.metadataVersion = file.metadataVersion;
         object.ownerId = file.ownerId;
         object.parentPath = parent;
         object.name = name;
@@ -681,6 +737,17 @@ bool GatewayState::reserveLeaseLocked(const SessionState& session,
     if(plan.leaseId.empty()) return false;
     plan.routeVersion = std::hash<std::string>{}(plan.leaseId);
     plan.expiresAt = now + 120;
+    plan.identityScheme = request.identityScheme;
+    plan.checksumType = request.checksumType;
+    plan.checksumDigest = request.checksumDigest;
+    plan.objectVersion = session.objectVersion;
+    if(request.identityScheme == "opaque-chunk-id") {
+        const std::string seed = session.sessionId + "\n" +
+            std::to_string(request.chunkIndex) + "\n" + request.chunkHash;
+        plan.chunkId = "chk-" + sha256Hex(seed.data(), seed.size()).substr(0, 40);
+    } else {
+        plan.chunkId = request.chunkHash;
+    }
 
     WriteLease lease;
     lease.leaseId = plan.leaseId;
@@ -843,7 +910,8 @@ bool GatewayState::createSession(const std::string& fileName, const std::string&
     std::lock_guard<std::mutex> lock(mutex_);
     out = {};
     out.sessionId = randomId();
-    if(out.sessionId.empty()) return false;    
+    out.objectId = randomId();
+    if(out.sessionId.empty() || out.objectId.empty()) return false;
     out.fileName = fileName;
     out.dirPath = dirPath;
     out.fileSize = fileSize;
@@ -876,6 +944,8 @@ FileCommitStatus GatewayState::createObjectLinkLocked(const std::string& fileNam
     object.objectId = randomId();
     if (object.objectId.empty()) return FileCommitStatus::kInvalidRequest;
     object.ownerId = file.ownerId;
+    object.objectVersion = file.objectVersion;
+    object.metadataVersion = file.metadataVersion;
     object.parentPath = parentPath;
     object.name = name;
     object.fileHash = file.fileHash;
@@ -902,6 +972,19 @@ FileCommitStatus GatewayState::createObjectLinkLocked(const std::string& fileNam
     }
     batch.Put("obj:" + object.objectId, objectValue(object));
     batch.Put("path:" + pathKey, object.objectId);
+    media::AiIndexEvent aiEvent;
+    // objectId is stable and unique for this logical directory entry, so it
+    // is safe to use as the outbox event identity in the V2 single-Gateway
+    // model. V3 will replace this with a metadata command/event id.
+    aiEvent.eventId = object.objectId;
+    aiEvent.objectId = object.objectId;
+    aiEvent.objectVersion = object.objectVersion;
+    aiEvent.metadataVersion = object.metadataVersion;
+    aiEvent.objectKey = childPath(parentPath, name);
+    aiEvent.fileHash = out.fileHash;
+    aiEvent.fileSize = out.fileSize;
+    aiEvent.occurredAt = out.createdAt;
+    batch.Put("ai:" + aiEvent.eventId, media::serializeAiIndexEvent(aiEvent));
     if (!db_->Write(leveldb::WriteOptions(), &batch).ok()) return FileCommitStatus::kInvalidRequest;
 
     objectCache_.erase(object.objectId);
@@ -960,7 +1043,10 @@ PreflightStatus GatewayState::preflightUpload(const UploadPreflightRequest& requ
 
     SessionState session;
     session.sessionId = randomId();
-    if (session.sessionId.empty()) return PreflightStatus::kInvalidRequest;
+    session.objectId = randomId();
+    if (session.sessionId.empty() || session.objectId.empty()) {
+        return PreflightStatus::kInvalidRequest;
+    }
     session.fileName = name;
     session.dirPath = parentPath;
     session.fileSize = request.fileSize;
@@ -1025,7 +1111,8 @@ bool GatewayState::createDerivedUpload(const std::string& jobId, const std::stri
 
     SessionState session;
     session.sessionId = randomId();
-    if(session.sessionId.empty()) return false;
+    session.objectId = randomId();
+    if(session.sessionId.empty() || session.objectId.empty()) return false;
     session.fileName = fileName;
     session.fileSize = request.fileSize;
     session.chunkSize = request.chunkSize;
@@ -1073,8 +1160,14 @@ RoutePlanStatus GatewayState::planRoutes(const std::string& sessionId,
     const int64_t now = unixSeconds();
     releaseExpiredLeasesLocked(now);
     std::vector<std::string> createdLeaseIds;
-    for(const auto& request : requests)
+    for(const auto& originalRequest : requests)
     {
+        ChunkRouteRequest request = originalRequest;
+        if(request.identityScheme.empty()) request.identityScheme = "cas-sha256";
+        if(request.checksumType.empty()) request.checksumType = "sha256";
+        if(request.checksumDigest.empty() && request.checksumType == "sha256") {
+            request.checksumDigest = request.chunkHash;
+        }
         const uint32_t index = request.chunkIndex;
         if(index >= it->second.totalChunks) {
             for(const auto& leaseId : createdLeaseIds) releaseLeaseLocked(leaseId);
@@ -1084,7 +1177,21 @@ RoutePlanStatus GatewayState::planRoutes(const std::string& sessionId,
         const uint64_t expected = index + 1 == it->second.totalChunks
             ? it->second.fileSize - static_cast<uint64_t>(index) * it->second.chunkSize
             : it->second.chunkSize;
+        const bool supportedIdentity = request.identityScheme == "cas-sha256" ||
+            request.identityScheme == "opaque-chunk-id";
+        const bool legacyCasChecksum = request.identityScheme == "cas-sha256" &&
+            request.checksumType == "sha256" &&
+            request.checksumDigest == request.chunkHash;
+        const bool supportedChecksum = legacyCasChecksum ||
+            (request.checksumType == "sha256" &&
+             lowerHexDigest(request.checksumDigest, 64)) ||
+            (request.checksumType == "crc32c" &&
+             lowerHexDigest(request.checksumDigest, 8));
+        const bool validCas = request.identityScheme != "cas-sha256" ||
+            (request.checksumType == "sha256" &&
+             request.checksumDigest == request.chunkHash);
         if(request.chunkHash.empty() || request.chunkSize != expected ||
+           !supportedIdentity || !supportedChecksum || !validCas ||
            it->second.completed.count(index))
         {
             for(const auto& leaseId : createdLeaseIds) releaseLeaseLocked(leaseId);
@@ -1150,6 +1257,12 @@ CommitChunkStatus GatewayState::commitChunk(const std::string& sessionId, uint32
     ChunkRoute route;
     if (!getRouteLocked(chunkHash, route)) route = {};
     route.chunkHash = chunkHash;
+    route.chunkId = lease->second.plan.chunkId;
+    route.identityScheme = lease->second.plan.identityScheme;
+    route.checksumType = lease->second.plan.checksumType;
+    route.checksumDigest = lease->second.plan.checksumDigest;
+    route.objectVersion = lease->second.plan.objectVersion;
+    route.generation = lease->second.plan.routeVersion;
     route.size = size;
     route.updateAt = unixSeconds();
     for(const auto& node : successfulNodes)
@@ -1230,13 +1343,33 @@ FileCommitStatus GatewayState::commitFile(const std::string& sessionId, FileMeta
     const std::string pathKey = catalogPathKey(out.ownerId, childPath(parentPath, name));
     std::string existingObjectId;
     const leveldb::Status pathStatus = db_->Get(leveldb::ReadOptions(), "path:" + pathKey, &existingObjectId);
-    if (pathStatus.ok()) return FileCommitStatus::kPathConflict;
+    if (pathStatus.ok()) {
+        // A client may lose the first successful response and retry the same
+        // Session commit.  Treat that as the same business operation, while
+        // keeping a different Session/object at the same path as a conflict.
+        ObjectMeta existingObject;
+        if (sessionIt->second.objectId.empty() ||
+            existingObjectId != sessionIt->second.objectId ||
+            !getObjectLocked(existingObjectId, existingObject) ||
+            existingObject.fileHash != out.fileHash) {
+            return FileCommitStatus::kPathConflict;
+        }
+        out.objectId = existingObject.objectId;
+        out.objectVersion = existingObject.objectVersion;
+        out.metadataVersion = existingObject.metadataVersion;
+        out.state = existingObject.state;
+        out.createdAt = existingObject.createdAt;
+        return FileCommitStatus::kCommitted;
+    }
     if (!pathStatus.IsNotFound()) return FileCommitStatus::kInvalidRequest;
 
     ObjectMeta object;
-    object.objectId = randomId();
+    object.objectId = sessionIt->second.objectId.empty()
+        ? randomId() : sessionIt->second.objectId;
     if (object.objectId.empty()) return FileCommitStatus::kInvalidRequest;
     object.ownerId = out.ownerId;
+    object.objectVersion = sessionIt->second.objectVersion;
+    object.metadataVersion = sessionIt->second.metadataVersion;
     object.parentPath = parentPath;
     object.name = name;
     object.fileHash = out.fileHash;
@@ -1244,6 +1377,8 @@ FileCommitStatus GatewayState::commitFile(const std::string& sessionId, FileMeta
     object.state = out.state;
     object.createdAt = out.createdAt;
     out.objectId = object.objectId;
+    out.objectVersion = object.objectVersion;
+    out.metadataVersion = object.metadataVersion;
 
     leveldb::WriteBatch batch;
     std::string current = "/";
@@ -1268,6 +1403,16 @@ FileCommitStatus GatewayState::commitFile(const std::string& sessionId, FileMeta
     }
     batch.Put("obj:" + object.objectId, objectValue(object));
     batch.Put("path:" + pathKey, object.objectId);
+    media::AiIndexEvent aiEvent;
+    aiEvent.eventId = object.objectId;
+    aiEvent.objectId = object.objectId;
+    aiEvent.objectVersion = object.objectVersion;
+    aiEvent.metadataVersion = object.metadataVersion;
+    aiEvent.objectKey = childPath(parentPath, name);
+    aiEvent.fileHash = out.fileHash;
+    aiEvent.fileSize = out.fileSize;
+    aiEvent.occurredAt = out.createdAt;
+    batch.Put("ai:" + aiEvent.eventId, media::serializeAiIndexEvent(aiEvent));
     if (!db_->Write(leveldb::WriteOptions(), &batch).ok()) return FileCommitStatus::kInvalidRequest;
 
     objectCache_.erase(object.objectId);
@@ -1323,9 +1468,12 @@ FileCommitStatus GatewayState::commitDerivedUpload(const std::string& jobId,
     }
 
     ObjectMeta object;
-    object.objectId = randomId();
+    object.objectId = sessionIt->second.objectId.empty()
+        ? randomId() : sessionIt->second.objectId;
     if(object.objectId.empty()) return FileCommitStatus::kInvalidRequest;
     object.ownerId = out.ownerId;
+    object.objectVersion = sessionIt->second.objectVersion;
+    object.metadataVersion = sessionIt->second.metadataVersion;
     object.name = out.fileName;
     object.fileHash = out.fileHash;
     object.fileSize = out.fileSize;
@@ -1333,6 +1481,8 @@ FileCommitStatus GatewayState::commitDerivedUpload(const std::string& jobId,
     object.state = out.state;
     object.createdAt = out.createdAt;
     out.objectId = object.objectId;
+    out.objectVersion = object.objectVersion;
+    out.metadataVersion = object.metadataVersion;
 
     std::string existingFile;
     const leveldb::Status fileStatus = db_->Get(leveldb::ReadOptions(), "f:" + out.fileHash, &existingFile);
@@ -1402,6 +1552,48 @@ bool GatewayState::buildManifestSnapshot(const std::string& fileHash,
     manifestCache_.put(fileHash, std::make_shared<const ManifestSnapshot>(snapshot),
                        estimatedManifestBytes(snapshot), kManifestCacheTtlSeconds);
     out = std::move(snapshot);
+    return true;
+}
+
+bool GatewayState::buildObjectReadDescriptor(
+    const std::string& objectId, control::ObjectReadDescriptor& out) const
+{
+    out = {};
+    std::lock_guard<std::mutex> lock(mutex_);
+    ObjectMeta object;
+    if(!getObjectLocked(objectId, object)) return false;
+    FileMeta file;
+    if(!getFileLocked(object.fileHash, file)) return false;
+
+    control::ObjectReadDescriptor descriptor;
+    descriptor.objectId = object.objectId;
+    descriptor.objectVersion = object.objectVersion;
+    descriptor.metadataVersion = object.metadataVersion;
+    descriptor.fileSize = object.fileSize;
+    descriptor.chunkSize = file.chunkSize;
+    descriptor.chunks.reserve(file.chunkHashes.size());
+    for(size_t index = 0; index < file.chunkHashes.size(); ++index) {
+        ChunkRoute route;
+        if(!getRouteLocked(file.chunkHashes[index], route)) return false;
+        control::ChunkReadDescriptor chunk;
+        chunk.index = static_cast<uint32_t>(index);
+        chunk.chunkId = route.chunkId.empty() ? route.chunkHash : route.chunkId;
+        chunk.storageIdentity = route.identityScheme == "opaque-chunk-id"
+            ? chunk.chunkId : route.chunkHash;
+        chunk.size = route.size;
+        chunk.checksumType = route.checksumType;
+        chunk.checksumDigest = route.checksumDigest;
+        chunk.generation = route.generation;
+        for(const auto& nodeId : route.replicas) {
+            const auto node = nodeRecords_.find(nodeId);
+            if(node == nodeRecords_.end()) return false;
+            chunk.replicas.push_back(
+                {node->second.nodeId, node->second.address, node->second.httpPort});
+        }
+        if(chunk.storageIdentity.empty() || chunk.replicas.empty()) return false;
+        descriptor.chunks.push_back(std::move(chunk));
+    }
+    out = std::move(descriptor);
     return true;
 }
 
@@ -1725,6 +1917,40 @@ std::vector<media::MediaJob> GatewayState::dueMediaJobs(int64_t now, size_t maxJ
     return result;
 }
 
+std::vector<media::AiIndexEvent> GatewayState::dueAiIndexEvents(int64_t now,
+                                                                 size_t maxEvents) const
+{
+    std::lock_guard<std::mutex> lock(mutex_);
+    std::vector<media::AiIndexEvent> result;
+    if(!db_ || maxEvents == 0) return result;
+
+    auto iterator = std::unique_ptr<leveldb::Iterator>(db_->NewIterator(leveldb::ReadOptions()));
+    for(iterator->Seek("ai:"); iterator->Valid() &&
+        iterator->key().ToString().rfind("ai:", 0) == 0 && result.size() < maxEvents;
+        iterator->Next()) {
+        media::AiIndexEvent event;
+        if(!media::parseAiIndexEvent(iterator->value().ToString(), event)) return {};
+        if(event.publishedAt == 0 && event.occurredAt <= now) result.push_back(std::move(event));
+    }
+    if(!iterator->status().ok()) return {};
+    return result;
+}
+
+bool GatewayState::markAiIndexEventPublished(const std::string& eventId, int64_t now)
+{
+    if(eventId.empty() || now <= 0) return false;
+    std::lock_guard<std::mutex> lock(mutex_);
+    if(!db_) return false;
+    std::string value;
+    if(!db_->Get(leveldb::ReadOptions(), "ai:" + eventId, &value).ok()) return false;
+    media::AiIndexEvent event;
+    if(!media::parseAiIndexEvent(value, event)) return false;
+    if(event.publishedAt != 0) return true;
+    event.publishedAt = now;
+    return db_->Put(leveldb::WriteOptions(), "ai:" + eventId,
+                    media::serializeAiIndexEvent(event)).ok();
+}
+
 ObjectMetaCache::Stats GatewayState::objectCacheStats() const
 {
     std::lock_guard<std::mutex> lock(mutex_);
@@ -1806,7 +2032,7 @@ std::vector<DeleteTaskSnapshot> GatewayState::pendingDeletesForNode(const std::s
     for (const auto& [chunkHash, task] : deleteTasks_) {
         if (std::find(task.pendingNodeIds.begin(), task.pendingNodeIds.end(), nodeId) !=
             task.pendingNodeIds.end()) {
-            pending.push_back({chunkHash, task.pendingNodeIds});
+            pending.push_back({chunkHash, task.storageIdentity, task.pendingNodeIds});
         }
     }
     return pending;
@@ -1897,6 +2123,8 @@ DeleteStatus GatewayState::deleteCatalogEntriesLocked(const std::vector<std::str
         }
         DeleteTask task;
         task.chunkHash = chunkHash;
+        task.storageIdentity = route.identityScheme == "opaque-chunk-id" ?
+            route.chunkId : route.chunkHash;
         task.pendingNodeIds = route.replicas;
         std::sort(task.pendingNodeIds.begin(), task.pendingNodeIds.end());
         task.pendingNodeIds.erase(std::unique(task.pendingNodeIds.begin(), task.pendingNodeIds.end()),

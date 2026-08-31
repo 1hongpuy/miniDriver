@@ -102,6 +102,16 @@ int main()
     FileMeta firstFile;
     CHECK(state.commitFile(firstResult.session.sessionId, firstFile) == FileCommitStatus::kCommitted);
     CHECK(firstFile.fileHash == first.manifestHash);
+    CHECK(firstFile.objectId == firstResult.session.objectId);
+    CHECK(firstFile.objectVersion == firstResult.session.objectVersion);
+    CHECK(firstFile.metadataVersion == firstResult.session.metadataVersion);
+
+    FileMeta retriedFile;
+    CHECK(state.commitFile(firstResult.session.sessionId, retriedFile) == FileCommitStatus::kCommitted);
+    CHECK(retriedFile.objectId == firstFile.objectId);
+    CHECK(retriedFile.objectVersion == firstFile.objectVersion);
+    CHECK(retriedFile.metadataVersion == firstFile.metadataVersion);
+    CHECK(retriedFile.fileHash == firstFile.fileHash);
 
     UploadPreflightRequest duplicate = first;
     duplicate.fileName = "copy.NEF";
@@ -129,6 +139,14 @@ int main()
     UploadPreflightResult conflictResult;
     CHECK(state.preflightUpload(first, conflictResult) == PreflightStatus::kPathConflict);
     CHECK(conflictResult.session.sessionId.empty());
+
+    UploadPreflightRequest overwrite = first;
+    overwrite.chunks[1].chunkHash = "different-committed-content";
+    overwrite.manifestHash = GatewayState::manifestHash(
+        overwrite.fileSize, overwrite.chunkSize, overwrite.chunks);
+    UploadPreflightResult overwriteResult;
+    CHECK(state.preflightUpload(overwrite, overwriteResult) == PreflightStatus::kPathConflict);
+    CHECK(overwriteResult.session.sessionId.empty());
 
     std::filesystem::remove_all(directory, error);
     std::cout << "PASS: upload preflight rejects path conflicts and reuses existing content\n";

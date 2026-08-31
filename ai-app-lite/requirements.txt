@@ -1,0 +1,9 @@
+# The base MVP uses only Python's standard library. Pillow enables EXIF extraction.
+Pillow>=10.0
+
+# Optional semantic image/text embeddings:
+# torch>=2.0
+# open_clip_torch>=2.24
+
+# Redis Streams ingestion uses a small stdlib RESP adapter in this MVP, so no
+# Python Redis package is required. A production migration may use redis>=5.0.

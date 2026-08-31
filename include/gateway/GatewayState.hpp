@@ -1,6 +1,8 @@
 #pragma once
 
 #include "gateway/LruCache.hpp"
+#include "control/ObjectReadTypes.hpp"
+#include "media/AiIndexEvent.hpp"
 #include "media/MediaJob.hpp"
 
 #include <cstdint>
@@ -54,6 +56,11 @@ struct PlacementPlan { //临时写入计划
     std::string leaseId;
     uint64_t routeVersion = 0; //防止冲突版本号
     int64_t  expiresAt    = 0; //过期时间
+    std::string identityScheme = "cas-sha256";
+    std::string chunkId;
+    std::string checksumType = "sha256";
+    std::string checksumDigest;
+    uint64_t objectVersion = 1;
     std::vector<NodeSnapshot> chain; //节点备份
 };
 
@@ -61,6 +68,9 @@ struct ChunkRouteRequest { //客户端申请的清单
     uint32_t chunkIndex = 0;
     std::string chunkHash;
     uint64_t chunkSize = 0;
+    std::string identityScheme = "cas-sha256";
+    std::string checksumType = "sha256";
+    std::string checksumDigest;
 };
 
 // Route planning failures have different client behavior. Invalid input must be
@@ -79,6 +89,11 @@ struct CompletedChunk { //最后写入的清单,会话层
 
 struct SessionState {
     std::string sessionId;
+    // Allocate logical identity before issuing any Chunk route. Retries after
+    // a Gateway restart must keep both object and physical Chunk identities.
+    std::string objectId;
+    uint64_t objectVersion = 1;
+    uint64_t metadataVersion = 1;
     std::string ownerId = "admin";
     std::string fileName;
     std::string dirPath;
@@ -99,6 +114,12 @@ struct SessionState {
 
 struct ChunkRoute { //每个chunk的真实副本管理，写入真实的数据
     std::string chunkHash;
+    std::string chunkId;
+    std::string identityScheme = "cas-sha256";
+    std::string checksumType = "sha256";
+    std::string checksumDigest;
+    uint64_t objectVersion = 1;
+    uint64_t generation = 0;
     uint64_t size = 0;
     uint32_t desiredReplicas = 2; //期望副本数
     std::vector<std::string> replicas;
@@ -121,6 +142,8 @@ struct FileMeta {
     // stored in f:{fileHash}: a file hash describes content, while objectId
     // describes one logical entry in the user's directory tree.
     std::string objectId;
+    uint64_t objectVersion = 1;
+    uint64_t metadataVersion = 1;
     std::string fileHash;
     std::string ownerId = "admin";
     std::string fileName;
@@ -140,6 +163,8 @@ struct DirectoryMeta {
 
 struct ObjectMeta {
     std::string objectId;
+    uint64_t objectVersion = 1;
+    uint64_t metadataVersion = 1;
     std::string ownerId = "admin";
     std::string parentPath;
     std::string name;
@@ -217,11 +242,13 @@ struct MetadataCacheUsage {
 
 struct DeleteTaskSnapshot {
     std::string chunkHash;
+    std::string storageIdentity;
     std::vector<std::string> pendingNodeIds;
 };
 
 struct DeleteTask {
     std::string chunkHash;
+    std::string storageIdentity;
     std::vector<std::string> pendingNodeIds;
     int64_t createdAt = 0;
     int64_t updatedAt = 0;
@@ -271,6 +298,8 @@ public:
     bool getFile(const std::string& fileHash, FileMeta& out) const;
     bool getRoute(const std::string& chunkHash, ChunkRoute& out) const;
     bool buildManifestSnapshot(const std::string& fileHash, ManifestSnapshot& out) const;
+    bool buildObjectReadDescriptor(const std::string& objectId,
+                                   control::ObjectReadDescriptor& out) const;
     bool createDirectory(const std::string& parentPath, const std::string& name,
                          DirectoryMeta* out = nullptr);
     bool listCatalog(const std::string& path, CatalogSnapshot& out) const;
@@ -301,6 +330,12 @@ public:
     // A worker may still claim it immediately; this only rate-limits recovery scans.
     bool deferMediaJobDispatch(const std::string& jobId, int64_t nextDispatchAt);
     std::vector<media::MediaJob> dueMediaJobs(int64_t now, size_t maxJobs) const;
+
+    // AI index events are written in the same LevelDB batch as File Commit.
+    // Redis publication is at-least-once; consumers must de-duplicate by
+    // eventId and objectId/objectVersion.
+    std::vector<media::AiIndexEvent> dueAiIndexEvents(int64_t now, size_t maxEvents) const;
+    bool markAiIndexEventPublished(const std::string& eventId, int64_t now);
 
 
 private:
@@ -359,11 +394,6 @@ private:
 
 }
 }
-
-
-
-
-
 
 
 

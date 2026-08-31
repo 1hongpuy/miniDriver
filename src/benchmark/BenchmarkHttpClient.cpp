@@ -1,12 +1,14 @@
 #include "benchmark/BenchmarkHttpClient.hpp"
 
 #include <arpa/inet.h>
+#include <chrono>
 #include <cerrno>
 #include <cstring>
 #include <netdb.h>
 #include <poll.h>
 #include <sstream>
 #include <sys/socket.h>
+#include <thread>
 #include <unistd.h>
 
 namespace miniKV::benchmark {
@@ -79,7 +81,8 @@ bool parseContentLength(const std::map<std::string, std::string>& headers, uint6
     return true;
 }
 
-bool readResponse(int fd, int timeoutMs, HttpResponse& response, std::string& error) {
+bool readResponse(int fd, int timeoutMs, HttpResponse& response, std::string& error,
+                  uint64_t maxReadBytesPerSecond) {
     response = {};
     std::string bytes;
     char buffer[64 * 1024];
@@ -98,8 +101,21 @@ bool readResponse(int fd, int timeoutMs, HttpResponse& response, std::string& er
             error = std::strerror(errno);
             return false;
         }
+        const size_t oldSize = bytes.size();
         bytes.append(buffer, static_cast<size_t>(result));
-        if (headerEnd != std::string::npos) continue;
+        if (headerEnd != std::string::npos) {
+            if (maxReadBytesPerSecond > 0) {
+                const size_t bodyStart = headerEnd + 4;
+                const size_t newlyReadBody = bytes.size() > std::max(oldSize, bodyStart)
+                    ? bytes.size() - std::max(oldSize, bodyStart) : 0;
+                if (newlyReadBody > 0) {
+                    const uint64_t nanoseconds = static_cast<uint64_t>(newlyReadBody) * 1000000000ULL /
+                        maxReadBytesPerSecond;
+                    if (nanoseconds > 0) std::this_thread::sleep_for(std::chrono::nanoseconds(nanoseconds));
+                }
+            }
+            continue;
+        }
         headerEnd = bytes.find("\r\n\r\n");
         if (headerEnd == std::string::npos) continue;
         std::istringstream headers(bytes.substr(0, headerEnd));
@@ -120,6 +136,11 @@ bool readResponse(int fd, int timeoutMs, HttpResponse& response, std::string& er
             response.headers[std::move(name)] = std::move(value);
         }
         if (!parseContentLength(response.headers, expectedBody)) { error = "HTTP response has no valid Content-Length"; return false; }
+        if (maxReadBytesPerSecond > 0 && bytes.size() > headerEnd + 4) {
+            const uint64_t bodyAlreadyRead = bytes.size() - (headerEnd + 4);
+            const uint64_t nanoseconds = bodyAlreadyRead * 1000000000ULL / maxReadBytesPerSecond;
+            if (nanoseconds > 0) std::this_thread::sleep_for(std::chrono::nanoseconds(nanoseconds));
+        }
     }
     response.body.assign(bytes.data() + headerEnd + 4, static_cast<size_t>(expectedBody));
     return true;
@@ -131,21 +152,31 @@ StreamingRequest::~StreamingRequest() { cancel(); }
 
 bool StreamingRequest::open(const Endpoint& endpoint, std::string_view method, std::string_view path,
                             const std::map<std::string, std::string>& headers,
-                            uint64_t contentLength, int timeoutMs, std::string& error) {
-    cancel();
+                            uint64_t contentLength, int timeoutMs, std::string& error,
+                            bool keepAlive) {
+    const std::string endpointKey = endpoint.host + ':' + std::to_string(endpoint.port);
+    if(fd_ >= 0 && (!keepAlive_ || !keepAlive || endpointKey_ != endpointKey)) cancel();
     error.clear();
-    fd_ = connectSocket(endpoint, timeoutMs, error);
-    if (fd_ < 0) return false;
+    if(fd_ < 0) {
+        fd_ = connectSocket(endpoint, timeoutMs, error);
+        if (fd_ < 0) return false;
+        ++stats_.connectionOpens;
+    } else {
+        ++stats_.connectionReuses;
+    }
     std::ostringstream request;
     request << method << ' ' << path << " HTTP/1.1\r\nHost: " << endpoint.host
-            << "\r\nConnection: close\r\n";
+            << "\r\nConnection: " << (keepAlive ? "keep-alive" : "close") << "\r\n";
     for (const auto& [name, value] : headers) request << name << ": " << value << "\r\n";
     request << "Content-Length: " << contentLength << "\r\n\r\n";
     const std::string headerBytes = request.str();
     if (!writeAll(fd_, headerBytes.data(), headerBytes.size(), timeoutMs, error)) { cancel(); return false; }
+    ++stats_.requests;
     expectedBytes_ = contentLength;
     sentBytes_ = 0;
     timeoutMs_ = timeoutMs;
+    keepAlive_ = keepAlive;
+    endpointKey_ = endpointKey;
     return true;
 }
 
@@ -159,10 +190,13 @@ bool StreamingRequest::write(const char* bytes, size_t size, std::string& error)
     return true;
 }
 
-bool StreamingRequest::finish(HttpResponse& response, std::string& error) {
+bool StreamingRequest::finish(HttpResponse& response, std::string& error,
+                              uint64_t maxReadBytesPerSecond) {
     if (fd_ < 0 || sentBytes_ != expectedBytes_) { error = "benchmark request body is incomplete"; cancel(); return false; }
-    const bool ok = readResponse(fd_, timeoutMs_, response, error);
-    cancel();
+    const bool ok = readResponse(fd_, timeoutMs_, response, error, maxReadBytesPerSecond);
+    expectedBytes_ = 0;
+    sentBytes_ = 0;
+    if(!ok || !keepAlive_ || response.headers["Connection"] == "close") cancel();
     return ok;
 }
 
@@ -172,6 +206,8 @@ void StreamingRequest::cancel() {
     expectedBytes_ = 0;
     sentBytes_ = 0;
     timeoutMs_ = 0;
+    keepAlive_ = false;
+    endpointKey_.clear();
 }
 
 bool httpRequest(const Endpoint& endpoint, std::string_view method, std::string_view path,

@@ -53,15 +53,28 @@ std::vector<std::string> nodeIds(const PlacementPlan& plan)
 }
 
 bool createObject(GatewayState& state, const std::string& name,
-                  const std::string& directory, FileMeta& file)
+                  const std::string& directory, FileMeta& file,
+                  bool opaque = false, std::string* storageIdentity = nullptr)
 {
     SessionState session;
     if (!state.createSession(name, directory, kChunkSize, kChunkSize, session)) return false;
-    const ChunkRouteRequest request{0, "chunk:" + name, kChunkSize};
+    ChunkRouteRequest request;
+    request.chunkIndex = 0;
+    request.chunkHash = opaque ? std::string(64, 'a') : "chunk:" + name;
+    request.chunkSize = kChunkSize;
+    if (opaque) {
+        request.identityScheme = "opaque-chunk-id";
+        request.checksumType = "crc32c";
+        request.checksumDigest = "e3069283";
+    }
     std::vector<PlacementPlan> plans;
     if (state.planRoutes(session.sessionId, {request}, plans) != RoutePlanStatus::kOk ||
         plans.size() != 1) {
         return false;
+    }
+    if (storageIdentity != nullptr) {
+        *storageIdentity = plans.front().identityScheme == "opaque-chunk-id" ?
+            plans.front().chunkId : request.chunkHash;
     }
     if (state.commitChunk(session.sessionId, 0, request.chunkHash, request.chunkSize,
                           nodeIds(plans.front()), plans.front().leaseId) !=
@@ -81,6 +94,7 @@ int main()
     std::filesystem::remove_all(directory, error);
 
     std::string pendingHash;
+    std::string persistedOpaqueStorageIdentity;
     {
         GatewayState state(directory.string());
         NodeRuntime runtime;
@@ -146,6 +160,33 @@ int main()
         CHECK(!reopened.getObject(nestedOne.objectId, object));
         CHECK(!reopened.getObject(nestedTwo.objectId, object));
         CHECK(reopened.deleteDirectory("/") == DeleteStatus::kInvalidRequest);
+
+        FileMeta opaque;
+        CHECK(createObject(reopened, "opaque.NEF", "/opaque", opaque, true,
+                           &persistedOpaqueStorageIdentity));
+        CHECK(persistedOpaqueStorageIdentity.rfind("chk-", 0) == 0);
+        CHECK(reopened.deleteObject(opaque.objectId) == DeleteStatus::kDeleted);
+        bool foundOpaqueDelete = false;
+        for (const auto& task : reopened.pendingDeletesForNode("node-a")) {
+            if (task.storageIdentity == persistedOpaqueStorageIdentity) {
+                CHECK(task.storageIdentity != task.chunkHash);
+                foundOpaqueDelete = true;
+            }
+        }
+        CHECK(foundOpaqueDelete);
+    }
+
+    {
+        GatewayState reopened(directory.string());
+        CHECK(reopened.open());
+        bool foundOpaqueDelete = false;
+        for (const auto& task : reopened.pendingDeletesForNode("node-a")) {
+            if (task.storageIdentity == persistedOpaqueStorageIdentity) {
+                CHECK(task.storageIdentity != task.chunkHash);
+                foundOpaqueDelete = true;
+            }
+        }
+        CHECK(foundOpaqueDelete);
     }
 
     std::filesystem::remove_all(directory, error);

@@ -2,6 +2,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <chrono>
 #include <condition_variable>
 #include <deque>
 #include <functional>
@@ -32,6 +33,11 @@ public:
         uint64_t activeWorkers = 0;
         uint64_t totalWorkers = 0;
         uint64_t completedTasks = 0;
+        uint64_t startedTasks = 0;
+        uint64_t totalQueueWaitUs = 0;
+        uint64_t maxQueueWaitUs = 0;
+        uint64_t totalWorkUs = 0;
+        uint64_t maxWorkUs = 0;
     };
 
     class BlockLease {
@@ -103,6 +109,7 @@ private:
         SharedBlockPtr sharedBlock;
         SharedWork sharedWork;
         Task task;
+        std::chrono::steady_clock::time_point queuedAt;
     };
 
     void release(uint16_t index);
@@ -120,6 +127,11 @@ private:
     uint64_t peakQueuedTasks_ = 0;
     uint64_t activeWorkers_ = 0;
     uint64_t completedTasks_ = 0;
+    uint64_t startedTasks_ = 0;
+    uint64_t totalQueueWaitUs_ = 0;
+    uint64_t maxQueueWaitUs_ = 0;
+    uint64_t totalWorkUs_ = 0;
+    uint64_t maxWorkUs_ = 0;
 };
 
 }  // namespace miniKV::datanode

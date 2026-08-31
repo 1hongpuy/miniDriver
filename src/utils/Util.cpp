@@ -278,10 +278,28 @@ std::string issueUploadCapability(const UploadCapability& capability,
     }
     std::vector<std::string> targets;
     for (const auto& target : capability.chainTargets) targets.push_back(hexEncode(target));
-    const std::string payload = "v1|" + hexEncode(capability.sessionId) + "|" +
-        std::to_string(capability.chunkIndex) + "|" + hexEncode(capability.chunkHash) + "|" +
-        std::to_string(capability.chunkSize) + "|" + join(targets, ',') + "|" +
-        hexEncode(capability.leaseId) + "|" + std::to_string(capability.expiresAt);
+    std::string payload;
+    if(capability.schemaVersion >= 2) {
+        const std::string chunkId = capability.chunkId.empty()
+            ? capability.chunkHash : capability.chunkId;
+        const std::string checksumDigest = capability.checksumDigest.empty()
+            ? capability.chunkHash : capability.checksumDigest;
+        if(chunkId.empty() || checksumDigest.empty() || capability.identityScheme.empty() ||
+           capability.checksumType.empty() || capability.objectVersion == 0) return {};
+        payload = "v2|" + hexEncode(capability.sessionId) + "|" +
+            std::to_string(capability.chunkIndex) + "|" + hexEncode(capability.chunkHash) + "|" +
+            std::to_string(capability.chunkSize) + "|" + join(targets, ',') + "|" +
+            hexEncode(capability.leaseId) + "|" + std::to_string(capability.expiresAt) + "|" +
+            hexEncode(capability.identityScheme) + "|" + hexEncode(chunkId) + "|" +
+            hexEncode(capability.objectId) + "|" + std::to_string(capability.objectVersion) + "|" +
+            std::to_string(capability.generation) + "|" + hexEncode(capability.checksumType) + "|" +
+            std::to_string(capability.checksumSegmentBytes) + "|" + hexEncode(checksumDigest);
+    } else {
+        payload = "v1|" + hexEncode(capability.sessionId) + "|" +
+            std::to_string(capability.chunkIndex) + "|" + hexEncode(capability.chunkHash) + "|" +
+            std::to_string(capability.chunkSize) + "|" + join(targets, ',') + "|" +
+            hexEncode(capability.leaseId) + "|" + std::to_string(capability.expiresAt);
+    }
     unsigned char signature[EVP_MAX_MD_SIZE];
     unsigned int signatureSize = 0;
     if (HMAC(EVP_sha256(), clusterSecret.data(), static_cast<int>(clusterSecret.size()),
@@ -318,13 +336,17 @@ bool verifyUploadCapability(const std::string& token,
     }
     //获取通信证
     const auto fields = split(payload, '|');
-    if (fields.size() != 8 || fields[0] != "v1") return false;
+    const bool v1 = fields.size() == 8 && fields[0] == "v1";
+    const bool v2 = fields.size() == 16 && fields[0] == "v2";
+    if(!v1 && !v2) return false;
     try {
         if (!hexDecode(fields[1], out.sessionId) || !hexDecode(fields[3], out.chunkHash) ||
             !hexDecode(fields[6], out.leaseId)) {
             return false;
         }
-        out.chunkIndex = static_cast<uint32_t>(std::stoul(fields[2]));
+        const unsigned long chunkIndex = std::stoul(fields[2]);
+        if(chunkIndex > UINT32_MAX) return false;
+        out.chunkIndex = static_cast<uint32_t>(chunkIndex);
         out.chunkSize = std::stoull(fields[4]);
         out.expiresAt = std::stoll(fields[7]);
         for (const auto& item : split(fields[5], ',')) {
@@ -333,18 +355,111 @@ bool verifyUploadCapability(const std::string& token,
             if (!hexDecode(item, target)) return false;
             out.chainTargets.push_back(std::move(target));
         }
+        if(v2) {
+            out.schemaVersion = 2;
+            if(!hexDecode(fields[8], out.identityScheme) ||
+               !hexDecode(fields[9], out.chunkId) ||
+               !hexDecode(fields[10], out.objectId) ||
+               !hexDecode(fields[13], out.checksumType) ||
+               !hexDecode(fields[15], out.checksumDigest)) return false;
+            out.objectVersion = std::stoull(fields[11]);
+            out.generation = std::stoull(fields[12]);
+            const unsigned long segmentBytes = std::stoul(fields[14]);
+            if(segmentBytes > UINT32_MAX) return false;
+            out.checksumSegmentBytes = static_cast<uint32_t>(segmentBytes);
+        } else {
+            out.schemaVersion = 1;
+            out.identityScheme = "cas-sha256";
+            out.chunkId = out.chunkHash;
+            out.objectVersion = 1;
+            out.checksumType = "sha256";
+            out.checksumDigest = out.chunkHash;
+        }
     } catch (...) {
         return false;
     }
     return !out.sessionId.empty() && !out.chunkHash.empty() && out.chunkSize > 0 &&
            !out.chainTargets.empty() && !out.leaseId.empty() &&
+           !out.identityScheme.empty() && !out.chunkId.empty() &&
+           out.objectVersion > 0 && !out.checksumType.empty() &&
+           !out.checksumDigest.empty() &&
+           out.expiresAt >= unixSeconds();
+}
+
+std::string issueReadCapability(const ReadCapability& capability,
+                                const std::string& clusterSecret)
+{
+    if(clusterSecret.empty() || capability.schemaVersion != 1 ||
+       capability.capabilityId.empty() || capability.principalId.empty() ||
+       capability.scope != "object:read" || capability.objectId.empty() ||
+       capability.objectVersion == 0 || capability.storageIdentity.empty() ||
+       capability.expiresAt <= 0) {
+        return {};
+    }
+    const std::string payload = "read-v1|" + hexEncode(capability.capabilityId) + "|" +
+        hexEncode(capability.principalId) + "|" + hexEncode(capability.scope) + "|" +
+        hexEncode(capability.objectId) + "|" + std::to_string(capability.objectVersion) + "|" +
+        hexEncode(capability.storageIdentity) + "|" + std::to_string(capability.expiresAt);
+    unsigned char signature[EVP_MAX_MD_SIZE];
+    unsigned int signatureSize = 0;
+    if(HMAC(EVP_sha256(), clusterSecret.data(), static_cast<int>(clusterSecret.size()),
+            reinterpret_cast<const unsigned char*>(payload.data()), payload.size(),
+            signature, &signatureSize) == nullptr) {
+        return {};
+    }
+    return hexEncode(payload) + "." +
+        hexEncode(std::string(reinterpret_cast<const char*>(signature), signatureSize));
+}
+
+bool verifyReadCapability(const std::string& token,
+                          const std::string& clusterSecret,
+                          ReadCapability& out)
+{
+    out = {};
+    const size_t splitAt = token.find('.');
+    if(splitAt == std::string::npos || splitAt == 0 || splitAt + 1 >= token.size() ||
+       token.size() > 4096 || clusterSecret.empty()) {
+        return false;
+    }
+    std::string payload;
+    std::string signature;
+    if(!hexDecode(token.substr(0, splitAt), payload) ||
+       !hexDecode(token.substr(splitAt + 1), signature)) {
+        return false;
+    }
+    unsigned char expected[EVP_MAX_MD_SIZE];
+    unsigned int expectedSize = 0;
+    if(HMAC(EVP_sha256(), clusterSecret.data(), static_cast<int>(clusterSecret.size()),
+            reinterpret_cast<const unsigned char*>(payload.data()), payload.size(),
+            expected, &expectedSize) == nullptr || signature.size() != expectedSize ||
+       !constantTimeEquals(signature,
+            std::string(reinterpret_cast<const char*>(expected), expectedSize))) {
+        return false;
+    }
+    const auto fields = split(payload, '|');
+    if(fields.size() != 8 || fields[0] != "read-v1") return false;
+    try {
+        out.schemaVersion = 1;
+        if(!hexDecode(fields[1], out.capabilityId) ||
+           !hexDecode(fields[2], out.principalId) ||
+           !hexDecode(fields[3], out.scope) ||
+           !hexDecode(fields[4], out.objectId) ||
+           !hexDecode(fields[6], out.storageIdentity)) {
+            return false;
+        }
+        out.objectVersion = std::stoull(fields[5]);
+        out.expiresAt = std::stoll(fields[7]);
+    } catch(...) {
+        return false;
+    }
+    return !out.capabilityId.empty() && !out.principalId.empty() &&
+           out.scope == "object:read" && !out.objectId.empty() &&
+           out.objectVersion > 0 && !out.storageIdentity.empty() &&
            out.expiresAt >= unixSeconds();
 }
 
 }
 }
-
-
 
 
 

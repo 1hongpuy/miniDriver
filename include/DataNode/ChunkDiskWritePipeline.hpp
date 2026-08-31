@@ -2,7 +2,7 @@
 
 #include "DataNode/DiskWriteExecutor.hpp"
 #include "DataNode/FastDataStore.hpp"
-#include "http/HttpContext.hpp"
+#include "DataNode/ChunkWriteTypes.hpp"
 
 #include <cstddef>
 #include <cstdint>
@@ -27,6 +27,20 @@ public:
         uint64_t peakQueuedBytes = 0;
         uint64_t pauseCount = 0;
         uint64_t pauseNanoseconds = 0;
+        uint64_t submittedBatches = 0;
+        uint64_t submittedBatchBytes = 0;
+        uint64_t peakBatchBytes = 0;
+    };
+
+    enum class WriteMode {
+        kSingleBlock,
+        kPwritev
+    };
+
+    struct Config {
+        WriteMode writeMode = WriteMode::kPwritev;
+        size_t targetBatchBytes = 256 * 1024;
+        uint64_t maxBatchDelayUs = 1000;
     };
 
     static constexpr size_t kHighWatermarkBytes = 1024 * 1024;
@@ -36,9 +50,14 @@ public:
                       DiskWriteExecutor& executor,
                       std::shared_ptr<FastDataStore::WriteSession> writer,
                       ReadyCallback readyCallback);
+    static Ptr create(network::EventLoop* loop,
+                      DiskWriteExecutor& executor,
+                      std::shared_ptr<FastDataStore::WriteSession> writer,
+                      ReadyCallback readyCallback,
+                      Config config);
 
-    http::HttpContext::BodyConsumeResult push(const char* bytes, size_t size,
-                                               DiskWriteExecutor::SharedBlockPtr* sharedBlock = nullptr);
+    StreamConsumeResult push(const char* bytes, size_t size,
+                             DiskWriteExecutor::SharedBlockPtr* sharedBlock = nullptr);
     void finishInput(FinishCallback callback);
     void cancel();
 
@@ -50,14 +69,18 @@ private:
     ChunkDiskWritePipeline(network::EventLoop* loop,
                            DiskWriteExecutor& executor,
                            std::shared_ptr<FastDataStore::WriteSession> writer,
-                           ReadyCallback readyCallback);
+                           ReadyCallback readyCallback,
+                           Config config);
 
     struct PendingBlock {
         DiskWriteExecutor::SharedBlockPtr block;
         size_t size = 0;
     };
 
-    void scheduleNextAppend();
+    void scheduleNextAppend(bool force = false);
+    void scheduleBatchDelay();
+    void cancelBatchDelay();
+    void onBatchDelay();
     void onAppendComplete(bool success, size_t size);
     void maybeFinish();
     void onFinishComplete(bool success, bool alreadyExists);
@@ -68,6 +91,7 @@ private:
     network::EventLoop* loop_;
     DiskWriteExecutor& executor_;
     std::shared_ptr<FastDataStore::WriteSession> writer_;
+    Config config_;
     ReadyCallback readyCallback_;
     FinishCallback finishCallback_;
     std::deque<PendingBlock> pendingBlocks_;
@@ -80,6 +104,7 @@ private:
     bool cancelled_ = false;
     bool paused_ = false;
     bool blockCheckScheduled_ = false;
+    int batchTimerId_ = -1;
     int64_t pauseStartedAtNanoseconds_ = 0;
 };
 

@@ -43,10 +43,12 @@ struct ChunkCommit {
     uint64_t size = 0;
     std::vector<std::string> successfulNodes;
     std::string uploadToken;
+    std::string requestId;
 };
 
 struct LeaseRelease {
     std::string uploadToken;
+    std::string requestId;
 };
 
 class GatewayControlClient {

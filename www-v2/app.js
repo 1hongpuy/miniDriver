@@ -46,7 +46,10 @@
     requestId: 0, renderId: 0, thumbnailUrls: new Map(),
   };
   const previewState = { object: null, url: null, scale: 1, image: null, requestId: 0 };
-  const aiSearch = { activeTags: new Set(), requestId: 0, results: [] };
+  const aiSearch = {
+    activeTags: new Set(), requestId: 0, results: [], query: "", nextCursor: null,
+    totalCandidates: 0, loadingMore: false,
+  };
   let mediaRefreshTimer = null;
 
   function formatBytes(bytes) {
@@ -159,6 +162,29 @@
       grid.append(card);
     }
     aiSearchResults.append(grid);
+    if (aiSearch.nextCursor) {
+      const more = document.createElement("button");
+      more.type = "button";
+      more.className = "command-button ai-search__more";
+      more.textContent = aiSearch.loadingMore ? "正在加载…" : "加载更多结果";
+      more.disabled = aiSearch.loadingMore;
+      more.addEventListener("click", () => loadMoreAiSearch().catch((error) => {
+        setAiSearchState("服务不可用", "error");
+        aiSearchHint.textContent = `无法继续加载：${error.message}`;
+      }));
+      aiSearchResults.append(more);
+    }
+  }
+
+  async function requestAiSearchPage(query, cursor = null) {
+    const body = { query, page_size: 9 };
+    if (cursor) body.cursor = cursor;
+    return aiRequest("/ai/search", { method: "POST", body: JSON.stringify(body) });
+  }
+
+  function mergeAiSearchResults(previous, incoming) {
+    const known = new Set(previous.map((result) => String(result.asset_id)));
+    return previous.concat((incoming || []).filter((result) => !known.has(String(result.asset_id))));
   }
 
   async function runAiSearch() {
@@ -171,19 +197,21 @@
     }
     const requestId = aiSearch.requestId + 1;
     aiSearch.requestId = requestId;
+    aiSearch.loadingMore = false;
+    aiSearch.nextCursor = null;
     aiSearchSubmit.disabled = true;
     setAiSearchState("正在检索", "loading");
     aiSearchHint.textContent = `正在通过 ${AI_API} 查询已索引素材。`;
     aiSearchResults.replaceChildren(emptyState("AI 正在比对图文向量与素材元数据。"));
     try {
-      const response = await aiRequest("/ai/search", {
-        method: "POST",
-        body: JSON.stringify({ query, top_k: 9 }),
-      });
+      const response = await requestAiSearchPage(query);
       if (requestId !== aiSearch.requestId) return;
       aiSearch.results = response.results || [];
-      setAiSearchState(`${aiSearch.results.length} 个结果`, "ready");
-      aiSearchHint.textContent = `查询“${response.query || query}”完成；结果来自已完成 AI 索引的素材。`;
+      aiSearch.query = response.query || query;
+      aiSearch.nextCursor = response.page?.next_cursor || null;
+      aiSearch.totalCandidates = Number(response.page?.total_candidates || aiSearch.results.length);
+      setAiSearchState(`${aiSearch.results.length}/${aiSearch.totalCandidates} 个结果`, "ready");
+      aiSearchHint.textContent = `查询“${aiSearch.query}”完成（${Number(response.query_latency_ms || 0).toFixed(1)} ms）；结果来自跨目录的已完成 AI 索引素材。`;
       renderAiSearchResults(aiSearch.results);
     } catch (error) {
       if (requestId !== aiSearch.requestId) return;
@@ -192,6 +220,27 @@
       aiSearchResults.replaceChildren(emptyState("先启动 ai-app-lite API 与 Worker，再重新检索。"));
     } finally {
       if (requestId === aiSearch.requestId) aiSearchSubmit.disabled = false;
+    }
+  }
+
+  async function loadMoreAiSearch() {
+    if (aiSearch.loadingMore || !aiSearch.nextCursor || !aiSearch.query) return;
+    const requestId = aiSearch.requestId;
+    aiSearch.loadingMore = true;
+    renderAiSearchResults(aiSearch.results);
+    try {
+      const response = await requestAiSearchPage(aiSearch.query, aiSearch.nextCursor);
+      if (requestId !== aiSearch.requestId) return;
+      aiSearch.results = mergeAiSearchResults(aiSearch.results, response.results);
+      aiSearch.nextCursor = response.page?.next_cursor || null;
+      aiSearch.totalCandidates = Number(response.page?.total_candidates || aiSearch.totalCandidates);
+      setAiSearchState(`${aiSearch.results.length}/${aiSearch.totalCandidates} 个结果`, "ready");
+      aiSearchHint.textContent = `已加载跨目录检索结果；排序按相似度和对象 ID 固定。`;
+    } finally {
+      if (requestId === aiSearch.requestId) {
+        aiSearch.loadingMore = false;
+        renderAiSearchResults(aiSearch.results);
+      }
     }
   }
 
@@ -335,12 +384,32 @@
     return [h0,h1,h2,h3,h4,h5,h6,h7].map((value) => value.toString(16).padStart(8, "0")).join("");
   }
 
+  const crc32cTable = (() => {
+    const table = new Uint32Array(256);
+    for (let value = 0; value < 256; value += 1) {
+      let crc = value;
+      for (let bit = 0; bit < 8; bit += 1) {
+        crc = (crc >>> 1) ^ ((crc & 1) ? 0x82f63b78 : 0);
+      }
+      table[value] = crc >>> 0;
+    }
+    return table;
+  })();
+
+  async function crc32c(blob) {
+    const bytes = new Uint8Array(await blob.arrayBuffer());
+    let crc = 0xffffffff;
+    for (const byte of bytes) crc = crc32cTable[(crc ^ byte) & 0xff] ^ (crc >>> 8);
+    return ((crc ^ 0xffffffff) >>> 0).toString(16).padStart(8, "0");
+  }
+
   function routeChain(route) { return route.chain.map((node) => `${node.nodeId}@${node.address}:${node.httpPort}`).join(";"); }
 
   function uploadChunk(route, chunk, index, onProgress) {
     return new Promise((resolve, reject) => {
       const xhr = new XMLHttpRequest();
-      xhr.open("PUT", `http://${route.primaryAddress}:${route.primaryPort}/v2/chunks/${route.chunkHash}`);
+      const storageIdentity = route.storageIdentity || route.chunkHash;
+      xhr.open("PUT", `http://${route.primaryAddress}:${route.primaryPort}/v2/chunks/${storageIdentity}`);
       xhr.setRequestHeader("Content-Type", "application/octet-stream");
       xhr.setRequestHeader("X-Session-Id", route.sessionId);
       xhr.setRequestHeader("X-Chunk-Index", String(index));
@@ -470,7 +539,12 @@
         updateProgress("分配");
         let uploadError = null;
         try {
-          const routeBody = { chunks: [{ index, hash: descriptor.hash, size: descriptor.size }] };
+          const checksumType = session.checksumType || "sha256";
+          const checksumDigest = checksumType === "crc32c" ? await crc32c(chunk) : descriptor.hash;
+          const routeBody = { chunks: [{
+            index, hash: descriptor.hash, size: descriptor.size,
+            checksumType, checksumDigest,
+          }] };
           const routes = await request(`/upload/sessions/${session.sessionId}/routes`, {
             method: "POST", body: JSON.stringify(routeBody),
           });
@@ -553,7 +627,8 @@
   async function fetchVerifiedChunk(chunk, onBytes = () => {}) {
     const replica = chunk.replicas && chunk.replicas[0];
     if (!replica) throw new Error(`Chunk ${chunk.index} 没有可读副本`);
-    const response = await fetch(`http://${replica.address}:${replica.httpPort}/v2/chunks/${chunk.hash}`);
+    const storageIdentity = chunk.storageIdentity || chunk.hash;
+    const response = await fetch(`http://${replica.address}:${replica.httpPort}/v2/chunks/${storageIdentity}`);
     if (!response.ok) throw new Error(`Chunk ${chunk.index} 下载失败: HTTP ${response.status}`);
     if (!response.body) throw new Error(`Chunk ${chunk.index} 下载响应没有 body stream`);
     const reader = response.body.getReader();

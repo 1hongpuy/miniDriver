@@ -15,7 +15,7 @@ EncodedControlRequest makeNodeRegistrationRequest(const NodeRegistration& reques
             ",\"maxStorageBytes\":" + std::to_string(request.maxStorageBytes) +
             ",\"reservedBytes\":" + std::to_string(request.reservedBytes) +
             ",\"maxConcurrentWrites\":" + std::to_string(request.maxConcurrentWrites) +
-            ",\"capabilities\":\"" + jsonEscape(join(request.capabilities, ',')) + "\"}"};
+            ",\"capabilities\":\"" + jsonEscape(join(request.capabilities, ',')) + "\"}", {}};
 }
 
 EncodedControlRequest makeHeartbeatRequest(const NodeHeartbeat& request)
@@ -27,7 +27,7 @@ EncodedControlRequest makeHeartbeatRequest(const NodeHeartbeat& request)
             ",\"memoryPermille\":" + std::to_string(request.memoryPermille) +
             ",\"diskIoPermille\":" + std::to_string(request.diskIoPermille) +
             ",\"netOutMbps\":" + std::to_string(request.netOutMbps) +
-            ",\"activeUploads\":" + std::to_string(request.activeUploads) + "}"};
+            ",\"activeUploads\":" + std::to_string(request.activeUploads) + "}", {}};
 }
 
 EncodedControlRequest makeChunkCommitRequest(const ChunkCommit& request)
@@ -38,13 +38,15 @@ EncodedControlRequest makeChunkCommitRequest(const ChunkCommit& request)
             ",\"chunkHash\":\"" + jsonEscape(request.chunkHash) +
             "\",\"size\":" + std::to_string(request.size) +
             ",\"successfulNodes\":\"" + jsonEscape(join(request.successfulNodes, ',')) +
-            "\",\"uploadToken\":\"" + jsonEscape(request.uploadToken) + "\"}"};
+            "\",\"uploadToken\":\"" + jsonEscape(request.uploadToken) + "\"}",
+            request.requestId};
 }
 
 EncodedControlRequest makeLeaseReleaseRequest(const LeaseRelease& request)
 {
     return {"POST", "/internal/v2/lease-releases",
-            "{\"uploadToken\":\"" + jsonEscape(request.uploadToken) + "\"}"};
+            "{\"uploadToken\":\"" + jsonEscape(request.uploadToken) + "\"}",
+            request.requestId};
 }
 
 }  // namespace miniKV::v2

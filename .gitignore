@@ -5,6 +5,11 @@ CMakeLists.txt.user
 data/
 file/
 tunnel.log
+测试/
+.codojo/
+ai-app-lite/.venv/
+ai-app-lite/.env
+__pycache__/
 
 # Runtime state, deployment secrets, and diagnostics must stay local.
 run/
@@ -27,8 +32,5 @@ reference_impl/
 *.o
 *.a
 *.so
-
-
-
 
 

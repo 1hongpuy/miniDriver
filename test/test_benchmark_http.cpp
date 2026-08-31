@@ -30,13 +30,22 @@ public:
         thread_ = std::thread([this] {
             const int peer = ::accept(fd_, nullptr, nullptr);
             MINIKV_CHECK(peer >= 0);
-            char buffer[1024];
-            ::recv(peer, buffer, sizeof(buffer), 0);
-            const char first[] = "HTTP/1.1 200 OK\r\nContent-Length: 3\r\nX-Test: yes\r\n\r\n";
-            MINIKV_CHECK(::send(peer, first, sizeof(first) - 1, MSG_NOSIGNAL) > 0);
-            std::this_thread::sleep_for(std::chrono::milliseconds(20));
-            MINIKV_CHECK(::send(peer, "abc", 3, MSG_NOSIGNAL) == 3);
-            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            for (int request = 0; request < 2; ++request) {
+                std::string headers;
+                char buffer[256];
+                while (headers.find("\r\n\r\n") == std::string::npos) {
+                    const ssize_t received = ::recv(peer, buffer, sizeof(buffer), 0);
+                    MINIKV_CHECK(received > 0);
+                    headers.append(buffer, static_cast<size_t>(received));
+                }
+                const char first[] = "HTTP/1.1 200 OK\r\nContent-Length: 3\r\n"
+                    "X-Test: yes\r\nConnection: keep-alive\r\n\r\n";
+                MINIKV_CHECK(::send(peer, first, sizeof(first) - 1, MSG_NOSIGNAL) > 0);
+                std::this_thread::sleep_for(std::chrono::milliseconds(5));
+                const char body = request == 0 ? 'a' : 'x';
+                MINIKV_CHECK(::send(peer, &body, 1, MSG_NOSIGNAL) == 1);
+                MINIKV_CHECK(::send(peer, request == 0 ? "bc" : "yz", 2, MSG_NOSIGNAL) == 2);
+            }
             ::close(peer);
         });
     }
@@ -58,15 +67,23 @@ private:
 
 int main() {
     FragmentedServer server;
+    miniKV::benchmark::StreamingRequest request;
     miniKV::benchmark::HttpResponse response;
     std::string error;
-    const bool ok = miniKV::benchmark::httpRequest(
-        {"127.0.0.1", server.port()}, "GET", "/test", {}, "", 1000, response, error);
-    MINIKV_CHECK(ok);
+    const miniKV::benchmark::Endpoint endpoint{"127.0.0.1", server.port()};
+    MINIKV_CHECK(request.open(endpoint, "GET", "/first", {}, 0, 1000, error, true));
+    MINIKV_CHECK(request.write(nullptr, 0, error));
+    MINIKV_CHECK(request.finish(response, error));
     MINIKV_CHECK(error.empty());
     MINIKV_CHECK(response.status == 200);
     MINIKV_CHECK(response.headers.at("Content-Length") == "3");
     MINIKV_CHECK(response.body == "abc");
-    std::cout << "PASS: benchmark HTTP client reads Content-Length response\n";
+    miniKV::benchmark::HttpResponse second;
+    MINIKV_CHECK(request.open(endpoint, "GET", "/second", {}, 0, 1000, error, true));
+    MINIKV_CHECK(request.write(nullptr, 0, error));
+    MINIKV_CHECK(request.finish(second, error));
+    MINIKV_CHECK(second.status == 200);
+    MINIKV_CHECK(second.body == "xyz");
+    std::cout << "PASS: benchmark HTTP client reads fragmented keep-alive responses\n";
     return 0;
 }

@@ -14,6 +14,7 @@ int main()
 {
     using miniKV::datanode::ChunkDiskWritePipeline;
     using miniKV::datanode::DiskWriteExecutor;
+    using miniKV::datanode::StreamConsumeResult;
 
     const std::filesystem::path directory =
         std::filesystem::temp_directory_path() / "minikv_chunk_disk_pipeline_test";
@@ -21,14 +22,15 @@ int main()
     std::filesystem::remove_all(directory, error);
 
     const std::string bytes(2 * DiskWriteExecutor::kBlockBytes, 'p');
-    const std::string hash = miniKV::util::sha256Hex(bytes.data(), bytes.size());
+    const std::string pipelineBytes(2 * DiskWriteExecutor::kBlockBytes + 123, 'v');
+    const std::string hash = miniKV::util::sha256Hex(pipelineBytes.data(), pipelineBytes.size());
 
     miniKV::datanode::FastDataStore store(directory.string());
     if(!store.open()) {
         std::cerr << "FAIL: cannot open test data store\n";
         return 1;
     }
-    auto session = store.beginPut(hash, bytes.size());
+    auto session = store.beginPut(hash, pipelineBytes.size());
     if(session == nullptr) {
         std::cerr << "FAIL: cannot create write session\n";
         return 1;
@@ -45,23 +47,31 @@ int main()
 
     std::promise<bool> finished;
     std::atomic<bool> pushed{false};
+    ChunkDiskWritePipeline::Ptr completedPipeline;
     loop.queueInLoop([&] {
-        auto pipeline = ChunkDiskWritePipeline::create(
+        completedPipeline = ChunkDiskWritePipeline::create(
             &loop, executor,
             std::shared_ptr<miniKV::datanode::FastDataStore::WriteSession>(std::move(session)),
             [] {});
-        if(!pipeline ||
-           pipeline->push(bytes.data(), DiskWriteExecutor::kBlockBytes) !=
-               miniKV::http::HttpContext::BodyConsumeResult::kContinue ||
-           pipeline->push(bytes.data() + DiskWriteExecutor::kBlockBytes,
-                          DiskWriteExecutor::kBlockBytes) !=
-               miniKV::http::HttpContext::BodyConsumeResult::kContinue) {
+        const size_t first = 17 * 1024;
+        const size_t second = 47 * 1024;
+        const size_t third = DiskWriteExecutor::kBlockBytes;
+        const size_t fourth = pipelineBytes.size() - first - second - third;
+        if(!completedPipeline ||
+           completedPipeline->push(pipelineBytes.data(), first) !=
+               StreamConsumeResult::kContinue ||
+           completedPipeline->push(pipelineBytes.data() + first, second) !=
+               StreamConsumeResult::kContinue ||
+           completedPipeline->push(pipelineBytes.data() + first + second, third) !=
+               StreamConsumeResult::kContinue ||
+           completedPipeline->push(pipelineBytes.data() + first + second + third, fourth) !=
+               StreamConsumeResult::kContinue) {
             finished.set_value(false);
             loop.quit();
             return;
         }
         pushed.store(true);
-        pipeline->finishInput([&finished, &loop](bool success, bool alreadyExists) {
+        completedPipeline->finishInput([&finished, &loop](bool success, bool alreadyExists) {
             finished.set_value(success && !alreadyExists);
             loop.quit();
         });
@@ -70,7 +80,11 @@ int main()
     auto result = finished.get_future();
     const auto waitStatus = result.wait_for(std::chrono::seconds(3));
     const bool succeeded = waitStatus == std::future_status::ready && result.get();
-    if(!succeeded || !pushed.load()) {
+    if(!succeeded || !pushed.load() || completedPipeline == nullptr ||
+       completedPipeline->metrics().submittedBatches != 1 ||
+       completedPipeline->metrics().submittedBatchBytes != pipelineBytes.size() ||
+       completedPipeline->writeMetrics().pwritevOperations != 1 ||
+       completedPipeline->writeMetrics().pwriteOperations != 0) {
         std::cerr << "FAIL: disk pipeline did not serialize and finish the chunk"
                   << " ready=" << (waitStatus == std::future_status::ready)
                   << " success=" << succeeded
@@ -82,10 +96,115 @@ int main()
     loopThread.join();
 
     std::string read;
-    if(!store.get(hash, read) || read != bytes) {
+    if(!store.get(hash, read) || read != pipelineBytes) {
         std::cerr << "FAIL: completed pipeline chunk is not readable\n";
         return 1;
     }
+
+    const std::string fallbackBytes(2 * DiskWriteExecutor::kBlockBytes, 's');
+    const std::string fallbackHash = miniKV::util::sha256Hex(
+        fallbackBytes.data(), fallbackBytes.size());
+    auto fallbackSession = store.beginPut(fallbackHash, fallbackBytes.size());
+    if(fallbackSession == nullptr) {
+        std::cerr << "FAIL: cannot create single-block fallback session\n";
+        return 1;
+    }
+    miniKV::network::EventLoop fallbackLoop;
+    std::thread fallbackLoopThread([&fallbackLoop] { fallbackLoop.loop(); });
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    std::promise<bool> fallbackFinished;
+    ChunkDiskWritePipeline::Ptr fallbackPipeline;
+    fallbackLoop.queueInLoop([&] {
+        ChunkDiskWritePipeline::Config pipelineConfig;
+        pipelineConfig.writeMode = ChunkDiskWritePipeline::WriteMode::kSingleBlock;
+        fallbackPipeline = ChunkDiskWritePipeline::create(
+            &fallbackLoop, executor,
+            std::shared_ptr<miniKV::datanode::FastDataStore::WriteSession>(
+                std::move(fallbackSession)),
+            [] {}, pipelineConfig);
+        if(!fallbackPipeline ||
+           fallbackPipeline->push(fallbackBytes.data(), DiskWriteExecutor::kBlockBytes) !=
+               StreamConsumeResult::kContinue ||
+           fallbackPipeline->push(fallbackBytes.data() + DiskWriteExecutor::kBlockBytes,
+                                  DiskWriteExecutor::kBlockBytes) !=
+               StreamConsumeResult::kContinue) {
+            fallbackFinished.set_value(false);
+            fallbackLoop.quit();
+            return;
+        }
+        fallbackPipeline->finishInput(
+            [&fallbackFinished, &fallbackLoop](bool success, bool alreadyExists) {
+                fallbackFinished.set_value(success && !alreadyExists);
+                fallbackLoop.quit();
+            });
+    });
+    auto fallbackResult = fallbackFinished.get_future();
+    if(fallbackResult.wait_for(std::chrono::seconds(3)) != std::future_status::ready ||
+       !fallbackResult.get()) {
+        std::cerr << "FAIL: single-block fallback pipeline did not finish\n";
+        fallbackLoop.quit();
+        fallbackLoopThread.join();
+        return 1;
+    }
+    fallbackLoopThread.join();
+    if(fallbackPipeline == nullptr || fallbackPipeline->metrics().submittedBatches != 2 ||
+       fallbackPipeline->writeMetrics().pwriteOperations != 2 ||
+       fallbackPipeline->writeMetrics().pwritevOperations != 0 ||
+       !store.get(fallbackHash, read) || read != fallbackBytes) {
+        std::cerr << "FAIL: single-block pwrite fallback changed behavior\n";
+        return 1;
+    }
+
+    const std::string delayedBytes(31 * 1024, 't');
+    const std::string delayedHash = miniKV::util::sha256Hex(
+        delayedBytes.data(), delayedBytes.size());
+    auto delayedSession = store.beginPut(delayedHash, delayedBytes.size());
+    if(delayedSession == nullptr) {
+        std::cerr << "FAIL: cannot create delayed batch session\n";
+        return 1;
+    }
+    miniKV::network::EventLoop delayedLoop;
+    std::thread delayedLoopThread([&delayedLoop] { delayedLoop.loop(); });
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    std::promise<bool> delayedFinished;
+    ChunkDiskWritePipeline::Ptr delayedPipeline;
+    const uint64_t delayedTaskBaseline = executor.metrics().completedTasks;
+    delayedLoop.queueInLoop([&] {
+        ChunkDiskWritePipeline::Config pipelineConfig;
+        pipelineConfig.targetBatchBytes = 256 * 1024;
+        pipelineConfig.maxBatchDelayUs = 1000;
+        delayedPipeline = ChunkDiskWritePipeline::create(
+            &delayedLoop, executor,
+            std::shared_ptr<miniKV::datanode::FastDataStore::WriteSession>(
+                std::move(delayedSession)),
+            [] {}, pipelineConfig);
+        if(!delayedPipeline ||
+           delayedPipeline->push(delayedBytes.data(), delayedBytes.size()) !=
+               StreamConsumeResult::kContinue) {
+            delayedFinished.set_value(false);
+            delayedLoop.quit();
+            return;
+        }
+        delayedLoop.runAfter(25, [&] {
+            const bool flushedBeforeFinish =
+                executor.metrics().completedTasks > delayedTaskBaseline;
+            delayedPipeline->finishInput(
+                [&delayedFinished, &delayedLoop, flushedBeforeFinish](
+                    bool success, bool alreadyExists) {
+                    delayedFinished.set_value(flushedBeforeFinish && success && !alreadyExists);
+                    delayedLoop.quit();
+                });
+        });
+    });
+    auto delayedResult = delayedFinished.get_future();
+    if(delayedResult.wait_for(std::chrono::seconds(3)) != std::future_status::ready ||
+       !delayedResult.get()) {
+        std::cerr << "FAIL: sub-threshold batch was not flushed by its deadline\n";
+        delayedLoop.quit();
+        delayedLoopThread.join();
+        return 1;
+    }
+    delayedLoopThread.join();
 
     DiskWriteExecutor::Config pausedConfig;
     pausedConfig.workerCount = 1;
@@ -117,12 +236,12 @@ int main()
             &pausedLoop, pausedExecutor,
             std::shared_ptr<miniKV::datanode::FastDataStore::WriteSession>(std::move(pausedSession)),
             [] {});
-        auto result = miniKV::http::HttpContext::BodyConsumeResult::kContinue;
+        auto result = StreamConsumeResult::kContinue;
         for(size_t i = 0; i < 16; ++i) {
             result = pipeline->push(bytes.data(), DiskWriteExecutor::kBlockBytes);
         }
         const bool hitHighWatermark =
-            result == miniKV::http::HttpContext::BodyConsumeResult::kPause &&
+            result == StreamConsumeResult::kPause &&
             pipeline->metrics().queuedBytes == 16 * DiskWriteExecutor::kBlockBytes &&
             pipeline->metrics().pauseCount == 1;
         pipeline->cancel();
@@ -177,8 +296,8 @@ int main()
                                            DiskWriteExecutor::kBlockBytes);
         pipeline->cancel();
         pausedBeforeConsume.set_value(
-            first == miniKV::http::HttpContext::BodyConsumeResult::kContinue &&
-            second == miniKV::http::HttpContext::BodyConsumeResult::kPauseBeforeConsume);
+            first == StreamConsumeResult::kContinue &&
+            second == StreamConsumeResult::kPauseBeforeConsume);
         exhaustedLoop.quit();
     });
     auto exhaustedResult = pausedBeforeConsume.get_future();

@@ -2,6 +2,7 @@
 
 #include "benchmark/BenchmarkHttpClient.hpp"
 #include "benchmark/BenchmarkInput.hpp"
+#include "client/MiniDriverClient.hpp"
 #include "utils/Util.hpp"
 
 #include <algorithm>
@@ -18,6 +19,7 @@
 #include <set>
 #include <sstream>
 #include <thread>
+#include <utility>
 
 namespace miniKV::benchmark {
 namespace {
@@ -25,6 +27,12 @@ namespace {
 constexpr size_t kBufferBytes = 64 * 1024;
 constexpr int kGatewayTimeoutMs = 30000;
 constexpr int kDataNodeTimeoutMs = 60000;
+
+struct DownloadTransportStats {
+    uint64_t connectionOpens = 0;
+    uint64_t requests = 0;
+    uint64_t connectionReuses = 0;
+};
 
 class ChunkBudget {
 public:
@@ -102,8 +110,37 @@ bool sha256File(const std::filesystem::path& path, std::string& hash, std::strin
     return true;
 }
 
-bool sha256Range(std::ifstream& input, uint64_t offset, uint64_t length,
-                 std::string& hash, std::string& error) {
+uint32_t updateCrc32c(uint32_t crc, const char* bytes, size_t size)
+{
+    static const std::array<uint32_t, 256> table = [] {
+        std::array<uint32_t, 256> values{};
+        for(uint32_t index = 0; index < values.size(); ++index) {
+            uint32_t value = index;
+            for(unsigned int bit = 0; bit < 8; ++bit) {
+                value = (value >> 1) ^ ((value & 1U) ? 0x82f63b78U : 0U);
+            }
+            values[index] = value;
+        }
+        return values;
+    }();
+    for(size_t index = 0; index < size; ++index) {
+        crc = table[(crc ^ static_cast<uint8_t>(bytes[index])) & 0xffU] ^ (crc >> 8);
+    }
+    return crc;
+}
+
+std::string uint32Hex(uint32_t value)
+{
+    static constexpr char digits[] = "0123456789abcdef";
+    std::string result(8, '0');
+    for(size_t index = 0; index < result.size(); ++index) {
+        result[index] = digits[(value >> ((7 - index) * 4)) & 0x0fU];
+    }
+    return result;
+}
+
+bool chunkDigestsRange(std::ifstream& input, uint64_t offset, uint64_t length,
+                       std::string& hash, std::string& crc32c, std::string& error) {
     input.clear();
     input.seekg(static_cast<std::streamoff>(offset));
     if (!input) { error = "cannot seek benchmark input"; return false; }
@@ -115,6 +152,7 @@ bool sha256Range(std::ifstream& input, uint64_t offset, uint64_t length,
     }
     std::array<char, kBufferBytes> buffer{};
     uint64_t remaining = length;
+    uint32_t crc = 0xffffffffU;
     while (remaining > 0) {
         const size_t wanted = static_cast<size_t>(std::min<uint64_t>(remaining, buffer.size()));
         input.read(buffer.data(), static_cast<std::streamsize>(wanted));
@@ -122,6 +160,7 @@ bool sha256Range(std::ifstream& input, uint64_t offset, uint64_t length,
             EVP_DigestUpdate(context, buffer.data(), wanted) != 1) {
             EVP_MD_CTX_free(context); error = "cannot hash benchmark input range"; return false;
         }
+        crc = updateCrc32c(crc, buffer.data(), wanted);
         remaining -= wanted;
     }
     unsigned char digest[EVP_MAX_MD_SIZE];
@@ -136,6 +175,7 @@ bool sha256Range(std::ifstream& input, uint64_t offset, uint64_t length,
         hash += digits[(digest[i] >> 4) & 0x0f];
         hash += digits[digest[i] & 0x0f];
     }
+    crc32c = uint32Hex(crc ^ 0xffffffffU);
     return true;
 }
 
@@ -224,10 +264,12 @@ bool uploadOneChunk(const BenchmarkOptions& options, const std::filesystem::path
     std::ifstream input(inputPath, std::ios::binary);
     if (!input) { error = "cannot reopen benchmark input for chunk"; return false; }
     std::string chunkHash;
-    if (!sha256Range(input, offset, bytes, chunkHash, error)) return false;
+    std::string chunkCrc32c;
+    if (!chunkDigestsRange(input, offset, bytes, chunkHash, chunkCrc32c, error)) return false;
     HttpResponse routeResponse;
     const std::string routeBody = "{\"chunks\":[{\"index\":" + std::to_string(index) +
-        ",\"hash\":\"" + chunkHash + "\",\"size\":" + std::to_string(bytes) + "}]}";
+        ",\"hash\":\"" + chunkHash + "\",\"size\":" + std::to_string(bytes) +
+        ",\"checksumType\":\"crc32c\",\"checksumDigest\":\"" + chunkCrc32c + "\"}]}";
     if (!gatewayRequest(options.gateway, "POST", "/api/v2/upload/sessions/" + sessionId + "/routes",
                         routeBody, routeResponse, error)) return false;
     const std::vector<std::string> routes = miniKV::util::jsonObjectArray(routeResponse.body, "routes");
@@ -236,6 +278,8 @@ bool uploadOneChunk(const BenchmarkOptions& options, const std::filesystem::path
     Endpoint primary{miniKV::util::jsonString(routes[0], "primaryAddress"),
                      static_cast<uint16_t>(miniKV::util::jsonUint(routes[0], "primaryPort"))};
     const std::string uploadToken = miniKV::util::jsonString(routes[0], "uploadToken");
+    std::string storageIdentity = miniKV::util::jsonString(routes[0], "storageIdentity");
+    if(storageIdentity.empty()) storageIdentity = chunkHash;
     std::string chain;
     if (primaryNodeId.empty() || primary.host.empty() || primary.port == 0 || uploadToken.empty() ||
         !makeRouteChain(routes[0], chain, error)) {
@@ -248,67 +292,58 @@ bool uploadOneChunk(const BenchmarkOptions& options, const std::filesystem::path
         {"X-Gateway-Address", options.gateway.host}, {"X-Gateway-Port", std::to_string(options.gateway.port)},
         {"X-Replica-Chain", chain}, {"X-Replica-Position", "0"}, {"X-Upload-Token", uploadToken},
     };
-    return uploadRange(input, offset, bytes, primary, "/v2/chunks/" + chunkHash, headers, error);
+    return uploadRange(input, offset, bytes, primary,
+                       "/v2/chunks/" + storageIdentity, headers, error);
 }
 
-bool downloadFile(const Endpoint& gateway, const std::string& fileHash,
+bool downloadFile(const miniKV::client::ClientConfig& config, bool sdkReadPlan,
+                  const std::string& fileHash, const miniKV::client::ObjectRef& object,
                   const std::filesystem::path& outputPath, uint32_t& chunkCount,
-                  std::string& error) {
-    HttpResponse manifest;
-    if (!gatewayRequest(gateway, "GET", "/api/v2/files/" + fileHash + "/manifest", "", manifest, error)) return false;
-    const std::vector<std::string> chunks = miniKV::util::jsonObjectArray(manifest.body, "chunks");
-    if (chunks.empty()) { error = "manifest has no chunks"; return false; }
-    std::ofstream output(outputPath, std::ios::binary | std::ios::trunc);
-    if (!output) { error = "cannot create " + outputPath.string(); return false; }
-    chunkCount = static_cast<uint32_t>(chunks.size());
-    for (size_t index = 0; index < chunks.size(); ++index) {
-        const std::string chunkHash = miniKV::util::jsonString(chunks[index], "hash");
-        bool read = false;
-        std::string lastError;
-        for (const std::string& replica : miniKV::util::jsonObjectArray(chunks[index], "replicas")) {
-            Endpoint endpoint{miniKV::util::jsonString(replica, "address"),
-                              static_cast<uint16_t>(miniKV::util::jsonUint(replica, "httpPort"))};
-            HttpResponse response;
-            std::string requestError;
-            if (endpoint.host.empty() || endpoint.port == 0 ||
-                !httpRequest(endpoint, "GET", "/v2/chunks/" + chunkHash, {}, "", kDataNodeTimeoutMs,
-                             response, requestError)) {
-                lastError = requestError;
-                continue;
-            }
-            if (response.status != 200) {
-                lastError = "HTTP " + std::to_string(response.status);
-                continue;
-            }
-            if (miniKV::util::sha256Hex(response.body.data(), response.body.size()) != chunkHash) {
-                lastError = "SHA-256 mismatch";
-                continue;
-            }
-            output.write(response.body.data(), static_cast<std::streamsize>(response.body.size()));
-            if (!output) { error = "cannot write downloaded chunk"; return false; }
-            read = true;
-            break;
-        }
-        if (!read) {
-            error = "cannot download chunk " + std::to_string(index) + ": " + lastError;
-            return false;
-        }
+                  bool keepAlive, bool transportOnly, DownloadTransportStats& transportStats,
+                  std::string& error, uint64_t maxReadBytesPerSecond = 0,
+                  miniKV::client::MiniDriverClient* persistentClient = nullptr) {
+    miniKV::client::MiniDriverClient localClient(config);
+    miniKV::client::MiniDriverClient& client = persistentClient != nullptr
+        ? *persistentClient : localClient;
+    miniKV::client::ObjectReadPlan plan;
+    if (sdkReadPlan) {
+        if (!client.getReadPlan(object, plan, error)) return false;
+    } else {
+        if (!client.getLegacyManifest(fileHash, plan, error)) return false;
     }
+    chunkCount = static_cast<uint32_t>(plan.chunks.size());
+    miniKV::client::TransferStats stats;
+    miniKV::client::ReadOptions readOptions;
+    readOptions.keepAlive = keepAlive;
+    readOptions.maxReadBytesPerSecond = maxReadBytesPerSecond;
+    if (transportOnly) {
+        if (!client.downloadToSink(plan, readOptions, stats, error)) return false;
+    } else if (!client.downloadToFile(plan, outputPath, readOptions, stats, error)) return false;
+    transportStats.connectionOpens = stats.dataConnectionOpens;
+    transportStats.requests = stats.dataRequests;
+    transportStats.connectionReuses = stats.dataConnectionReuses;
     return true;
 }
 
 RunRecord runDownloadOne(const BenchmarkOptions& options, const RunRecord& fixture,
-                         std::ostream& console) {
+                         std::ostream& console,
+                         miniKV::client::MiniDriverClient* persistentClient = nullptr,
+                         uint64_t maxReadBytesPerSecond = 0,
+                         std::string readerClass = "normal") {
     RunRecord record;
     record.runId = fixture.runId;
     record.operation = "download";
     record.sizeBytes = fixture.sizeBytes;
     record.chunkCount = fixture.chunkCount;
     record.fileHash = fixture.fileHash;
+    record.objectId = fixture.objectId;
+    record.objectVersion = fixture.objectVersion;
     record.inputHash = fixture.inputHash;
+    record.readerClass = std::move(readerClass);
     // The fixture is deliberately prepared before the timed download interval.
     record.uploadOk = true;
-    if (record.fileHash.empty() || record.inputHash.empty()) {
+    if (record.fileHash.empty() || record.inputHash.empty() ||
+        (options.sdkReadPlan && (record.objectId.empty() || record.objectVersion == 0))) {
         record.error = "download fixture is incomplete";
         return record;
     }
@@ -316,16 +351,29 @@ RunRecord runDownloadOne(const BenchmarkOptions& options, const RunRecord& fixtu
     std::string error;
     const auto start = std::chrono::steady_clock::now();
     uint32_t downloadedChunks = 0;
-    if (!downloadFile(options.gateway, record.fileHash, outputPath, downloadedChunks, error)) {
+    DownloadTransportStats transportStats;
+    miniKV::client::ClientConfig config;
+    config.gateway = options.gateway;
+    config.clusterInternalToken = options.clusterInternalToken;
+    config.servicePrincipal = options.servicePrincipal;
+    if (!downloadFile(config, options.sdkReadPlan, record.fileHash,
+                      {record.objectId, record.objectVersion}, outputPath, downloadedChunks,
+                      options.keepAlive, options.transportOnlyDownload, transportStats, error, maxReadBytesPerSecond,
+                      persistentClient)) {
         record.error = error;
         return record;
     }
-    std::string outputHash;
-    if (!sha256File(outputPath, outputHash, error)) { record.error = error; return record; }
-    if (outputHash != record.inputHash) { record.error = "downloaded file SHA-256 mismatch"; return record; }
+    if (!options.transportOnlyDownload) {
+        std::string outputHash;
+        if (!sha256File(outputPath, outputHash, error)) { record.error = error; return record; }
+        if (outputHash != record.inputHash) { record.error = "downloaded file SHA-256 mismatch"; return record; }
+    }
     record.downloadMs = std::chrono::duration<double, std::milli>(
         std::chrono::steady_clock::now() - start).count();
     record.downloadOk = downloadedChunks == record.chunkCount;
+    record.dataConnectionOpens = transportStats.connectionOpens;
+    record.dataRequests = transportStats.requests;
+    record.dataConnectionReuses = transportStats.connectionReuses;
     if (!record.downloadOk) record.error = "manifest chunk count changed during benchmark";
     console << record.runId << " download=" << std::fixed << std::setprecision(2)
             << mibPerSecond(record.sizeBytes, record.downloadMs) << " MiB/s\n";
@@ -348,75 +396,30 @@ RunRecord runOne(const BenchmarkOptions& options, uint64_t size, uint32_t runInd
     record.inputHash = inputHash;
 
     const auto uploadStart = std::chrono::steady_clock::now();
-    HttpResponse created;
-    const std::string fileName = record.runId + ".bin";
-    const std::string createBody = "{\"fileName\":\"" + miniKV::util::jsonEscape(fileName) +
-        "\",\"dirPath\":\"" + miniKV::util::jsonEscape(options.remoteDir) +
-        "\",\"fileSize\":" + std::to_string(size) + "}";
-    if (!gatewayRequest(options.gateway, "POST", "/api/v2/upload/sessions", createBody, created, error)) {
+    miniKV::client::MiniDriverClient client({options.gateway});
+    miniKV::client::UploadOptions uploadOptions;
+    uploadOptions.chunkWindow = options.chunkWindow;
+    uploadOptions.checksumType = options.uploadChecksumType;
+    if (chunkBudget != nullptr) {
+        uploadOptions.acquireChunk = [chunkBudget] { chunkBudget->acquire(); };
+        uploadOptions.releaseChunk = [chunkBudget] { chunkBudget->release(); };
+    }
+    miniKV::client::UploadResult uploaded;
+    if (!client.uploadFile(inputPath, record.runId + ".bin", options.remoteDir, uploadOptions, uploaded, error)) {
         record.error = error; return record;
     }
-    const std::string sessionId = miniKV::util::jsonString(created.body, "sessionId");
-    if (sessionId.empty()) { record.error = "Gateway returned no sessionId"; return record; }
-    HttpResponse session;
-    if (!gatewayRequest(options.gateway, "GET", "/api/v2/upload/sessions/" + sessionId, "", session, error)) {
-        record.error = error; return record;
-    }
-    const uint64_t chunkSize = miniKV::util::jsonUint(session.body, "chunkSize");
-    const uint32_t totalChunks = static_cast<uint32_t>(miniKV::util::jsonUint(session.body, "totalChunks"));
-    if (chunkSize == 0 || totalChunks == 0) { record.error = "Gateway returned invalid session chunking"; return record; }
-    record.chunkCount = totalChunks;
-    const auto completedValues = miniKV::util::jsonUIntArray(session.body, "completed");
-    const std::set<uint32_t> completed(completedValues.begin(), completedValues.end());
-
-    std::vector<uint32_t> pendingChunks;
-    for (uint32_t index = 0; index < totalChunks; ++index) {
-        if (!completed.count(index)) pendingChunks.push_back(index);
-    }
-    std::atomic<size_t> nextChunk{0};
-    std::atomic<bool> failed{false};
-    std::mutex errorMutex;
-    std::mutex consoleMutex;
-    std::string uploadError;
-    const uint32_t workerCount = std::min<uint32_t>(options.chunkWindow,
-        static_cast<uint32_t>(pendingChunks.size()));
-    std::vector<std::thread> chunkWorkers;
-    chunkWorkers.reserve(workerCount);
-    for (uint32_t worker = 0; worker < workerCount; ++worker) {
-        chunkWorkers.emplace_back([&] {
-            for (;;) {
-                if (failed.load()) return;
-                const size_t task = nextChunk.fetch_add(1);
-                if (task >= pendingChunks.size()) return;
-                const uint32_t index = pendingChunks[task];
-                std::string chunkError;
-                ChunkBudgetLease budgetLease(chunkBudget);
-                if (failed.load()) return;
-                if (!uploadOneChunk(options, inputPath, sessionId, size, chunkSize, index, chunkError)) {
-                    std::lock_guard<std::mutex> lock(errorMutex);
-                    if (!failed.exchange(true)) uploadError = "chunk " + std::to_string(index) + ": " + chunkError;
-                    return;
-                }
-                std::lock_guard<std::mutex> lock(consoleMutex);
-                console << record.runId << " uploaded chunk " << index + 1 << '/' << totalChunks << '\n';
-            }
-        });
-    }
-    for (auto& worker : chunkWorkers) worker.join();
-    if (failed.load()) { record.error = uploadError; return record; }
-    HttpResponse committed;
-    if (!gatewayRequest(options.gateway, "POST", "/api/v2/upload/sessions/" + sessionId + "/commit", "{}", committed, error)) {
-        record.error = error; return record;
-    }
-    const std::string fileHash = miniKV::util::jsonString(committed.body, "fileHash");
-    if (fileHash.empty()) { record.error = "Gateway returned no fileHash"; return record; }
-    record.fileHash = fileHash;
+    record.chunkCount = uploaded.chunkCount;
+    record.fileHash = uploaded.fileHash;
+    record.objectId = uploaded.object.objectId;
+    record.objectVersion = uploaded.object.objectVersion;
     record.uploadMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - uploadStart).count();
     record.uploadOk = true;
 
     if(options.mode == BenchmarkMode::kUploadOnly) {
-        // The upload-capacity mode intentionally stops after durable Gateway
-        // commit. Mark the unused download half successful so the existing
+        // The upload-capacity mode intentionally stops after the Gateway's
+        // application-level commit. This is not a durable media commit until
+        // the DataNode and metadata paths add an explicit sync boundary. Mark
+        // the unused download half successful so the existing
         // per-run reporting pipeline can represent a valid upload-only run.
         record.downloadOk = true;
         console << record.runId << " upload=" << std::fixed << std::setprecision(2)
@@ -426,14 +429,26 @@ RunRecord runOne(const BenchmarkOptions& options, uint64_t size, uint32_t runInd
 
     const auto downloadStart = std::chrono::steady_clock::now();
     uint32_t downloadedChunks = 0;
-    if (!downloadFile(options.gateway, fileHash, outputPath, downloadedChunks, error)) {
+    DownloadTransportStats transportStats;
+    miniKV::client::ClientConfig readConfig;
+    readConfig.gateway = options.gateway;
+    readConfig.clusterInternalToken = options.clusterInternalToken;
+    readConfig.servicePrincipal = options.servicePrincipal;
+    if (!downloadFile(readConfig, options.sdkReadPlan, record.fileHash,
+                      {record.objectId, record.objectVersion}, outputPath, downloadedChunks,
+                      options.keepAlive, options.transportOnlyDownload, transportStats, error)) {
         record.error = error; return record;
     }
-    std::string outputHash;
-    if (!sha256File(outputPath, outputHash, error)) { record.error = error; return record; }
-    if (outputHash != inputHash) { record.error = "downloaded file SHA-256 mismatch"; return record; }
+    if (!options.transportOnlyDownload) {
+        std::string outputHash;
+        if (!sha256File(outputPath, outputHash, error)) { record.error = error; return record; }
+        if (outputHash != inputHash) { record.error = "downloaded file SHA-256 mismatch"; return record; }
+    }
     record.downloadMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - downloadStart).count();
-    record.downloadOk = downloadedChunks == totalChunks;
+    record.downloadOk = downloadedChunks == record.chunkCount;
+    record.dataConnectionOpens = transportStats.connectionOpens;
+    record.dataRequests = transportStats.requests;
+    record.dataConnectionReuses = transportStats.connectionReuses;
     if (!record.downloadOk) record.error = "manifest chunk count changed during benchmark";
     console << record.runId << " upload=" << std::fixed << std::setprecision(2)
             << mibPerSecond(size, record.uploadMs) << " MiB/s download="
@@ -452,6 +467,183 @@ int BenchmarkRunner::run(std::ostream& console) {
         console << "cannot create work directory: " << filesystemError.message() << '\n';
         return 2;
     }
+    if (options_.readProfile == BenchmarkReadProfile::kMixedSize) {
+        // Prepare one immutable fixture per size, then run readers for every
+        // size in the same timed round.  This is intentionally different
+        // from the historical `--sizes` loop, which runs sizes serially and
+        // cannot expose small-object tail latency behind original-file reads.
+        ChunkBudget fixtureBudget(options_.globalChunkBudget);
+        BenchmarkOptions fixtureOptions = options_;
+        fixtureOptions.mode = BenchmarkMode::kUploadOnly;
+        std::vector<RunRecord> fixtures;
+        fixtures.reserve(options_.sizes.size());
+        for (size_t index = 0; index < options_.sizes.size(); ++index) {
+            std::ostringstream fixtureLog;
+            RunRecord fixture = runOne(fixtureOptions, options_.sizes[index],
+                                       2000000U + static_cast<uint32_t>(index), fixtureLog,
+                                       &fixtureBudget);
+            fixture.operation = "download";
+            console << fixtureLog.str();
+            std::error_code removeError;
+            std::filesystem::remove(options_.workDir / (fixture.runId + ".input"), removeError);
+            if (!fixture.error.empty()) {
+                console << "mixed-size fixture FAILED: " << fixture.error << '\n';
+                return 1;
+            }
+            fixtures.push_back(std::move(fixture));
+        }
+        std::vector<RunRecord> records;
+        for (uint32_t round = 0; round < options_.runs; ++round) {
+            std::vector<RunRecord> roundRecords(options_.concurrency);
+            std::vector<std::string> logs(options_.concurrency);
+            std::vector<std::thread> workers;
+            workers.reserve(options_.concurrency);
+            const auto started = std::chrono::steady_clock::now();
+            for (uint32_t worker = 0; worker < options_.concurrency; ++worker) {
+                workers.emplace_back([&, worker] {
+                    // Rotate the starting fixture each round. With c4 and
+                    // five asset sizes, a fixed worker modulo would otherwise
+                    // never sample the fifth (50 MiB) original at all.
+                    const RunRecord& source = fixtures[
+                        (static_cast<size_t>(round) * options_.concurrency + worker) % fixtures.size()];
+                    RunRecord fixture = source;
+                    fixture.runId += "-mixed-r" + std::to_string(round + 1) +
+                        "-reader-" + std::to_string(worker + 1);
+                    std::ostringstream log;
+                    const bool slow = options_.slowReaderWorkers > 0 &&
+                        worker >= options_.concurrency - options_.slowReaderWorkers;
+                    roundRecords[worker] = runDownloadOne(options_, fixture, log, nullptr,
+                        slow ? options_.slowReaderBytesPerSecond : 0,
+                        slow ? "slow" : "normal");
+                    logs[worker] = log.str();
+                });
+            }
+            for (std::thread& worker : workers) worker.join();
+            uint64_t completedBytes = 0;
+            for (uint32_t worker = 0; worker < options_.concurrency; ++worker) {
+                console << logs[worker];
+                RunRecord& record = roundRecords[worker];
+                if (!record.error.empty()) console << "FAILED: " << record.error << '\n';
+                if (record.uploadOk && record.downloadOk) completedBytes += record.sizeBytes;
+                std::error_code removeError;
+                std::filesystem::remove(options_.workDir / (record.runId + ".download"), removeError);
+                records.push_back(std::move(record));
+            }
+            const double elapsed = std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - started).count();
+            console << "mixed-size round aggregate=" << std::fixed << std::setprecision(2)
+                    << mibPerSecond(completedBytes, elapsed) << " MiB/s\n";
+        }
+        std::vector<SizeSummary> summaries;
+        for (const uint64_t size : options_.sizes) {
+            const uint32_t requested = static_cast<uint32_t>(std::count_if(
+                records.begin(), records.end(), [size](const RunRecord& record) {
+                    return record.sizeBytes == size;
+                }));
+            summaries.push_back(summarize(size, requested, records, options_.mode));
+        }
+        if (!writeReports(options_, records, summaries, filesystemError)) {
+            console << "cannot write benchmark reports: " << filesystemError.message() << '\n';
+            return 2;
+        }
+        const bool allSucceeded = std::all_of(records.begin(), records.end(), [](const RunRecord& record) {
+            return record.uploadOk && record.downloadOk && record.error.empty();
+        });
+        console << "reports: " << options_.workDir << "\n";
+        return allSucceeded ? 0 : 1;
+    }
+    if (options_.mode == BenchmarkMode::kDownloadOnly && options_.requestsPerWorker > 1) {
+        // R6 path: retain a StreamRequest per worker while making distinct,
+        // complete object reads. The regular path measures one object read per
+        // worker and therefore cannot reveal Keep-Alive gains for a 64 KiB
+        // single-Chunk object.
+        std::vector<RunRecord> records;
+        for (const uint64_t size : options_.sizes) {
+            for (uint32_t round = 0; round < options_.runs; ++round) {
+                const uint32_t fixtureCount = options_.readProfile == BenchmarkReadProfile::kHotObject
+                    ? 1 : options_.concurrency;
+                std::vector<RunRecord> fixtures(fixtureCount);
+                BenchmarkOptions fixtureOptions = options_;
+                fixtureOptions.mode = BenchmarkMode::kUploadOnly;
+                for (uint32_t index = 0; index < fixtureCount; ++index) {
+                    std::ostringstream fixtureLog;
+                    fixtures[index] = runOne(fixtureOptions, size,
+                        3000000U + round * options_.concurrency + index, fixtureLog);
+                    fixtures[index].operation = "download";
+                    console << fixtureLog.str();
+                    std::error_code removeError;
+                    std::filesystem::remove(options_.workDir / (fixtures[index].runId + ".input"), removeError);
+                    if (!fixtures[index].error.empty()) {
+                        console << "repeated-read fixture FAILED: " << fixtures[index].error << '\n';
+                        return 1;
+                    }
+                }
+                std::vector<std::vector<RunRecord>> workerRecords(options_.concurrency);
+                std::vector<std::string> logs(options_.concurrency);
+                std::vector<std::thread> workers;
+                workers.reserve(options_.concurrency);
+                const auto started = std::chrono::steady_clock::now();
+                for (uint32_t worker = 0; worker < options_.concurrency; ++worker) {
+                    workers.emplace_back([&, worker] {
+                        miniKV::client::ClientConfig persistentConfig;
+                        persistentConfig.gateway = options_.gateway;
+                        persistentConfig.clusterInternalToken = options_.clusterInternalToken;
+                        persistentConfig.servicePrincipal = options_.servicePrincipal;
+                        miniKV::client::MiniDriverClient persistentClient(std::move(persistentConfig));
+                        const RunRecord& source = fixtures[options_.readProfile == BenchmarkReadProfile::kHotObject
+                            ? 0 : worker];
+                        std::ostringstream log;
+                        const bool slow = options_.slowReaderWorkers > 0 &&
+                            worker >= options_.concurrency - options_.slowReaderWorkers;
+                        workerRecords[worker].reserve(options_.requestsPerWorker);
+                        for (uint32_t request = 0; request < options_.requestsPerWorker; ++request) {
+                            RunRecord fixture = source;
+                            fixture.runId += "-round-" + std::to_string(round + 1) +
+                                "-reader-" + std::to_string(worker + 1) +
+                                "-request-" + std::to_string(request + 1);
+                            workerRecords[worker].push_back(runDownloadOne(
+                                options_, fixture, log,
+                                options_.keepAlive ? &persistentClient : nullptr,
+                                slow ? options_.slowReaderBytesPerSecond : 0,
+                                slow ? "slow" : "normal"));
+                        }
+                        logs[worker] = log.str();
+                    });
+                }
+                for (std::thread& worker : workers) worker.join();
+                uint64_t completedBytes = 0;
+                for (uint32_t worker = 0; worker < options_.concurrency; ++worker) {
+                    console << logs[worker];
+                    for (RunRecord& record : workerRecords[worker]) {
+                        if (!record.error.empty()) console << "FAILED: " << record.error << '\n';
+                        if (record.uploadOk && record.downloadOk) completedBytes += record.sizeBytes;
+                        std::error_code removeError;
+                        std::filesystem::remove(options_.workDir / (record.runId + ".download"), removeError);
+                        records.push_back(std::move(record));
+                    }
+                }
+                const double elapsed = std::chrono::duration<double, std::milli>(
+                    std::chrono::steady_clock::now() - started).count();
+                console << "repeated-read round aggregate=" << std::fixed << std::setprecision(2)
+                        << mibPerSecond(completedBytes, elapsed) << " MiB/s\n";
+            }
+        }
+        std::vector<SizeSummary> summaries;
+        for (const uint64_t size : options_.sizes) {
+            summaries.push_back(summarize(size,
+                options_.runs * options_.concurrency * options_.requestsPerWorker,
+                records, options_.mode));
+        }
+        if (!writeReports(options_, records, summaries, filesystemError)) {
+            console << "cannot write benchmark reports: " << filesystemError.message() << '\n';
+            return 2;
+        }
+        const bool allSucceeded = std::all_of(records.begin(), records.end(), [](const RunRecord& record) {
+            return record.uploadOk && record.downloadOk && record.error.empty();
+        });
+        console << "reports: " << options_.workDir << "\n";
+        return allSucceeded ? 0 : 1;
+    }
     std::vector<RunRecord> records;
     for (const uint64_t size : options_.sizes) {
         for (uint32_t runIndex = 0; runIndex < options_.runs; ++runIndex) {
@@ -467,7 +659,9 @@ int BenchmarkRunner::run(std::ostream& console) {
             if (downloadWorkers > 0) {
                 BenchmarkOptions fixtureOptions = options_;
                 fixtureOptions.mode = BenchmarkMode::kUploadOnly;
-                for (uint32_t index = 0; index < downloadWorkers; ++index) {
+                const uint32_t fixtureCount = options_.readProfile == BenchmarkReadProfile::kHotObject
+                    ? 1 : downloadWorkers;
+                for (uint32_t index = 0; index < fixtureCount; ++index) {
                     std::ostringstream fixtureLog;
                     const uint32_t fixtureRunIndex = 1000000U + runIndex * options_.concurrency + index;
                     downloadFixtures[index] = runOne(fixtureOptions, size, fixtureRunIndex, fixtureLog);
@@ -478,6 +672,16 @@ int BenchmarkRunner::run(std::ostream& console) {
                     if (!downloadFixtures[index].error.empty()) {
                         console << "download fixture FAILED: " << downloadFixtures[index].error << '\n';
                     }
+                }
+                if (options_.readProfile == BenchmarkReadProfile::kHotObject && fixtureCount == 1) {
+                    for (uint32_t index = 1; index < downloadWorkers; ++index) {
+                        downloadFixtures[index] = downloadFixtures[0];
+                    }
+                }
+                if (options_.fixtureSettleMs > 0) {
+                    console << "waiting " << options_.fixtureSettleMs
+                            << " ms for fixture load reporting to settle\n";
+                    std::this_thread::sleep_for(std::chrono::milliseconds(options_.fixtureSettleMs));
                 }
             }
             std::vector<std::thread> workers;
@@ -490,7 +694,17 @@ int BenchmarkRunner::run(std::ostream& console) {
                     if (workerIndex < downloadWorkers) {
                         if (downloadFixtures[workerIndex].uploadOk &&
                             downloadFixtures[workerIndex].error.empty()) {
-                            roundRecords[workerIndex] = runDownloadOne(options_, downloadFixtures[workerIndex], workerConsole);
+                            RunRecord fixture = downloadFixtures[workerIndex];
+                            // A hot-object read has one source object but every reader
+                            // needs a distinct local output path and report identity.
+                            if (options_.readProfile == BenchmarkReadProfile::kHotObject) {
+                                fixture.runId += "-reader-" + std::to_string(workerIndex + 1);
+                            }
+                            const bool slow = options_.slowReaderWorkers > 0 &&
+                                workerIndex >= options_.concurrency - options_.slowReaderWorkers;
+                            roundRecords[workerIndex] = runDownloadOne(options_, fixture, workerConsole,
+                                nullptr, slow ? options_.slowReaderBytesPerSecond : 0,
+                                slow ? "slow" : "normal");
                         } else {
                             roundRecords[workerIndex] = downloadFixtures[workerIndex];
                         }

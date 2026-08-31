@@ -30,6 +30,9 @@ public:
         options.timeoutMs = 10000;
         options.headers = {{"Content-Type", "application/json"},
                            {"X-Cluster-Internal-Token", internalToken}};
+        if(!request.requestId.empty()) {
+            options.headers.emplace("X-Request-Id", request.requestId);
+        }
         httpRequest->open(std::move(options), [httpRequest, body] {
             if(httpRequest->write(body->data(), body->size()) != AsyncWriteResult::kAccepted) {
                 httpRequest->cancel();

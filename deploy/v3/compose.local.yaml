@@ -1,0 +1,83 @@
+services:
+  gateway:
+    build:
+      context: ../..
+      dockerfile: Dockerfile.minidriver
+    image: minidriver:3.0-ai-ready
+    command: ["minikv_v2_gateway", "18280", "/var/lib/minidriver/gateway"]
+    environment:
+      MINIKV_V2_CLUSTER_SECRET: ${MINIKV_V2_CLUSTER_SECRET:-local-v3-change-me}
+      MINIKV_V3_IDENTITY_SCHEME: opaque-chunk-id
+      MINIKV_V3_CHECKSUM_TYPE: crc32c
+      MINIKV_LOG_LEVEL: info
+    ports:
+      - "18280:18280"
+    volumes:
+      - gateway-data:/var/lib/minidriver/gateway
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "--silent", "http://127.0.0.1:18280/readyz"]
+      interval: 3s
+      timeout: 2s
+      retries: 20
+    restart: unless-stopped
+
+  dn-1:
+    image: minidriver:3.0-ai-ready
+    command: ["minikv_v2_datanode", "dn-1", "dn-1", "19201", "/var/lib/minidriver/datanode", "gateway", "18280"]
+    environment: &dn-env
+      MINIKV_V2_CLUSTER_SECRET: ${MINIKV_V2_CLUSTER_SECRET:-local-v3-change-me}
+      MINIKV_V3_DURABILITY_MODE: group_commit
+      MINIKV_V3_GROUP_COMMIT_BYTES: "8388608"
+      MINIKV_V3_GROUP_COMMIT_ITEMS: "8"
+      MINIKV_V3_GROUP_COMMIT_DELAY_US: "2000"
+      MINIKV_V3_WRITE_BATCH_BYTES: "262144"
+      MINIKV_V3_WRITE_BATCH_DELAY_US: "1000"
+      MINIKV_V4_MAX_ACTIVE_UPLOADS: "8"
+      MINIKV_V4_MAX_ACTIVE_DOWNLOADS: "8"
+      MINIKV_LOG_LEVEL: info
+    ports: ["19201:19201"]
+    volumes: ["dn-1-data:/var/lib/minidriver/datanode"]
+    depends_on:
+      gateway: {condition: service_healthy}
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "--silent", "http://127.0.0.1:19201/readyz"]
+      interval: 3s
+      timeout: 2s
+      retries: 20
+    restart: unless-stopped
+
+  dn-2:
+    image: minidriver:3.0-ai-ready
+    command: ["minikv_v2_datanode", "dn-2", "dn-2", "19202", "/var/lib/minidriver/datanode", "gateway", "18280"]
+    environment: *dn-env
+    ports: ["19202:19202"]
+    volumes: ["dn-2-data:/var/lib/minidriver/datanode"]
+    depends_on:
+      gateway: {condition: service_healthy}
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "--silent", "http://127.0.0.1:19202/readyz"]
+      interval: 3s
+      timeout: 2s
+      retries: 20
+    restart: unless-stopped
+
+  dn-3:
+    image: minidriver:3.0-ai-ready
+    command: ["minikv_v2_datanode", "dn-3", "dn-3", "19203", "/var/lib/minidriver/datanode", "gateway", "18280"]
+    environment: *dn-env
+    ports: ["19203:19203"]
+    volumes: ["dn-3-data:/var/lib/minidriver/datanode"]
+    depends_on:
+      gateway: {condition: service_healthy}
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "--silent", "http://127.0.0.1:19203/readyz"]
+      interval: 3s
+      timeout: 2s
+      retries: 20
+    restart: unless-stopped
+
+volumes:
+  gateway-data:
+  dn-1-data:
+  dn-2-data:
+  dn-3-data:

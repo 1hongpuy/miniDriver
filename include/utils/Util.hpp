@@ -12,12 +12,36 @@ namespace util {
 
 //通行证
 struct UploadCapability {
+    uint32_t schemaVersion = 1;
     std::string sessionId;
     uint32_t chunkIndex = 0;
     std::string chunkHash;
     uint64_t chunkSize = 0;
     std::vector<std::string> chainTargets;
     std::string leaseId;
+    int64_t expiresAt = 0;
+    // V2 capability fields decouple routing identity from content checksum.
+    // V1 tokens leave these empty and are normalized by the HTTP adapter.
+    std::string identityScheme = "cas-sha256";
+    std::string chunkId;
+    std::string objectId;
+    uint64_t objectVersion = 1;
+    uint64_t generation = 0;
+    std::string checksumType = "sha256";
+    uint32_t checksumSegmentBytes = 0;
+    std::string checksumDigest;
+};
+
+// Short-lived, per-Chunk read authority. Binding the physical identity into
+// the signature prevents a token issued for one Chunk from reading another.
+struct ReadCapability {
+    uint32_t schemaVersion = 1;
+    std::string capabilityId;
+    std::string principalId;
+    std::string scope = "object:read";
+    std::string objectId;
+    uint64_t objectVersion = 1;
+    std::string storageIdentity;
     int64_t expiresAt = 0;
 };
 
@@ -47,14 +71,17 @@ std::string issueUploadCapability(const UploadCapability& capability,
 bool verifyUploadCapability(const std::string& token,
                             const std::string& clusterSecret,
                             UploadCapability& out);
+std::string issueReadCapability(const ReadCapability& capability,
+                                const std::string& clusterSecret);
+bool verifyReadCapability(const std::string& token,
+                          const std::string& clusterSecret,
+                          ReadCapability& out);
 bool constantTimeEquals(const std::string& left, const std::string& right);
 
 
 }
 
 }
-
-
 
 
 

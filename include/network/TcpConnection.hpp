@@ -10,6 +10,7 @@
 #include <string>
 #include <functional> //回调
 #include <atomic>
+#include <chrono>
 #include <sys/types.h>
 #include <type_traits>
 
@@ -32,9 +33,13 @@ using WaterMarkCallback = std::function<void(const TcpConnectionPtr&, size_t)>;
 
 struct SendFileResult {
     bool success = false;
-    size_t bytesSent = 0;
-    size_t writeCalls = 0;
-    size_t maxBytesPerCall = 0;
+    size_t bytesSent = 0;           //发送字节
+    size_t writeCalls = 0;          //调用次数
+    size_t maxBytesPerCall = 0;     //单次系统发送的最大字节数
+    uint64_t syscallNanoseconds = 0;
+    uint64_t wouldBlockCount = 0;
+    uint64_t wouldBlockNanoseconds = 0;
+    uint64_t firstAttemptNanoseconds = 0;
 };
 
 struct OutputBufferStats {
@@ -140,13 +145,21 @@ private:
     };
 
     struct SendFileCtx {
-        int fd = -1;
-        off_t  offset = 0;
-        size_t remaining = 0;
-        size_t totalBytes = 0;
-        size_t writeCalls = 0;
-        size_t maxBytesPerCall = 0;
-        SendFileCompleteCallback callback;
+        int fd = -1;                        // 文件描述符
+        off_t  offset = 0;                  // 读盘的物理偏移量
+        size_t remaining = 0;               // 剩下多少字节没发完
+        size_t totalBytes = 0;              // 总共要发送多少字节
+        size_t writeCalls = 0;              // 调用了多少次sendfile
+        size_t maxBytesPerCall = 0;         // 单次调用sendfile发送的最大字节数
+        uint64_t syscallNanoseconds = 0;
+        uint64_t wouldBlockCount = 0;
+        uint64_t wouldBlockNanoseconds = 0;
+        uint64_t firstAttemptNanoseconds = 0;
+        std::chrono::steady_clock::time_point startedAt;
+        std::chrono::steady_clock::time_point blockedAt;
+        bool firstAttemptRecorded = false;
+        bool blocked = false;
+        SendFileCompleteCallback callback;  // 发完之后通知谁（业务回调函数）
     };
     std::unique_ptr<SendFileCtx> sendFileCtx_;
     size_t sendFileQuantum_ = 256 * 1024;
@@ -183,7 +196,6 @@ private:
 }
 
 }
-
 
 
 

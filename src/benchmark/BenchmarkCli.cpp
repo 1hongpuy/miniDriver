@@ -38,8 +38,13 @@ bool parseSizes(const std::string& text, std::vector<uint64_t>& sizes) {
 
 std::string benchmarkUsage() {
     return "usage: minikv_v2_bench local --gateway HOST:PORT --work-dir ABSOLUTE_PATH "
-           "[--sizes 4MiB,32MiB,256MiB,1GiB] [--runs 3] [--concurrency 1] [--chunk-window 1|2] [--global-chunk-budget 2] "
-           "[--mode end-to-end|upload|download|mixed] [--remote-dir /benchmark]";
+           "[--sizes 64KiB,4MiB,32MiB,256MiB,1GiB] [--runs 3] [--concurrency 1] [--chunk-window 1|2] [--global-chunk-budget 2] [--upload-checksum crc32c|sha256] [--fixture-settle-ms 0] "
+           "[--mode end-to-end|upload|download|mixed] [--read-profile independent|hot-object|mixed-size] "
+           "[--connection-mode close|keep-alive] [--requests-per-worker 1] "
+           "[--download-verification strict|transport-only] "
+           "[--slow-reader-workers 0] [--slow-reader-bytes-per-sec 1MiB] "
+           "[--sdk-read-plan true|false --cluster-internal-token TOKEN --service-principal ID] "
+           "[--remote-dir /benchmark]";
 }
 
 bool parseBenchmarkOptions(const std::vector<std::string>& args,
@@ -51,6 +56,13 @@ bool parseBenchmarkOptions(const std::vector<std::string>& args,
     options.concurrency = 1;
     options.chunkWindow = 1;
     options.globalChunkBudget = 2;
+    options.uploadChecksumType = "crc32c";
+    options.fixtureSettleMs = 0;
+    options.keepAlive = false;
+    options.requestsPerWorker = 1;
+    options.slowReaderWorkers = 0;
+    options.slowReaderBytesPerSecond = 0;
+    options.readProfile = BenchmarkReadProfile::kIndependent;
     options.remoteDir = "/benchmark";
     if (args.empty() || args.front() != "local") { error = "only the local command is supported"; return false; }
     bool gatewaySet = false;
@@ -81,12 +93,57 @@ bool parseBenchmarkOptions(const std::vector<std::string>& args,
             if (!parseRuns(value, options.globalChunkBudget)) {
                 error = "invalid --global-chunk-budget"; return false;
             }
+        } else if (flag == "--upload-checksum") {
+            if (value != "crc32c" && value != "sha256") {
+                error = "--upload-checksum must be crc32c or sha256";
+                return false;
+            }
+            options.uploadChecksumType = value;
+        } else if (flag == "--fixture-settle-ms") {
+            if (!parseRuns(value, options.fixtureSettleMs) || options.fixtureSettleMs > 60000) {
+                error = "--fixture-settle-ms must be 1..60000"; return false;
+            }
         } else if (flag == "--mode") {
             if(value == "end-to-end") options.mode = BenchmarkMode::kEndToEnd;
             else if(value == "upload") options.mode = BenchmarkMode::kUploadOnly;
             else if(value == "download") options.mode = BenchmarkMode::kDownloadOnly;
             else if(value == "mixed") options.mode = BenchmarkMode::kMixed;
             else { error = "invalid --mode"; return false; }
+        } else if (flag == "--read-profile") {
+            if(value == "independent") options.readProfile = BenchmarkReadProfile::kIndependent;
+            else if(value == "hot-object") options.readProfile = BenchmarkReadProfile::kHotObject;
+            else if(value == "mixed-size") options.readProfile = BenchmarkReadProfile::kMixedSize;
+            else { error = "--read-profile must be independent, hot-object, or mixed-size"; return false; }
+        } else if(flag == "--connection-mode") {
+            if(value == "close") options.keepAlive = false;
+            else if(value == "keep-alive") options.keepAlive = true;
+            else { error = "--connection-mode must be close or keep-alive"; return false; }
+        } else if(flag == "--requests-per-worker") {
+            if(!parseRuns(value, options.requestsPerWorker) || options.requestsPerWorker > 100000) {
+                error = "--requests-per-worker must be 1..100000"; return false;
+            }
+        } else if(flag == "--download-verification") {
+            if(value == "strict") options.transportOnlyDownload = false;
+            else if(value == "transport-only") options.transportOnlyDownload = true;
+            else { error = "--download-verification must be strict or transport-only"; return false; }
+        } else if(flag == "--slow-reader-workers") {
+            if(!parseRuns(value, options.slowReaderWorkers)) {
+                error = "--slow-reader-workers must be positive"; return false;
+            }
+        } else if(flag == "--slow-reader-bytes-per-sec") {
+            if(!parseSize(value, options.slowReaderBytesPerSecond)) {
+                error = "--slow-reader-bytes-per-sec must use KiB, MiB, or GiB"; return false;
+            }
+        } else if (flag == "--sdk-read-plan") {
+            if (value == "true") options.sdkReadPlan = true;
+            else if (value == "false") options.sdkReadPlan = false;
+            else { error = "--sdk-read-plan must be true or false"; return false; }
+        } else if (flag == "--cluster-internal-token") {
+            if (value.empty()) { error = "invalid --cluster-internal-token"; return false; }
+            options.clusterInternalToken = value;
+        } else if (flag == "--service-principal") {
+            if (value.empty()) { error = "invalid --service-principal"; return false; }
+            options.servicePrincipal = value;
         } else if (flag == "--remote-dir") {
             if (value.empty()) { error = "invalid --remote-dir"; return false; }
             options.remoteDir = value.front() == '/' ? value : "/" + value;
@@ -98,6 +155,27 @@ bool parseBenchmarkOptions(const std::vector<std::string>& args,
     if (!gatewaySet || !workDirSet) { error = "--gateway and --work-dir are required"; return false; }
     if (options.mode == BenchmarkMode::kMixed && options.concurrency < 2) {
         error = "--mode mixed requires --concurrency >= 2";
+        return false;
+    }
+    if ((options.readProfile == BenchmarkReadProfile::kHotObject ||
+         options.readProfile == BenchmarkReadProfile::kMixedSize) &&
+        options.mode != BenchmarkMode::kDownloadOnly) {
+        error = "this --read-profile requires --mode download";
+        return false;
+    }
+    if (options.slowReaderWorkers > 0) {
+        if (options.mode != BenchmarkMode::kDownloadOnly ||
+            options.slowReaderWorkers >= options.concurrency ||
+            options.slowReaderBytesPerSecond == 0) {
+            error = "slow readers require download mode, 1..concurrency-1 workers, and a byte rate";
+            return false;
+        }
+    } else if (options.slowReaderBytesPerSecond != 0) {
+        error = "--slow-reader-bytes-per-sec requires --slow-reader-workers";
+        return false;
+    }
+    if (options.sdkReadPlan && (options.clusterInternalToken.empty() || options.servicePrincipal.empty())) {
+        error = "--sdk-read-plan requires --cluster-internal-token and --service-principal";
         return false;
     }
     return true;

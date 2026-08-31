@@ -100,7 +100,11 @@ bool DiskWriteExecutor::submit(BlockLease block, Work work)
     {
         std::lock_guard<std::mutex> lock(mutex_);
         if(stopping_) return false;
-        readyQueue_.push_back({std::move(block), std::move(work)});
+        WorkItem item;
+        item.block = std::move(block);
+        item.work = std::move(work);
+        item.queuedAt = std::chrono::steady_clock::now();
+        readyQueue_.push_back(std::move(item));
         peakQueuedTasks_ = std::max<uint64_t>(peakQueuedTasks_, readyQueue_.size());
     }
     cv_.notify_one();
@@ -116,6 +120,7 @@ bool DiskWriteExecutor::submit(SharedBlockPtr block, SharedWork work)
         WorkItem item;
         item.sharedBlock = std::move(block);
         item.sharedWork = std::move(work);
+        item.queuedAt = std::chrono::steady_clock::now();
         readyQueue_.push_back(std::move(item));
         peakQueuedTasks_ = std::max<uint64_t>(peakQueuedTasks_, readyQueue_.size());
     }
@@ -131,6 +136,7 @@ bool DiskWriteExecutor::submitTask(Task task)
         if(stopping_) return false;
         WorkItem item;
         item.task = std::move(task);
+        item.queuedAt = std::chrono::steady_clock::now();
         readyQueue_.push_back(std::move(item));
         peakQueuedTasks_ = std::max<uint64_t>(peakQueuedTasks_, readyQueue_.size());
     }
@@ -144,7 +150,8 @@ DiskWriteExecutor::Metrics DiskWriteExecutor::metrics() const
     return {leasedBytes_, peakLeasedBytes_, static_cast<uint64_t>(readyQueue_.size()),
             peakQueuedTasks_, static_cast<uint64_t>(freeIds_.size()),
             static_cast<uint64_t>(freeIds_.size() + leasedBytes_ / kBlockBytes),
-            activeWorkers_, static_cast<uint64_t>(workers_.size()), completedTasks_};
+            activeWorkers_, static_cast<uint64_t>(workers_.size()), completedTasks_,
+            startedTasks_, totalQueueWaitUs_, maxQueueWaitUs_, totalWorkUs_, maxWorkUs_};
 }
 
 void DiskWriteExecutor::stop()
@@ -178,8 +185,15 @@ void DiskWriteExecutor::workerMain()
             item = std::move(readyQueue_.front());
             readyQueue_.pop_front();
             ++activeWorkers_;
+            ++startedTasks_;
+            const uint64_t queueWaitUs = static_cast<uint64_t>(
+                std::chrono::duration_cast<std::chrono::microseconds>(
+                    std::chrono::steady_clock::now() - item.queuedAt).count());
+            totalQueueWaitUs_ += queueWaitUs;
+            maxQueueWaitUs_ = std::max(maxQueueWaitUs_, queueWaitUs);
         }
 
+        const auto workStartedAt = std::chrono::steady_clock::now();
         try {
             if(item.work) item.work(std::move(item.block));
             else if(item.sharedWork) item.sharedWork(std::move(item.sharedBlock));
@@ -187,10 +201,15 @@ void DiskWriteExecutor::workerMain()
         } catch(...) {
             // The owning upload pipeline reports its own write failure.
         }
+        const uint64_t workUs = static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now() - workStartedAt).count());
         {
             std::lock_guard<std::mutex> lock(mutex_);
             if(activeWorkers_ > 0) --activeWorkers_;
             ++completedTasks_;
+            totalWorkUs_ += workUs;
+            maxWorkUs_ = std::max(maxWorkUs_, workUs);
         }
     }
 }

@@ -1,0 +1,49 @@
+# miniDriver V3-Lite Phase 0 本地拓扑清单
+# 当前仅作为配置契约和启动准备的输入；Metadata/Raft 可执行程序在 Phase 2 接入。
+
+version: 1
+mode: single
+
+gateway:
+  id: gateway-v3-local
+  listen: 127.0.0.1:18280
+  metadata_rpc_timeout_ms: 1000
+  metadata_retry_limit: 2
+
+metadata:
+  transport: mature_raft_adapter
+  election_timeout_ms: 300
+  heartbeat_interval_ms: 100
+  nodes:
+    - id: meta-1
+      raft_listen: 127.0.0.1:18201
+      rpc_listen: 127.0.0.1:18301
+      data_dir: /tmp/minidriver-v3-lite/metadata/meta-1
+    - id: meta-2
+      raft_listen: 127.0.0.1:18202
+      rpc_listen: 127.0.0.1:18302
+      data_dir: /tmp/minidriver-v3-lite/metadata/meta-2
+    - id: meta-3
+      raft_listen: 127.0.0.1:18203
+      rpc_listen: 127.0.0.1:18303
+      data_dir: /tmp/minidriver-v3-lite/metadata/meta-3
+
+datanodes:
+  - id: dn-1
+    address: 127.0.0.1
+    data_port: 19201
+    data_dir: /tmp/minidriver-v3-lite/datanode/dn-1
+  - id: dn-2
+    address: 127.0.0.1
+    data_port: 19202
+    data_dir: /tmp/minidriver-v3-lite/datanode/dn-2
+  - id: dn-3
+    address: 127.0.0.1
+    data_port: 19203
+    data_dir: /tmp/minidriver-v3-lite/datanode/dn-3
+
+fault_injection:
+  enabled: false
+  heartbeat_drop_after: 0
+  metadata_delay_ms: 0
+  repair_fail_before_finalize: false

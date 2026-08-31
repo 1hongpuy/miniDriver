@@ -131,10 +131,26 @@ void TcpConnection::handleWrite(){
     }
     if(sendFileCtx_ && sendFileCtx_->fd >= 0 && outputBuffer_.readableBytes() == 0)
     {
+        const auto attemptStartedAt = std::chrono::steady_clock::now();
+        if(!sendFileCtx_->firstAttemptRecorded) {
+            sendFileCtx_->firstAttemptRecorded = true;
+            sendFileCtx_->firstAttemptNanoseconds = static_cast<uint64_t>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    attemptStartedAt - sendFileCtx_->startedAt).count());
+        }
+        if(sendFileCtx_->blocked) {
+            sendFileCtx_->wouldBlockNanoseconds += static_cast<uint64_t>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    attemptStartedAt - sendFileCtx_->blockedAt).count());
+            sendFileCtx_->blocked = false;
+        }
         const size_t requestedBytes = std::min(sendFileCtx_->remaining, sendFileQuantum_);
         const ssize_t sent = ::sendfile(fd_, sendFileCtx_->fd,
                                         &sendFileCtx_->offset,
                                         requestedBytes);
+        sendFileCtx_->syscallNanoseconds += static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now() - attemptStartedAt).count());
         if(sent > 0)
         {
             const size_t sentBytes = static_cast<size_t>(sent);
@@ -159,6 +175,9 @@ void TcpConnection::handleWrite(){
             return;
         }
         else if(sent < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+            ++sendFileCtx_->wouldBlockCount;
+            sendFileCtx_->blockedAt = std::chrono::steady_clock::now();
+            sendFileCtx_->blocked = true;
             channel_->enableWriteing();
             return;
         }
@@ -455,6 +474,7 @@ void TcpConnection::startSendFileInLoop(const std::string& filePath, off_t offse
     sendFileCtx_->offset = offset;
     sendFileCtx_->remaining = fileSize;
     sendFileCtx_->totalBytes = fileSize;
+    sendFileCtx_->startedAt = std::chrono::steady_clock::now();
     sendFileCtx_->callback = std::move(callback);
 
     if(fileSize == 0) {
@@ -478,13 +498,16 @@ void TcpConnection::finishSendFile(bool success)
     result.bytesSent = context->totalBytes - context->remaining;
     result.writeCalls = context->writeCalls;
     result.maxBytesPerCall = context->maxBytesPerCall;
+    result.syscallNanoseconds = context->syscallNanoseconds;
+    result.wouldBlockCount = context->wouldBlockCount;
+    result.wouldBlockNanoseconds = context->wouldBlockNanoseconds;
+    result.firstAttemptNanoseconds = context->firstAttemptNanoseconds;
     auto callback = std::move(context->callback);
     if(callback) callback(result);
 }
 
 }
 }
-
 
 
 

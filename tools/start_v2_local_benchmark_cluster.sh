@@ -15,8 +15,8 @@ node_c_port="${MINIKV_V2_BENCH_NODE_C_PORT:-19103}"
 node_count="${MINIKV_V2_BENCH_NODE_COUNT:-2}"
 pid_file="${root_dir}/pids"
 
-if [[ ! "${node_count}" =~ ^[2-4]$ ]]; then
-    echo "MINIKV_V2_BENCH_NODE_COUNT must be 2, 3, or 4" >&2
+if [[ ! "${node_count}" =~ ^[1-4]$ ]]; then
+    echo "MINIKV_V2_BENCH_NODE_COUNT must be 1, 2, 3, or 4" >&2
     exit 2
 fi
 

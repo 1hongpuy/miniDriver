@@ -1,0 +1,3 @@
+# Formal Phase D PostgreSQL + pgvector runtime dependency.
+# The database itself is started by docker compose, not by pip.
+psycopg[binary]>=3.2,<4

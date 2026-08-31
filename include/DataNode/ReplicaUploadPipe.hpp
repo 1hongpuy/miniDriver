@@ -5,6 +5,7 @@
 #include "http/PersistentHttpSession.hpp"
 #include "DataNode/ReplicaConnectionPool.hpp"
 #include "DataNode/DiskWriteExecutor.hpp"
+#include "DataNode/ChunkWriteTypes.hpp"
 
 #include <cstddef>
 #include <chrono>
@@ -86,8 +87,8 @@ public:
     // Called from HttpContext::BodyDataCallback. kPause means this segment
     // was accepted by the pipe but more upstream bytes must wait. kAbort means
     // this segment was not accepted and the HTTP stream must fail.
-    miniKV::http::HttpContext::BodyConsumeResult push(const char* data, size_t size);
-    miniKV::http::HttpContext::BodyConsumeResult pushShared(
+    StreamConsumeResult push(const char* data, size_t size);
+    StreamConsumeResult pushShared(
         DiskWriteExecutor::SharedBlockPtr block, size_t size);
 
     // Signals that the upstream HTTP body is complete. Final success still
@@ -110,7 +111,7 @@ private:
     void startPersistentRequestInLoop(http::PersistentHttpSession::Ptr session);
     AsyncWriteResult writeDownstreamInLoop(const char* data, size_t size);
     void finishDownstreamInLoop();
-    miniKV::http::HttpContext::BodyConsumeResult pushInLoop(const char* data, size_t size);
+    StreamConsumeResult pushInLoop(const char* data, size_t size);
     void finishInLoop();
     void abortInLoop();
     struct PendingBlock {
@@ -121,7 +122,7 @@ private:
     };
     bool enqueuePendingInLoop(const char* data, size_t size);
     bool enqueueSharedPendingInLoop(DiskWriteExecutor::SharedBlockPtr block, size_t size);
-    miniKV::http::HttpContext::BodyConsumeResult pushSharedInLoop(
+    StreamConsumeResult pushSharedInLoop(
         DiskWriteExecutor::SharedBlockPtr block, size_t size);
     bool flushPendingInLoop();
     void tryResumeUpstreamInLoop();

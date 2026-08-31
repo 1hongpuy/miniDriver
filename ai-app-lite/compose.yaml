@@ -1,0 +1,98 @@
+x-ai-runtime: &ai-runtime
+  build:
+    context: .
+    dockerfile: Dockerfile
+  restart: unless-stopped
+  environment: &ai-environment
+    AI_STORAGE_BACKEND: postgres
+    AI_POSTGRES_DSN: postgresql://cinedata:${POSTGRES_PASSWORD:-cinedata}@postgres:5432/cinedata
+    AI_REDIS_ADDRESS: redis
+    AI_REDIS_PORT: "6379"
+    AI_REDIS_FILE_EVENT_STREAM: ${AI_REDIS_FILE_EVENT_STREAM:-minidrive:file-events}
+    AI_REDIS_CONSUMER_GROUP: ${AI_REDIS_CONSUMER_GROUP:-cinedata-indexers}
+    AI_REDIS_CONSUMER_NAME: ${AI_REDIS_CONSUMER_NAME:-ai-worker-0}
+    # MiniDrive still runs on the host in the V2 deployment. Docker's
+    # host-gateway mapping makes this name work on Linux as well as Docker Desktop.
+    AI_MINIDRIVE_GATEWAY_URL: ${AI_MINIDRIVE_GATEWAY_URL:-http://host.docker.internal:8080}
+    AI_CORS_ALLOW_ORIGIN: ${AI_CORS_ALLOW_ORIGIN:-http://127.0.0.1:8080}
+    AI_EMBEDDING_PROVIDER: ${AI_EMBEDDING_PROVIDER:-hash}
+    AI_EMBEDDING_DIM: ${AI_EMBEDDING_DIM:-256}
+    AI_WORKER_BATCH_SIZE: ${AI_WORKER_BATCH_SIZE:-4}
+  depends_on:
+    postgres:
+      condition: service_healthy
+    redis:
+      condition: service_healthy
+  extra_hosts:
+    - "host.docker.internal:host-gateway"
+
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    container_name: cinedata-pgvector
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: cinedata
+      POSTGRES_USER: cinedata
+      # Local development default only. Override with POSTGRES_PASSWORD before
+      # sharing a host or exposing a port beyond localhost.
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-cinedata}
+    ports:
+      - "127.0.0.1:54329:5432"
+    volumes:
+      - cinedata_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U cinedata -d cinedata"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  redis:
+    image: redis:7-alpine
+    container_name: cinedata-redis
+    restart: unless-stopped
+    # Remote Gateway/DataNode access is allowed only when the host port is
+    # deliberately bound to a Tailscale/private address in .env.
+    command: ["redis-server", "--appendonly", "yes", "--protected-mode", "no"]
+    ports:
+      - "${AI_REDIS_BIND_ADDRESS:-127.0.0.1}:${AI_REDIS_HOST_PORT:-6379}:6379"
+    volumes:
+      - cinedata_redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  api:
+    <<: *ai-runtime
+    command: ["api", "--host", "0.0.0.0", "--port", "18290"]
+    ports:
+      - "${AI_API_BIND_ADDRESS:-127.0.0.1}:${AI_API_HOST_PORT:-18290}:18290"
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:18290/healthz', timeout=2).read()"
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  stream-worker:
+    <<: *ai-runtime
+    command: ["stream-worker"]
+    environment:
+      <<: *ai-environment
+      AI_REDIS_CONSUMER_NAME: stream-worker-0
+
+  worker:
+    <<: *ai-runtime
+    command: ["worker"]
+    environment:
+      <<: *ai-environment
+      AI_REDIS_CONSUMER_NAME: asset-worker-0
+
+volumes:
+  cinedata_pgdata:
+  cinedata_redisdata:

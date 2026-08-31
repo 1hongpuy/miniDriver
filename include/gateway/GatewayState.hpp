@@ -308,7 +308,10 @@ public:
     CatalogCache::Stats catalogCacheStats() const;
     ManifestCache::Stats manifestCacheStats() const;
     MetadataCacheUsage metadataCacheUsage() const;
-    DeleteStatus deleteObject(const std::string& objectId);
+    // expectedObjectVersion==0 preserves legacy callers. V3 control APIs
+    // pass a concrete version so a stale lifecycle request cannot delete a
+    // newer logical object incarnation.
+    DeleteStatus deleteObject(const std::string& objectId, uint64_t expectedObjectVersion = 0);
     DeleteStatus deleteDirectory(const std::string& path);
     std::vector<DeleteTaskSnapshot> pendingDeletesForNode(const std::string& nodeId) const;
     bool acknowledgeDelete(const std::string& chunkHash, const std::string& nodeId);
@@ -394,7 +397,6 @@ private:
 
 }
 }
-
 
 
 

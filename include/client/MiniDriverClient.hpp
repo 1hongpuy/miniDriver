@@ -2,6 +2,7 @@
 
 #include "client/HttpTransport.hpp"
 
+#include <cstddef>
 #include <cstdint>
 #include <filesystem>
 #include <functional>
@@ -47,6 +48,20 @@ struct UploadOptions {
     std::function<void()> releaseChunk;
 };
 
+// Replayable source required by the current upload retry contract.  A generic
+// non-seekable stream is deliberately not accepted yet: after a route/body
+// failure the SDK must be able to replay exactly the same Chunk bytes.
+struct ObjectSource {
+    std::filesystem::path file;
+};
+
+// Storage-domain options only.  User albums, paths and display names belong
+// to a catalog/business layer, not to the Object API.
+struct PutObjectOptions {
+    UploadOptions transfer;
+    std::string contentType = "application/octet-stream";
+};
+
 struct UploadResult {
     ObjectRef object;
     std::string sessionId;
@@ -79,6 +94,37 @@ struct ObjectReadPlan {
     bool capabilityBound = false;
     std::vector<ChunkReadPlan> chunks;
 };
+
+// Stable object-level metadata for Workers and control-plane callers.  It is
+// deliberately storage-domain metadata only: user albums and media labels
+// remain outside MiniDriver.
+struct ObjectInfo {
+    ObjectRef object;
+    uint64_t metadataVersion = 0;
+    uint64_t size = 0;
+    std::string name;
+    std::string parentPath;
+    std::string state;
+};
+
+struct NodeReadHint {
+    std::string nodeId;
+    uint64_t localBytes = 0;
+    double coverageRatio = 0.0;
+    // A ReadPlan is a placement snapshot, not a live health report.  The
+    // first Object API keeps this explicit rather than inventing health data.
+    std::string health = "unknown";
+};
+
+struct ObjectReadHints {
+    ObjectRef object;
+    uint64_t size = 0;
+    std::vector<NodeReadHint> candidates;
+};
+
+// Called in logical object order.  Returning false aborts the read and sets
+// error; the SDK still owns Chunk verification and replica fallback.
+using ObjectSink = std::function<bool(const char* data, size_t size, std::string& error)>;
 
 struct TransferStats {
     uint64_t dataConnectionOpens = 0;
@@ -122,6 +168,38 @@ public:
     bool uploadFile(const std::filesystem::path& input, const std::string& fileName,
                     const std::string& dirPath, const UploadOptions& options,
                     UploadResult& out, std::string& error) const;
+
+    // Stable Object API façade for native Workers.  The compatibility catalog
+    // entry created underneath uses an opaque SDK-generated name; callers do
+    // not supply a remote directory or business filename.
+    bool putObject(const ObjectSource& source, const PutObjectOptions& options,
+                   ObjectRef& out, std::string& error) const;
+
+    // Compatibility helper for existing catalog/file callers.  New compute
+    // code should use putObject(ObjectSource, PutObjectOptions, ...).
+    bool putObject(const std::filesystem::path& input, const std::string& fileName,
+                   const std::string& dirPath, const UploadOptions& options,
+                   ObjectRef& out, std::string& error) const;
+
+    bool getObject(const ObjectRef& object, const ReadOptions& options,
+                   const ObjectSink& sink, TransferStats& stats, std::string& error);
+
+    bool getRange(const ObjectRef& object, uint64_t offset, uint64_t length,
+                  const ReadOptions& options, const ObjectSink& sink,
+                  TransferStats& stats, RangeReadResult& result, std::string& error);
+
+    bool headObject(const ObjectRef& object, ObjectInfo& out, std::string& error) const;
+
+    // Control/GC API.  Worker processing code should not call this casually.
+    bool deleteObject(const ObjectRef& object, std::string& error) const;
+
+    // Scheduler API.  The current implementation derives hints from one
+    // ReadPlan; batch RPC aggregation is introduced separately at Gateway.
+    bool getObjectReadHints(const ObjectRef& object, ObjectReadHints& out,
+                            std::string& error) const;
+    bool batchGetObjectReadHints(const std::vector<ObjectRef>& objects,
+                                 std::vector<ObjectReadHints>& out,
+                                 std::string& error) const;
 
     bool downloadToFile(const ObjectReadPlan& plan, const std::filesystem::path& output,
                         const ReadOptions& options, TransferStats& stats,

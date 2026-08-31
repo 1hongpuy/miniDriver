@@ -7,6 +7,7 @@
 #include <fstream>
 #include <limits>
 #include <memory>
+#include <string_view>
 #include <vector>
 
 #define STBI_MAX_DIMENSIONS 16000
@@ -34,6 +35,111 @@ bool hasJpegSignature(const std::string& path)
            bytes[0] == 0xff && bytes[1] == 0xd8 && bytes[2] == 0xff;
 }
 
+uint16_t readU16(const unsigned char* data, bool littleEndian)
+{
+    return littleEndian ? static_cast<uint16_t>(data[0] | (static_cast<uint16_t>(data[1]) << 8))
+                        : static_cast<uint16_t>((static_cast<uint16_t>(data[0]) << 8) | data[1]);
+}
+
+uint32_t readU32(const unsigned char* data, bool littleEndian)
+{
+    if(littleEndian) {
+        return static_cast<uint32_t>(data[0]) |
+               (static_cast<uint32_t>(data[1]) << 8) |
+               (static_cast<uint32_t>(data[2]) << 16) |
+               (static_cast<uint32_t>(data[3]) << 24);
+    }
+    return (static_cast<uint32_t>(data[0]) << 24) |
+           (static_cast<uint32_t>(data[1]) << 16) |
+           (static_cast<uint32_t>(data[2]) << 8) |
+           static_cast<uint32_t>(data[3]);
+}
+
+uint16_t exifOrientation(const std::string& path)
+{
+    std::ifstream input(path, std::ios::binary);
+    if(!input) return 1;
+    std::vector<unsigned char> bytes((std::istreambuf_iterator<char>(input)), {});
+    if(bytes.size() < 4 || bytes[0] != 0xff || bytes[1] != 0xd8) return 1;
+
+    for(size_t offset = 2; offset + 4 <= bytes.size();) {
+        if(bytes[offset] != 0xff) { ++offset; continue; }
+        while(offset < bytes.size() && bytes[offset] == 0xff) ++offset;
+        if(offset >= bytes.size()) return 1;
+        const unsigned char marker = bytes[offset++];
+        if(marker == 0xd9 || marker == 0xda) return 1;
+        if(marker == 0x01 || (marker >= 0xd0 && marker <= 0xd7)) continue;
+        if(offset + 2 > bytes.size()) return 1;
+        const size_t segmentLength = (static_cast<size_t>(bytes[offset]) << 8) | bytes[offset + 1];
+        if(segmentLength < 2 || offset + segmentLength > bytes.size()) return 1;
+        const size_t payload = offset + 2;
+        const size_t payloadSize = segmentLength - 2;
+        offset += segmentLength;
+        if(marker != 0xe1 || payloadSize < 14 ||
+           std::string_view(reinterpret_cast<const char*>(bytes.data() + payload), 6) !=
+               std::string_view("Exif\0\0", 6)) {
+            continue;
+        }
+
+        const size_t tiff = payload + 6;
+        const size_t tiffSize = payloadSize - 6;
+        if(tiffSize < 8) return 1;
+        const bool littleEndian = bytes[tiff] == 'I' && bytes[tiff + 1] == 'I';
+        if(!littleEndian && !(bytes[tiff] == 'M' && bytes[tiff + 1] == 'M')) return 1;
+        if(readU16(bytes.data() + tiff + 2, littleEndian) != 42) return 1;
+        const uint32_t ifdOffset = readU32(bytes.data() + tiff + 4, littleEndian);
+        if(ifdOffset > tiffSize - 2) return 1;
+        const size_t ifd = tiff + ifdOffset;
+        const uint16_t entries = readU16(bytes.data() + ifd, littleEndian);
+        if(entries > (tiff + tiffSize - (ifd + 2)) / 12) return 1;
+        for(uint16_t index = 0; index < entries; ++index) {
+            const size_t entry = ifd + 2 + static_cast<size_t>(index) * 12;
+            if(readU16(bytes.data() + entry, littleEndian) != 0x0112 ||
+               readU16(bytes.data() + entry + 2, littleEndian) != 3 ||
+               readU32(bytes.data() + entry + 4, littleEndian) != 1) {
+                continue;
+            }
+            const uint16_t orientation = readU16(bytes.data() + entry + 8, littleEndian);
+            return orientation >= 1 && orientation <= 8 ? orientation : 1;
+        }
+        return 1;
+    }
+    return 1;
+}
+
+bool applyOrientation(const unsigned char* source, int sourceWidth, int sourceHeight,
+                      uint16_t orientation, std::vector<unsigned char>& output,
+                      int& outputWidth, int& outputHeight)
+{
+    if(orientation < 2 || orientation > 8) return false;
+    const bool swapDimensions = orientation >= 5;
+    outputWidth = swapDimensions ? sourceHeight : sourceWidth;
+    outputHeight = swapDimensions ? sourceWidth : sourceHeight;
+    output.resize(static_cast<size_t>(outputWidth) * outputHeight * 3);
+    for(int y = 0; y < outputHeight; ++y) {
+        for(int x = 0; x < outputWidth; ++x) {
+            int sourceX = x;
+            int sourceY = y;
+            switch(orientation) {
+            case 2: sourceX = sourceWidth - 1 - x; break;
+            case 3: sourceX = sourceWidth - 1 - x; sourceY = sourceHeight - 1 - y; break;
+            case 4: sourceY = sourceHeight - 1 - y; break;
+            case 5: sourceX = y; sourceY = x; break;
+            case 6: sourceX = y; sourceY = sourceHeight - 1 - x; break;
+            case 7: sourceX = sourceWidth - 1 - y; sourceY = sourceHeight - 1 - x; break;
+            case 8: sourceX = sourceWidth - 1 - y; sourceY = x; break;
+            default: return false;
+            }
+            const size_t destination = (static_cast<size_t>(y) * outputWidth + x) * 3;
+            const size_t input = (static_cast<size_t>(sourceY) * sourceWidth + sourceX) * 3;
+            output[destination] = source[input];
+            output[destination + 1] = source[input + 1];
+            output[destination + 2] = source[input + 2];
+        }
+    }
+    return true;
+}
+
 void fail(JpegThumbnailResult& result, const std::string& error, bool unsupported = false)
 {
     result = {};
@@ -50,7 +156,7 @@ bool jpegDerivedProfile(const std::string& profile, JpegThumbnailOptions& option
     std::string selectedFileName;
     if(profile == "thumb-512-jpeg-v1") {
         selected.maxEdge = 512;
-        selected.jpegQuality = 82;
+        selected.jpegQuality = 85;
         selectedFileName = "thumb-512-jpeg-v1.jpg";
     } else if(profile == "preview-2048-jpeg-v1") {
         selected.maxEdge = 2048;
@@ -105,6 +211,19 @@ bool generateJpegThumbnail(const std::string& sourcePath, const std::string& out
         return false;
     }
 
+    std::vector<unsigned char> oriented;
+    const unsigned char* resizeSource = source.get();
+    if(options.applyExifOrientation) {
+        int orientedWidth = sourceWidth;
+        int orientedHeight = sourceHeight;
+        if(applyOrientation(source.get(), sourceWidth, sourceHeight, exifOrientation(sourcePath), oriented,
+                            orientedWidth, orientedHeight)) {
+            resizeSource = oriented.data();
+            sourceWidth = orientedWidth;
+            sourceHeight = orientedHeight;
+        }
+    }
+
     uint32_t outputWidth = static_cast<uint32_t>(sourceWidth);
     uint32_t outputHeight = static_cast<uint32_t>(sourceHeight);
     const uint32_t largest = std::max(outputWidth, outputHeight);
@@ -125,7 +244,7 @@ bool generateJpegThumbnail(const std::string& sourcePath, const std::string& out
         return false;
     }
     std::vector<unsigned char> resized(static_cast<size_t>(outputWidth) * outputHeight * 3);
-    if(stbir_resize_uint8_srgb(source.get(), sourceWidth, sourceHeight, sourceWidth * 3,
+    if(stbir_resize_uint8_srgb(resizeSource, sourceWidth, sourceHeight, sourceWidth * 3,
                                resized.data(), static_cast<int>(outputWidth),
                                static_cast<int>(outputHeight), static_cast<int>(outputWidth) * 3,
                                STBIR_RGB) == nullptr) {

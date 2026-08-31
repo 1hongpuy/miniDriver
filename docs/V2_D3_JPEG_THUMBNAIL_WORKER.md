@@ -7,8 +7,11 @@
 
 | Profile | 最大边长 | JPEG 质量 | 用途 |
 | --- | ---: | ---: | --- |
-| `thumb-512-jpeg-v1` | 512px | 82 | 目录瀑布流/缩略图 |
+| `thumb-512-jpeg-v1` | 512px | 85 | OpenCLIP 分析预览；也可作目录缩略图 |
 | `preview-2048-jpeg-v1` | 2048px | 88 | 浏览器预览弹窗 |
+
+两个派生 JPEG 都会先把 EXIF Orientation 烘焙进像素，再按 sRGB 8-bit RGB 路径缩放和编码；
+下游不需要读取 EXIF 方向才能正确显示。输出不嵌入 ICC profile，调用方按普通 sRGB JPEG 消费。
 
 它不会阻塞 Gateway 或 DataNode 的上传路径。Worker 是 Node Agent 启动的独立进程：
 

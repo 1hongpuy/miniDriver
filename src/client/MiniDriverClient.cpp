@@ -195,6 +195,35 @@ bool parseChunks(const std::string& json, bool capabilityBound, uint64_t fileSiz
     return true;
 }
 
+bool parseReadHints(const std::string& json, const ObjectRef& requested,
+                    ObjectReadHints& out, std::string& error) {
+    ObjectReadHints parsed;
+    parsed.object.objectId = miniKV::util::jsonString(json, "objectId");
+    parsed.object.objectVersion = miniKV::util::jsonUint(json, "objectVersion");
+    parsed.size = miniKV::util::jsonUint(json, "fileSize");
+    if(parsed.object.objectId != requested.objectId ||
+       parsed.object.objectVersion != requested.objectVersion || parsed.size == 0) {
+        error = "invalid object read hints response";
+        return false;
+    }
+    for(const std::string& item : miniKV::util::jsonObjectArray(json, "candidates")) {
+        NodeReadHint hint;
+        hint.nodeId = miniKV::util::jsonString(item, "nodeId");
+        hint.localBytes = miniKV::util::jsonUint(item, "localBytes");
+        hint.health = miniKV::util::jsonString(item, "health");
+        hint.coverageRatio = static_cast<double>(miniKV::util::jsonUint(item, "coveragePermille")) / 1000.0;
+        if(hint.nodeId.empty() || hint.localBytes > parsed.size || hint.coverageRatio < 0.0 ||
+           hint.coverageRatio > 1.0 || hint.health.empty()) {
+            error = "invalid read hint candidate";
+            return false;
+        }
+        parsed.candidates.push_back(std::move(hint));
+    }
+    if(parsed.candidates.empty()) { error = "read hints have no candidates"; return false; }
+    out = std::move(parsed);
+    return true;
+}
+
 std::string pathEscape(const std::string& value) {
     static constexpr char digits[] = "0123456789ABCDEF";
     std::string escaped;
@@ -471,6 +500,193 @@ bool MiniDriverClient::uploadFile(const std::filesystem::path& input, const std:
     if (out.fileHash.empty() || out.object.objectId.empty() || out.object.objectVersion == 0) {
         error = "Gateway returned incomplete commit identity";
         return false;
+    }
+    return true;
+}
+
+bool MiniDriverClient::putObject(const std::filesystem::path& input, const std::string& fileName,
+                                 const std::string& dirPath, const UploadOptions& options,
+                                 ObjectRef& out, std::string& error) const {
+    UploadResult uploaded;
+    if (!uploadFile(input, fileName, dirPath, options, uploaded, error)) return false;
+    out = std::move(uploaded.object);
+    return true;
+}
+
+bool MiniDriverClient::putObject(const ObjectSource& source, const PutObjectOptions& options,
+                                 ObjectRef& out, std::string& error) const {
+    if(source.file.empty()) { error = "replayable object source file is required"; return false; }
+    // Gateway's legacy catalog still needs an entry name while the Object API
+    // is being migrated.  Keep it opaque so business naming is not smuggled
+    // into storage identity or the compute contract.
+    const std::string internalName = "_object_" + miniKV::util::randomId();
+    return putObject(source.file, internalName, "/", options.transfer, out, error);
+}
+
+bool MiniDriverClient::getObject(const ObjectRef& object, const ReadOptions& options,
+                                 const ObjectSink& sink, TransferStats& stats,
+                                 std::string& error) {
+    if (!sink) { error = "object sink is required"; return false; }
+    ObjectReadPlan plan;
+    if (!getReadPlan(object, plan, error)) return false;
+    uint64_t delivered = 0;
+    for (const ChunkReadPlan& chunk : plan.chunks) {
+        std::string body;
+        if (!readWholeChunk(chunk, body, options, stats, error)) return false;
+        if (!sink(body.data(), body.size(), error)) {
+            if (error.empty()) error = "object sink rejected bytes";
+            return false;
+        }
+        delivered += body.size();
+    }
+    if (delivered != plan.fileSize) { error = "object length mismatch"; return false; }
+    return true;
+}
+
+bool MiniDriverClient::getRange(const ObjectRef& object, uint64_t offset, uint64_t length,
+                                const ReadOptions& options, const ObjectSink& sink,
+                                TransferStats& stats, RangeReadResult& result,
+                                std::string& error) {
+    result = {};
+    if (!sink || length == 0) { error = "object sink and positive range length are required"; return false; }
+    ObjectReadPlan plan;
+    if (!getReadPlan(object, plan, error)) return false;
+    if (offset >= plan.fileSize || length > plan.fileSize - offset) {
+        error = "range exceeds object";
+        return false;
+    }
+    const uint64_t end = offset + length;
+    uint64_t chunkStart = 0;
+    bool allWholeChunks = true;
+    for (const ChunkReadPlan& chunk : plan.chunks) {
+        const uint64_t chunkEnd = chunkStart + chunk.size;
+        const uint64_t begin = std::max(offset, chunkStart);
+        const uint64_t finish = std::min(end, chunkEnd);
+        if (begin < finish) {
+            const uint64_t localOffset = begin - chunkStart;
+            const uint64_t wanted = finish - begin;
+            IntegrityStatus integrity = IntegrityStatus::kUnverifiedPartialRange;
+            std::string body;
+            if (!readChunkRange(chunk, localOffset, wanted, body, options, stats, integrity, error)) return false;
+            if (!sink(body.data(), body.size(), error)) {
+                if (error.empty()) error = "object sink rejected bytes";
+                return false;
+            }
+            result.bytesRead += body.size();
+            allWholeChunks = allWholeChunks && integrity == IntegrityStatus::kVerifiedWholeChunk;
+        }
+        chunkStart = chunkEnd;
+    }
+    if (result.bytesRead != length) { error = "range length mismatch"; return false; }
+    result.integrity = allWholeChunks ? IntegrityStatus::kVerifiedWholeChunk
+                                      : IntegrityStatus::kUnverifiedPartialRange;
+    return true;
+}
+
+bool MiniDriverClient::headObject(const ObjectRef& object, ObjectInfo& out, std::string& error) const {
+    out = {};
+    if (object.objectId.empty() || object.objectVersion == 0) {
+        error = "object reference is required";
+        return false;
+    }
+    HttpResponse response;
+    const std::map<std::string, std::string> headers{
+        {"X-Cluster-Internal-Token", config_.clusterInternalToken},
+        {"X-Service-Principal", config_.servicePrincipal},
+    };
+    if (config_.clusterInternalToken.empty() || config_.servicePrincipal.empty()) {
+        error = "cluster token and service principal are required";
+        return false;
+    }
+    if (!httpRequest(config_.gateway, "GET", "/internal/v3/objects/" + pathEscape(object.objectId) +
+                     "/versions/" + std::to_string(object.objectVersion) + "/head", headers, "",
+                     config_.gatewayTimeoutMs, response, error)) return false;
+    if (response.status != 200) { error = "object head HTTP " + std::to_string(response.status); return false; }
+    ObjectInfo parsed;
+    parsed.object.objectId = miniKV::util::jsonString(response.body, "objectId");
+    parsed.object.objectVersion = miniKV::util::jsonUint(response.body, "objectVersion");
+    parsed.metadataVersion = miniKV::util::jsonUint(response.body, "metadataVersion");
+    parsed.size = miniKV::util::jsonUint(response.body, "fileSize");
+    parsed.name = miniKV::util::jsonString(response.body, "name");
+    parsed.parentPath = miniKV::util::jsonString(response.body, "parentPath");
+    parsed.state = miniKV::util::jsonString(response.body, "state");
+    if (parsed.object.objectId != object.objectId || parsed.object.objectVersion != object.objectVersion ||
+        parsed.size == 0 || parsed.state.empty()) {
+        error = "invalid object head response";
+        return false;
+    }
+    out = std::move(parsed);
+    return true;
+}
+
+bool MiniDriverClient::deleteObject(const ObjectRef& object, std::string& error) const {
+    if (object.objectId.empty() || object.objectVersion == 0) {
+        error = "object reference is required";
+        return false;
+    }
+    HttpResponse response;
+    const std::map<std::string, std::string> headers{
+        {"X-Cluster-Internal-Token", config_.clusterInternalToken},
+        {"X-Service-Principal", config_.servicePrincipal},
+    };
+    if (config_.clusterInternalToken.empty() || config_.servicePrincipal.empty()) {
+        error = "cluster token and service principal are required";
+        return false;
+    }
+    if (!httpRequest(config_.gateway, "DELETE", "/internal/v3/objects/" + pathEscape(object.objectId) +
+                     "/versions/" + std::to_string(object.objectVersion) + "/delete", headers, "",
+                     config_.gatewayTimeoutMs, response, error)) return false;
+    if (response.status != 202) { error = "object delete HTTP " + std::to_string(response.status); return false; }
+    return true;
+}
+
+bool MiniDriverClient::getObjectReadHints(const ObjectRef& object, ObjectReadHints& out,
+                                          std::string& error) const {
+    out = {};
+    if(object.objectId.empty() || object.objectVersion == 0 || config_.clusterInternalToken.empty() ||
+       config_.servicePrincipal.empty()) { error = "object reference and control credentials are required"; return false; }
+    HttpResponse response;
+    const std::map<std::string, std::string> headers{{"X-Cluster-Internal-Token", config_.clusterInternalToken},
+                                                     {"X-Service-Principal", config_.servicePrincipal}};
+    if(!httpRequest(config_.gateway, "POST", "/internal/v3/objects/" + pathEscape(object.objectId) +
+                    "/versions/" + std::to_string(object.objectVersion) + "/read-hints", headers, "",
+                    config_.gatewayTimeoutMs, response, error)) return false;
+    if(response.status != 200) { error = "object read hints HTTP " + std::to_string(response.status); return false; }
+    return parseReadHints(response.body, object, out, error);
+}
+
+bool MiniDriverClient::batchGetObjectReadHints(const std::vector<ObjectRef>& objects,
+                                               std::vector<ObjectReadHints>& out,
+                                               std::string& error) const {
+    out.clear();
+    if(objects.empty() || config_.clusterInternalToken.empty() || config_.servicePrincipal.empty()) {
+        error = "objects and control credentials are required"; return false;
+    }
+    std::ostringstream body;
+    body << "{\"objects\":[";
+    for(size_t index = 0; index < objects.size(); ++index) {
+        if(objects[index].objectId.empty() || objects[index].objectVersion == 0) {
+            error = "object reference is required"; return false;
+        }
+        if(index != 0) body << ',';
+        body << "{\"objectId\":\"" << miniKV::util::jsonEscape(objects[index].objectId)
+             << "\",\"objectVersion\":" << objects[index].objectVersion << '}';
+    }
+    body << "]}";
+    HttpResponse response;
+    const std::map<std::string, std::string> headers{{"Content-Type", "application/json"},
+                                                     {"X-Cluster-Internal-Token", config_.clusterInternalToken},
+                                                     {"X-Service-Principal", config_.servicePrincipal}};
+    if(!httpRequest(config_.gateway, "POST", "/internal/v3/objects/read-hints:batch", headers, body.str(),
+                    config_.gatewayTimeoutMs, response, error)) return false;
+    if(response.status != 200) { error = "batch object read hints HTTP " + std::to_string(response.status); return false; }
+    const std::vector<std::string> values = miniKV::util::jsonObjectArray(response.body, "objects");
+    if(values.size() != objects.size()) { error = "batch object read hints count mismatch"; return false; }
+    out.reserve(values.size());
+    for(size_t index = 0; index < values.size(); ++index) {
+        ObjectReadHints hints;
+        if(!parseReadHints(values[index], objects[index], hints, error)) { out.clear(); return false; }
+        out.push_back(std::move(hints));
     }
     return true;
 }

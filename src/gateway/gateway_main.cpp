@@ -21,6 +21,7 @@
 #include <filesystem>
 #include <iostream>
 #include <limits>
+#include <map>
 #include <mutex>
 #include <set>
 #include <sstream>
@@ -366,6 +367,27 @@ bool parseObjectReadPlanPath(const std::string& path, std::string& objectId,
     }
 }
 
+bool parseObjectVersionPath(const std::string& path, const char* suffix,
+                            std::string& objectId, uint64_t& objectVersion)
+{
+    constexpr const char* prefix = "/internal/v3/objects/";
+    constexpr const char* marker = "/versions/";
+    const size_t suffixLength = std::strlen(suffix);
+    if(!beginsWith(path, prefix) || path.size() <= std::strlen(prefix) + suffixLength ||
+       path.compare(path.size() - suffixLength, suffixLength, suffix) != 0) return false;
+    const std::string value = path.substr(std::strlen(prefix),
+        path.size() - std::strlen(prefix) - suffixLength);
+    const size_t markerAt = value.find(marker);
+    if(markerAt == std::string::npos || markerAt == 0) return false;
+    objectId = value.substr(0, markerAt);
+    const std::string version = value.substr(markerAt + std::strlen(marker));
+    try {
+        size_t parsed = 0;
+        objectVersion = std::stoull(version, &parsed);
+        return parsed == version.size() && objectVersion > 0;
+    } catch(...) { return false; }
+}
+
 std::string objectReadPlanJson(miniKV::control::ObjectReadDescriptor descriptor,
                                const std::string& principalId,
                                const std::string& clusterSecret)
@@ -404,6 +426,45 @@ std::string objectReadPlanJson(miniKV::control::ObjectReadDescriptor descriptor,
                 << "\",\"port\":" << replica.port << '}';
         }
         out << "]}";
+    }
+    out << "]}";
+    return out.str();
+}
+
+const char* nodeHealthName(NodeLiveState state)
+{
+    switch(state) {
+    case NodeLiveState::kOnline: return "healthy";
+    case NodeLiveState::kRecovering: return "recovering";
+    case NodeLiveState::kSuspect: return "suspect";
+    case NodeLiveState::kOffline: return "offline";
+    case NodeLiveState::kDraining: return "draining";
+    }
+    return "unknown";
+}
+
+std::string objectReadHintsJson(const miniKV::control::ObjectReadDescriptor& descriptor,
+                                const std::map<std::string, NodeSnapshot>& nodes)
+{
+    std::map<std::string, uint64_t> bytesByNode;
+    for(const auto& chunk : descriptor.chunks) {
+        for(const auto& replica : chunk.replicas) bytesByNode[replica.nodeId] += chunk.size;
+    }
+    std::ostringstream out;
+    out << "{\"objectId\":\"" << jsonEscape(descriptor.objectId)
+        << "\",\"objectVersion\":" << descriptor.objectVersion
+        << ",\"fileSize\":" << descriptor.fileSize << ",\"candidates\":[";
+    bool first = true;
+    for(const auto& [nodeId, localBytes] : bytesByNode) {
+        if(!first) out << ',';
+        first = false;
+        const auto node = nodes.find(nodeId);
+        const char* health = node == nodes.end() ? "unknown" : nodeHealthName(node->second.runtime.state);
+        const uint64_t coveragePermille = descriptor.fileSize == 0 ? 0 :
+            (localBytes * 1000ULL) / descriptor.fileSize;
+        out << "{\"nodeId\":\"" << jsonEscape(nodeId) << "\",\"localBytes\":" << localBytes
+            << ",\"coveragePermille\":" << coveragePermille
+            << ",\"health\":\"" << health << "\"}";
     }
     out << "]}";
     return out.str();
@@ -591,6 +652,89 @@ int main(int argc, char** argv) {
                                    " object=" + readObjectId + " version=" +
                                    std::to_string(readObjectVersion));
             json(response, 200, plan);
+            return;
+        }
+        std::string controlObjectId;
+        uint64_t controlObjectVersion = 0;
+        if(request.method() == HttpRequest::kGet &&
+           parseObjectVersionPath(path, "/head", controlObjectId, controlObjectVersion)) {
+            if(!constantTimeEquals(request.getHeader("X-Cluster-Internal-Token"), clusterSecret) ||
+               request.getHeader("X-Service-Principal").empty()) {
+                json(response, 403, jsonError("invalid object control credentials"));
+                return;
+            }
+            ObjectMeta object;
+            if(!state.getObject(controlObjectId, object) || object.objectVersion != controlObjectVersion) {
+                json(response, 404, jsonError("object version not found"));
+            } else {
+                json(response, 200, objectJson(object));
+            }
+            return;
+        }
+        if(request.method() == HttpRequest::kDelete &&
+           parseObjectVersionPath(path, "/delete", controlObjectId, controlObjectVersion)) {
+            if(!constantTimeEquals(request.getHeader("X-Cluster-Internal-Token"), clusterSecret) ||
+               request.getHeader("X-Service-Principal").empty()) {
+                json(response, 403, jsonError("invalid object control credentials"));
+                return;
+            }
+            const DeleteStatus status = state.deleteObject(controlObjectId, controlObjectVersion);
+            if(status == DeleteStatus::kDeleted) {
+                dispatchPendingDeletes();
+                json(response, 202, "{\"status\":\"deleting\",\"objectId\":\"" +
+                    jsonEscape(controlObjectId) + "\",\"objectVersion\":" +
+                    std::to_string(controlObjectVersion) + "}");
+            } else if(status == DeleteStatus::kNotFound) {
+                json(response, 404, jsonError("object version not found"));
+            } else {
+                json(response, 400, jsonError("invalid object delete request"));
+            }
+            return;
+        }
+        if(request.method() == HttpRequest::kPost &&
+           parseObjectVersionPath(path, "/read-hints", controlObjectId, controlObjectVersion)) {
+            if(!constantTimeEquals(request.getHeader("X-Cluster-Internal-Token"), clusterSecret) ||
+               request.getHeader("X-Service-Principal").empty()) {
+                json(response, 403, jsonError("invalid object control credentials"));
+                return;
+            }
+            miniKV::control::ObjectReadDescriptor descriptor;
+            if(!state.buildObjectReadDescriptor(controlObjectId, descriptor) ||
+               descriptor.objectVersion != controlObjectVersion) {
+                json(response, 404, jsonError("object version not found"));
+            } else {
+                std::map<std::string, NodeSnapshot> nodes;
+                for(const NodeSnapshot& node : state.nodes()) nodes.emplace(node.record.nodeId, node);
+                json(response, 200, objectReadHintsJson(descriptor, nodes));
+            }
+            return;
+        }
+        if(request.method() == HttpRequest::kPost && path == "/internal/v3/objects/read-hints:batch") {
+            if(!constantTimeEquals(request.getHeader("X-Cluster-Internal-Token"), clusterSecret) ||
+               request.getHeader("X-Service-Principal").empty()) {
+                json(response, 403, jsonError("invalid object control credentials"));
+                return;
+            }
+            std::map<std::string, NodeSnapshot> nodes;
+            for(const NodeSnapshot& node : state.nodes()) nodes.emplace(node.record.nodeId, node);
+            std::ostringstream result;
+            result << "{\"objects\":[";
+            bool first = true;
+            for(const std::string& item : jsonObjectArray(body, "objects")) {
+                const std::string objectId = jsonString(item, "objectId");
+                const uint64_t version = jsonUint(item, "objectVersion");
+                miniKV::control::ObjectReadDescriptor descriptor;
+                if(objectId.empty() || version == 0 || !state.buildObjectReadDescriptor(objectId, descriptor) ||
+                   descriptor.objectVersion != version) {
+                    json(response, 404, jsonError("object version not found"));
+                    return;
+                }
+                if(!first) result << ',';
+                first = false;
+                result << objectReadHintsJson(descriptor, nodes);
+            }
+            result << "]}";
+            json(response, 200, result.str());
             return;
         }
         if (request.method() == HttpRequest::kPost && path == "/api/v2/nodes/register") {

@@ -121,6 +121,9 @@ int main()
 
         FileMeta unique;
         CHECK(createObject(state, "unique.NEF", "/delete-me", unique));
+        CHECK(state.deleteObject(unique.objectId, unique.objectVersion + 1) == DeleteStatus::kNotFound);
+        ObjectMeta versionProtected;
+        CHECK(state.getObject(unique.objectId, versionProtected));
         CHECK(state.deleteObject(unique.objectId) == DeleteStatus::kDeleted);
         CHECK(!state.getObject(unique.objectId, object));
         CHECK(!state.buildManifestSnapshot(unique.fileHash, manifest));

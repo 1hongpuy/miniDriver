@@ -9,8 +9,37 @@
 #define STB_IMAGE_IMPLEMENTATION
 #include "stb_image.h"
 
+#include <array>
 #include <filesystem>
+#include <fstream>
 #include <vector>
+
+namespace {
+
+bool writeOrientationSixJpeg(const std::filesystem::path& source,
+                             const std::filesystem::path& oriented)
+{
+    std::ifstream input(source, std::ios::binary);
+    std::vector<unsigned char> bytes((std::istreambuf_iterator<char>(input)), {});
+    if(bytes.size() < 2 || bytes[0] != 0xff || bytes[1] != 0xd8) return false;
+    const std::array<unsigned char, 36> exif = {
+        0xff, 0xe1, 0x00, 0x22,
+        'E', 'x', 'i', 'f', 0x00, 0x00,
+        'I', 'I', 0x2a, 0x00, 0x08, 0x00, 0x00, 0x00,
+        0x01, 0x00,
+        0x12, 0x01, 0x03, 0x00, 0x01, 0x00, 0x00, 0x00,
+        0x06, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00
+    };
+    std::ofstream output(oriented, std::ios::binary | std::ios::trunc);
+    output.write(reinterpret_cast<const char*>(bytes.data()), 2);
+    output.write(reinterpret_cast<const char*>(exif.data()), exif.size());
+    output.write(reinterpret_cast<const char*>(bytes.data() + 2),
+                 static_cast<std::streamsize>(bytes.size() - 2));
+    return static_cast<bool>(output);
+}
+
+}  // namespace
 
 int main()
 {
@@ -43,6 +72,14 @@ int main()
     MINIKV_CHECK(height == 256);
     stbi_image_free(decoded);
 
+    const std::filesystem::path orientedSource = directory / "oriented-source.jpg";
+    const std::filesystem::path orientedThumbnail = directory / "oriented-thumbnail.jpg";
+    MINIKV_CHECK(writeOrientationSixJpeg(source, orientedSource));
+    MINIKV_CHECK(miniKV::media::generateJpegThumbnail(orientedSource.string(),
+                                                       orientedThumbnail.string(), result));
+    MINIKV_CHECK(result.width == 256);
+    MINIKV_CHECK(result.height == 512);
+
     miniKV::media::JpegThumbnailOptions previewOptions;
     std::string previewFileName;
     MINIKV_CHECK(miniKV::media::jpegDerivedProfile("preview-2048-jpeg-v1",
@@ -50,6 +87,13 @@ int main()
     MINIKV_CHECK(previewOptions.maxEdge == 2048);
     MINIKV_CHECK(previewOptions.jpegQuality == 88);
     MINIKV_CHECK(previewFileName == "preview-2048-jpeg-v1.jpg");
+    miniKV::media::JpegThumbnailOptions thumbOptions;
+    std::string thumbFileName;
+    MINIKV_CHECK(miniKV::media::jpegDerivedProfile("thumb-512-jpeg-v1", thumbOptions,
+                                                   thumbFileName));
+    MINIKV_CHECK(thumbOptions.maxEdge == 512);
+    MINIKV_CHECK(thumbOptions.jpegQuality == 85);
+    MINIKV_CHECK(thumbOptions.applyExifOrientation);
     MINIKV_CHECK(!miniKV::media::jpegDerivedProfile("invalid-profile", previewOptions,
                                                     previewFileName));
 

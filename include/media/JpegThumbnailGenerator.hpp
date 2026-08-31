@@ -12,6 +12,9 @@ struct JpegThumbnailOptions {
     uint64_t maxSourcePixels = 80ULL * 1024ULL * 1024ULL;
     uint32_t maxEdge = 512;
     int jpegQuality = 82;
+    // JPEG EXIF orientation is metadata, not pixels. Apply it before resize so
+    // derived objects always have their visual orientation baked into pixels.
+    bool applyExifOrientation = true;
 };
 
 struct JpegThumbnailResult {

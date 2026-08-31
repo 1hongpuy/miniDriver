@@ -1976,12 +1976,15 @@ MetadataCacheUsage GatewayState::metadataCacheUsage() const
             catalogCache_.size(), manifestCache_.size()};
 }
 
-DeleteStatus GatewayState::deleteObject(const std::string& objectId)
+DeleteStatus GatewayState::deleteObject(const std::string& objectId, uint64_t expectedObjectVersion)
 {
     if (objectId.empty()) return DeleteStatus::kInvalidRequest;
     std::lock_guard<std::mutex> lock(mutex_);
     ObjectMeta object;
     if (!getObjectLocked(objectId, object)) return DeleteStatus::kNotFound;
+    if (expectedObjectVersion != 0 && object.objectVersion != expectedObjectVersion) {
+        return DeleteStatus::kNotFound;
+    }
     return deleteCatalogEntriesLocked({objectId}, {});
 }
 

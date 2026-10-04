@@ -51,9 +51,12 @@ private slots:
     void catalogLoaded(const miniKV::qtclient::CatalogSnapshot& snapshot);
     void catalogFailed(const QString& path, const QString& error);
     void showVideoPlayerWindow();
+    void saveConnectionSettings();
+    void loadConnectionSettings();
 
 private:
     miniKV::client::ClientConfig clientConfig() const;
+    QString connectionSettingsPath() const;
     void buildUi();
     VideoPlayerWidget* ensureVideoPlayerWindow();
     QUrl edgePlaybackUrl(const QString& objectId, quint64 version, QString& error) const;
@@ -66,6 +69,7 @@ private:
     QLineEdit* servicePrincipal_ = nullptr;
     QLineEdit* edgeHost_ = nullptr;
     QLineEdit* edgePort_ = nullptr;
+    QLineEdit* metadataMode_ = nullptr;
     QLineEdit* objectId_ = nullptr;
     QLineEdit* objectVersion_ = nullptr;
     QLineEdit* catalogPath_ = nullptr;

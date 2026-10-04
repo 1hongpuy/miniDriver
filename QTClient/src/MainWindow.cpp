@@ -12,11 +12,14 @@
 #include <QGroupBox>
 #include <QHBoxLayout>
 #include <QHeaderView>
+#include <QJsonDocument>
+#include <QJsonObject>
 #include <QLabel>
 #include <QListView>
 #include <QMessageBox>
 #include <QDir>
 #include <QPushButton>
+#include <QSaveFile>
 #include <QStandardPaths>
 #include <QSplitter>
 #include <QStatusBar>
@@ -67,6 +70,7 @@ MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent) {
         logFile_.open(QIODevice::WriteOnly | QIODevice::Append | QIODevice::Text);
     }
     buildUi();
+    loadConnectionSettings();
 
     heartbeatLabel_ = new QLabel(QStringLiteral("GUI heartbeat: --"), this);
     heartbeatLabel_->setToolTip(QStringLiteral("诊断 Qt GUI EventLoop 是否被传输任务阻塞"));
@@ -103,12 +107,23 @@ void MainWindow::buildUi() {
     servicePrincipal_ = new QLineEdit(QStringLiteral("qt-client"), connectionBox);
     edgeHost_ = new QLineEdit(QStringLiteral("127.0.0.1"), connectionBox);
     edgePort_ = new QLineEdit(QStringLiteral("19100"), connectionBox);
+    metadataMode_ = new QLineEdit(qEnvironmentVariable("MINIKV_METADATA_MODE", QStringLiteral("raft")), connectionBox);
     connectionForm->addRow(QStringLiteral("Gateway host"), gatewayHost_);
     connectionForm->addRow(QStringLiteral("Gateway port"), gatewayPort_);
     connectionForm->addRow(QStringLiteral("Cluster token"), clusterToken_);
     connectionForm->addRow(QStringLiteral("Service principal"), servicePrincipal_);
     connectionForm->addRow(QStringLiteral("Edge host (Step 3 lab)"), edgeHost_);
     connectionForm->addRow(QStringLiteral("Edge port"), edgePort_);
+    connectionForm->addRow(QStringLiteral("Metadata mode"), metadataMode_);
+    auto* settingsButtons = new QHBoxLayout();
+    auto* saveSettings = new QPushButton(QStringLiteral("Save connection settings"), connectionBox);
+    auto* reloadSettings = new QPushButton(QStringLiteral("Reload settings"), connectionBox);
+    settingsButtons->addWidget(saveSettings);
+    settingsButtons->addWidget(reloadSettings);
+    settingsButtons->addStretch(1);
+    connectionForm->addRow(settingsButtons);
+    connect(saveSettings, &QPushButton::clicked, this, &MainWindow::saveConnectionSettings);
+    connect(reloadSettings, &QPushButton::clicked, this, &MainWindow::loadConnectionSettings);
     root->addWidget(connectionBox);
 
     auto* actions = new QGroupBox(QStringLiteral("Object transfer"), central);
@@ -247,6 +262,72 @@ void MainWindow::showVideoPlayerWindow() {
     }
 }
 
+QString MainWindow::connectionSettingsPath() const {
+    const QString directory = QStandardPaths::writableLocation(QStandardPaths::AppConfigLocation);
+    return directory.isEmpty() ? QString() : QDir(directory).filePath(QStringLiteral("connection.json"));
+}
+
+void MainWindow::saveConnectionSettings() {
+    const QString path = connectionSettingsPath();
+    if (path.isEmpty() || !QDir().mkpath(QFileInfo(path).absolutePath())) {
+        QMessageBox::warning(this, QStringLiteral("Settings"), QStringLiteral("Cannot create the local settings directory."));
+        return;
+    }
+    const QString mode = metadataMode_->text().trimmed();
+    if (mode.isEmpty()) {
+        QMessageBox::warning(this, QStringLiteral("Settings"), QStringLiteral("Metadata mode cannot be empty."));
+        return;
+    }
+    QJsonObject settings;
+    settings.insert(QStringLiteral("schemaVersion"), 1);
+    settings.insert(QStringLiteral("gatewayHost"), gatewayHost_->text().trimmed());
+    settings.insert(QStringLiteral("gatewayPort"), gatewayPort_->text().trimmed());
+    settings.insert(QStringLiteral("servicePrincipal"), servicePrincipal_->text().trimmed());
+    settings.insert(QStringLiteral("edgeHost"), edgeHost_->text().trimmed());
+    settings.insert(QStringLiteral("edgePort"), edgePort_->text().trimmed());
+    settings.insert(QStringLiteral("metadataMode"), mode);
+    settings.insert(QStringLiteral("clusterTokenEnv"), QStringLiteral("MINIDRIVER_QT_CLUSTER_TOKEN"));
+    QSaveFile output(path);
+    if (!output.open(QIODevice::WriteOnly) || output.write(QJsonDocument(settings).toJson(QJsonDocument::Indented)) < 0 || !output.commit()) {
+        QMessageBox::warning(this, QStringLiteral("Settings"), QStringLiteral("Cannot save connection settings: %1").arg(output.errorString()));
+        return;
+    }
+    qputenv("MINIKV_METADATA_MODE", mode.toUtf8());
+    statusBar()->showMessage(QStringLiteral("Connection settings saved: %1").arg(path), 5000);
+}
+
+void MainWindow::loadConnectionSettings() {
+    const QString path = connectionSettingsPath();
+    if (path.isEmpty() || !QFileInfo::exists(path)) return;
+    QFile input(path);
+    if (!input.open(QIODevice::ReadOnly)) {
+        statusBar()->showMessage(QStringLiteral("Cannot read connection settings: %1").arg(input.errorString()), 5000);
+        return;
+    }
+    QJsonParseError parseError;
+    const QJsonDocument document = QJsonDocument::fromJson(input.readAll(), &parseError);
+    if (parseError.error != QJsonParseError::NoError || !document.isObject()) {
+        statusBar()->showMessage(QStringLiteral("Invalid connection settings JSON: %1").arg(parseError.errorString()), 5000);
+        return;
+    }
+    const QJsonObject settings = document.object();
+    const auto apply = [&settings](QLineEdit* field, const char* key) {
+        const QString value = settings.value(QLatin1String(key)).toString();
+        if (!value.isEmpty()) field->setText(value);
+    };
+    apply(gatewayHost_, "gatewayHost");
+    apply(gatewayPort_, "gatewayPort");
+    apply(servicePrincipal_, "servicePrincipal");
+    apply(edgeHost_, "edgeHost");
+    apply(edgePort_, "edgePort");
+    apply(metadataMode_, "metadataMode");
+    const QString token = qEnvironmentVariable("MINIDRIVER_QT_CLUSTER_TOKEN");
+    if (!token.isEmpty()) clusterToken_->setText(token);
+    const QString mode = metadataMode_->text().trimmed();
+    if (!mode.isEmpty()) qputenv("MINIKV_METADATA_MODE", mode.toUtf8());
+    statusBar()->showMessage(QStringLiteral("Connection settings loaded%1").arg(token.isEmpty() ? QStringLiteral("; token still required") : QString()), 5000);
+}
+
 miniKV::client::ClientConfig MainWindow::clientConfig() const {
     miniKV::client::ClientConfig config;
     config.gateway.host = gatewayHost_->text().trimmed().toStdString();
@@ -255,6 +336,8 @@ miniKV::client::ClientConfig MainWindow::clientConfig() const {
     config.gateway.port = validPort ? port : 0;
     config.clusterInternalToken = clusterToken_->text().toStdString();
     config.servicePrincipal = servicePrincipal_->text().trimmed().toStdString();
+    const QString mode = metadataMode_->text().trimmed();
+    if (!mode.isEmpty()) qputenv("MINIKV_METADATA_MODE", mode.toUtf8());
     return config;
 }
 

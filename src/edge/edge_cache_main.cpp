@@ -1,4 +1,5 @@
 #include "client/MiniDriverClient.hpp"
+#include "client/HttpTransport.hpp"
 #include "edge/EdgeCacheStore.hpp"
 #include "http/HttpRange.hpp"
 #include "http/HttpRequest.hpp"
@@ -7,6 +8,7 @@
 #include "network/EventLoop.hpp"
 #include "utils/AsyncLogger.hpp"
 #include "utils/ThreadPool.hpp"
+#include "utils/Util.hpp"
 
 #include <atomic>
 #include <cctype>
@@ -17,6 +19,7 @@
 #include <filesystem>
 #include <iostream>
 #include <limits>
+#include <map>
 #include <string>
 #include <string_view>
 #include <unistd.h>
@@ -104,42 +107,54 @@ std::string contentTypeForName(const std::string& name) {
     return "application/octet-stream";
 }
 
-bool parseObjectPath(const std::string& path, ObjectRef& object, std::string& errorMessage) {
-    constexpr std::string_view prefix = "/v1/play/";
+std::string queryEscape(std::string_view value) {
+    static constexpr char digits[] = "0123456789ABCDEF";
+    std::string result;
+    result.reserve(value.size() * 3U);
+    for (const unsigned char byte : value) {
+        const bool safe = (byte >= 'a' && byte <= 'z') ||
+                          (byte >= 'A' && byte <= 'Z') ||
+                          (byte >= '0' && byte <= '9') ||
+                          byte == '-' || byte == '_' || byte == '.' || byte == '~';
+        if (safe) result.push_back(static_cast<char>(byte));
+        else {
+            result.push_back('%');
+            result.push_back(digits[(byte >> 4U) & 0x0fU]);
+            result.push_back(digits[byte & 0x0fU]);
+        }
+    }
+    return result;
+}
+
+bool parseVirtualPath(const std::string& path, std::string& virtualPath,
+                      std::string& parentPath, std::string& leafName,
+                      std::string& errorMessage) {
+    constexpr std::string_view prefix = "/vod/";
     if (!startsWith(path, prefix)) {
         errorMessage = "route not found";
         return false;
     }
-    const std::string tail = path.substr(prefix.size());
-    const size_t objectSlash = tail.find('/');
-    if (objectSlash == std::string::npos || objectSlash == 0 || objectSlash + 1 >= tail.size()) {
-        errorMessage = "expected /v1/play/{objectId}/{objectVersion}[/displayName]";
+    const std::string tail = miniKV::util::urlDecode(path.substr(prefix.size()));
+    if (tail.empty() || tail.front() == '/' || tail.find('\0') != std::string::npos) {
+        errorMessage = "expected /vod/{virtualPath}";
         return false;
     }
-    const size_t nameSlash = tail.find('/', objectSlash + 1);
-    const std::string versionText = nameSlash == std::string::npos
-        ? tail.substr(objectSlash + 1)
-        : tail.substr(objectSlash + 1, nameSlash - objectSlash - 1);
-    if (versionText.empty() ||
-        (nameSlash != std::string::npos &&
-         (nameSlash + 1 >= tail.size() || tail.find('/', nameSlash + 1) != std::string::npos))) {
-        errorMessage = "expected /v1/play/{objectId}/{objectVersion}[/displayName]";
-        return false;
+    size_t begin = 0;
+    while (begin < tail.size()) {
+        const size_t end = tail.find('/', begin);
+        const std::string_view part(tail.data() + begin,
+                                    (end == std::string::npos ? tail.size() : end) - begin);
+        if (part.empty() || part == "." || part == "..") {
+            errorMessage = "invalid virtual path";
+            return false;
+        }
+        if (end == std::string::npos) break;
+        begin = end + 1;
     }
-    object.objectId = tail.substr(0, objectSlash);
-    try {
-        size_t parsed = 0;
-        object.objectVersion = std::stoull(versionText, &parsed);
-        if (parsed != versionText.size() || object.objectVersion == 0) throw std::invalid_argument("version");
-    } catch (...) {
-        errorMessage = "objectVersion must be a positive integer";
-        return false;
-    }
-    if (object.objectId.empty() || object.objectId.find("..") != std::string::npos ||
-        object.objectId.find('/') != std::string::npos) {
-        errorMessage = "invalid objectId";
-        return false;
-    }
+    virtualPath = "/" + tail;
+    const size_t slash = virtualPath.find_last_of('/');
+    parentPath = slash == 0 ? "/" : virtualPath.substr(0, slash);
+    leafName = virtualPath.substr(slash + 1);
     return true;
 }
 
@@ -147,6 +162,43 @@ struct EdgeConfig {
     ClientConfig client;
     std::shared_ptr<EdgeCacheStore> cache;
 };
+
+bool resolveVirtualObject(const HttpRequest& request, const EdgeConfig& config,
+                          ObjectRef& object, std::string& virtualPath,
+                          std::string& errorMessage) {
+    std::string parentPath;
+    std::string leafName;
+    if (!parseVirtualPath(request.path(), virtualPath, parentPath, leafName, errorMessage)) return false;
+
+    std::map<std::string, std::string> headers;
+    headers.emplace("X-Cluster-Internal-Token", config.client.clusterInternalToken);
+    headers.emplace("X-Service-Principal", config.client.servicePrincipal);
+    miniKV::client::HttpResponse catalog;
+    if (!miniKV::client::httpRequest(config.client.gateway, "GET",
+                                     "/api/v2/catalog?path=" + queryEscape(parentPath), headers, "",
+                                     config.client.gatewayTimeoutMs, catalog, errorMessage)) {
+        errorMessage = "cannot resolve virtual path: " + errorMessage;
+        return false;
+    }
+    if (catalog.status != 200) {
+        const std::string message = miniKV::util::jsonString(catalog.body, "error");
+        errorMessage = "catalog HTTP " + std::to_string(catalog.status) +
+                       (message.empty() ? std::string{} : ": " + message);
+        return false;
+    }
+    for (const std::string& file : miniKV::util::jsonObjectArray(catalog.body, "files")) {
+        if (miniKV::util::jsonString(file, "name") != leafName) continue;
+        if (miniKV::util::jsonString(file, "state") != "AVAILABLE") {
+            errorMessage = "virtual path is not available";
+            return false;
+        }
+        object.objectId = miniKV::util::jsonString(file, "objectId");
+        object.objectVersion = miniKV::util::jsonUint(file, "objectVersion");
+        if (!object.objectId.empty() && object.objectVersion > 0) return true;
+    }
+    errorMessage = "virtual path not found";
+    return false;
+}
 
 void addObjectHeaders(HttpResponse* response, const ObjectInfo& info,
                       uint64_t totalSize, uint64_t start, uint64_t length, bool partial) {
@@ -165,8 +217,9 @@ void addObjectHeaders(HttpResponse* response, const ObjectInfo& info,
 
 void handlePlayback(const HttpRequest& request, HttpResponse* response, const EdgeConfig& config) {
     ObjectRef object;
+    std::string virtualPath;
     std::string failure;
-    if (!parseObjectPath(request.path(), object, failure)) {
+    if (!resolveVirtualObject(request, config, object, virtualPath, failure)) {
         error(response, HttpResponse::k404NotFound, failure);
         return;
     }
@@ -275,10 +328,11 @@ void handlePlayback(const HttpRequest& request, HttpResponse* response, const Ed
     addObjectHeaders(response, info, plan.fileSize, start, length, partial);
     auto heldLeases = std::make_shared<std::vector<CacheLease>>(std::move(leases));
     response->setFileBodies(std::move(segments), static_cast<size_t>(length),
-        [heldLeases, object, start, length, stats, originBytes, cacheHits](const miniKV::network::SendFileResult& sent) {
+        [heldLeases, object, virtualPath, start, length, stats, originBytes, cacheHits](const miniKV::network::SendFileResult& sent) {
             miniKV::utils::logInfo(
                 "event=edge_response_complete object_id=" + object.objectId +
                 " object_version=" + std::to_string(object.objectVersion) +
+                " virtual_path=" + virtualPath +
                 " range_start=" + std::to_string(start) +
                 " range_length=" + std::to_string(length) +
                 " response_bytes=" + std::to_string(sent.bytesSent) +

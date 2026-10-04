@@ -554,26 +554,22 @@ void MainWindow::previewSelectedCatalogObject() {
     statusBar()->showMessage(QStringLiteral("Preview download queued: %1").arg(taskId));
 }
 
-QUrl MainWindow::edgePlaybackUrl(const QString& objectId, quint64 version,
-                                 const QString& displayName, QString& error) const {
+QUrl MainWindow::edgePlaybackUrl(const QString& virtualPath, QString& error) const {
     const QString host = edgeHost_->text().trimmed();
     bool validPort = false;
     const quint16 port = edgePort_->text().toUShort(&validPort);
-    if (host.isEmpty() || !validPort || port == 0 || version == 0) {
-        error = QStringLiteral("Enter a valid Edge host, port, and ObjectRef.");
+    if (host.isEmpty() || !validPort || port == 0 || virtualPath.isEmpty() ||
+        !virtualPath.startsWith(QLatin1Char('/'))) {
+        error = QStringLiteral("Enter a valid Edge host, port, and virtual path.");
         return {};
     }
-    const QString safeName = QFileInfo(displayName).fileName();
     QUrl url;
     url.setScheme(QStringLiteral("http"));
     url.setHost(host);
     url.setPort(port);
-    // Windows Media Foundation can use the URL extension while deciding which
-    // demuxer to load. The final segment is presentation-only: Edge still
-    // resolves bytes solely from ObjectRef(objectId, version).
-    url.setPath(QStringLiteral("/v1/play/") + objectId + QStringLiteral("/") +
-                QString::number(version) + QStringLiteral("/") +
-                (safeName.isEmpty() ? QStringLiteral("object.bin") : safeName));
+    // This is the public VOD identity. Edge resolves it to ObjectRef inside
+    // the trusted cluster, keeping object IDs and versions out of the player.
+    url.setPath(QStringLiteral("/vod") + virtualPath);
     if (!url.isValid()) error = QStringLiteral("Cannot construct Edge playback URL.");
     return url;
 }
@@ -583,8 +579,17 @@ void MainWindow::playSelectedCatalogObject() {
     quint64 version = 0;
     QString name;
     if (!selectedCatalogObject(objectId, version, name)) return;
+    QString virtualPath = catalogPath_->text().trimmed();
+    if (virtualPath.isEmpty()) virtualPath = QStringLiteral("/");
+    if (!virtualPath.startsWith(QLatin1Char('/'))) {
+        QMessageBox::warning(this, QStringLiteral("Invalid virtual path"),
+                             QStringLiteral("Catalog path must start with '/'."));
+        return;
+    }
+    if (!virtualPath.endsWith(QLatin1Char('/'))) virtualPath += QLatin1Char('/');
+    virtualPath += QFileInfo(name).fileName();
     QString failure;
-    const QUrl url = edgePlaybackUrl(objectId, version, name, failure);
+    const QUrl url = edgePlaybackUrl(virtualPath, failure);
     if (!url.isValid()) {
         QMessageBox::warning(this, QStringLiteral("Invalid Edge endpoint"), failure);
         return;
@@ -595,7 +600,7 @@ void MainWindow::playSelectedCatalogObject() {
     videoPlayerWindow_->activateWindow();
     if (player->openNetworkUrl(url)) {
         player->play();
-        statusBar()->showMessage(QStringLiteral("Opening %1 through Edge HTTP Range").arg(name));
+        statusBar()->showMessage(QStringLiteral("Opening %1 through Edge HTTP Range").arg(virtualPath));
     }
 }
 

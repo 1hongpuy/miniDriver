@@ -59,8 +59,7 @@ private:
     QString connectionSettingsPath() const;
     void buildUi();
     VideoPlayerWidget* ensureVideoPlayerWindow();
-    QUrl edgePlaybackUrl(const QString& objectId, quint64 version,
-                         const QString& displayName, QString& error) const;
+    QUrl edgePlaybackUrl(const QString& virtualPath, QString& error) const;
     bool selectedCatalogObject(QString& objectId, quint64& version, QString& name);
     QString previewOutputPath(const QString& objectId, quint64 version, const QString& name) const;
 

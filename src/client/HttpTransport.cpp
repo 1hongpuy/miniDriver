@@ -1,21 +1,24 @@
 #include "client/HttpTransport.hpp"
 
 #include <algorithm>
+#include <chrono>
+#include <cctype>
 #include <climits>
+#include <cstring>
+#include <sstream>
+#include <thread>
 #ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #else
 #include <arpa/inet.h>
-#include <chrono>
-#include <cctype>
 #include <cerrno>
-#include <cstring>
 #include <netdb.h>
 #include <poll.h>
-#include <sstream>
 #include <sys/socket.h>
-#include <thread>
 #include <unistd.h>
 #endif
 
@@ -54,7 +57,7 @@ void closeSocket(TransportSocket fd) { if (fd != kInvalidTransportSocket) ::clos
 bool waitFor(TransportSocket fd, short events, int timeoutMs, std::string& error) {
     PollDescriptor descriptor{fd, events, 0};
 #ifdef _WIN32
-    const int result = ::WSAPoll(&descriptor, 1, timeoutMs);
+    const int result = ::WSAPoll(&descriptor, static_cast<ULONG>(1), timeoutMs);
 #else
     const int result = ::poll(&descriptor, 1, timeoutMs);
 #endif
@@ -104,7 +107,7 @@ TransportSocket connectSocket(const Endpoint& endpoint, int timeoutMs, std::stri
 #else
             socklen_t length = sizeof(socketError);
 #endif
-            if (::getsockopt(fd, SOL_SOCKET, SO_ERROR, &socketError, &length) != 0 || socketError != 0) {
+            if (::getsockopt(fd, SOL_SOCKET, SO_ERROR, reinterpret_cast<char*>(&socketError), &length) != 0 || socketError != 0) {
                 error = socketError == 0 ? "getsockopt(SO_ERROR) failed" : socketErrorText(socketError);
                 closeSocket(fd); fd = kInvalidTransportSocket; continue;
             }
@@ -189,8 +192,8 @@ bool readResponse(TransportSocket fd, int timeoutMs, HttpResponse& response, std
         bytes.append(buffer, static_cast<size_t>(result));
         if (headerEnd != std::string::npos) {
             const size_t bodyStart = headerEnd + 4;
-            const size_t fresh = bytes.size() > std::max(oldSize, bodyStart)
-                ? bytes.size() - std::max(oldSize, bodyStart) : 0;
+            const size_t fresh = bytes.size() > (std::max)(oldSize, bodyStart)
+                ? bytes.size() - (std::max)(oldSize, bodyStart) : 0;
             throttle(fresh, maxReadBytesPerSecond);
             continue;
         }

@@ -22,7 +22,7 @@ option(MINIKV_DESKTOP_CLIENT_ONLY
     "Build only the portable SDK and Qt desktop client (for native Windows delivery)" OFF)
 set(MINIKV_NURAFT_SOURCE_DIR "" CACHE PATH
     "Path to a pinned NuRaft source tree (v2.1.0 is supported by CMake 3.22)")
-if (MINIKV_ENABLE_FRAME_POINTERS)
+if (MINIKV_ENABLE_FRAME_POINTERS AND NOT MSVC)
     add_compile_options(-fno-omit-frame-pointer)
 endif()
 

@@ -4,11 +4,13 @@ project(miniKV VERSION 0.1 LANGUAGES CXX)
 
 include(CTest)
 
-if (NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
-    set(CMAKE_BUILD_TYPE "RelWithDebInfo" CACHE STRING "Build type" FORCE)
+if (NOT CMAKE_CONFIGURATION_TYPES)
+    if (NOT CMAKE_BUILD_TYPE)
+        set(CMAKE_BUILD_TYPE "RelWithDebInfo" CACHE STRING "Build type" FORCE)
+    endif()
+    set_property(CACHE CMAKE_BUILD_TYPE PROPERTY STRINGS
+        "Debug" "Release" "RelWithDebInfo" "MinSizeRel")
 endif()
-set_property(CACHE CMAKE_BUILD_TYPE PROPERTY STRINGS
-    "Debug" "Release" "RelWithDebInfo" "MinSizeRel")
 
 option(MINIKV_ENABLE_FRAME_POINTERS
     "Keep frame pointers for perf and flame graph profiling" ON)

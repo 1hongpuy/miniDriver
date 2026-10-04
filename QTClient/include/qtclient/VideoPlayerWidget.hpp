@@ -78,6 +78,7 @@ private:
     QStackedLayout* videoStack_ = nullptr;
     QTimer* diagnosticsTimer_ = nullptr;
     QString currentLocalFile_;
+    QUrl currentSource_;
     qint64 durationMs_ = 0;
     QElapsedTimer diagnosticsClock_;
     qint64 frameWindowStartedMs_ = 0;

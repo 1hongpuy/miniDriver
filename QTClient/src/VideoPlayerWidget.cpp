@@ -55,6 +55,17 @@ QString bitRateText(const QVariant& value) {
         static_cast<double>(bitsPerSecond) / 1000.0 / 1000.0, 0, 'f', 2);
 }
 
+QString mediaErrorText(QMediaPlayer::Error error) {
+    switch (error) {
+    case QMediaPlayer::NoError: return QStringLiteral("NoError");
+    case QMediaPlayer::ResourceError: return QStringLiteral("ResourceError");
+    case QMediaPlayer::FormatError: return QStringLiteral("FormatError");
+    case QMediaPlayer::NetworkError: return QStringLiteral("NetworkError");
+    case QMediaPlayer::AccessDeniedError: return QStringLiteral("AccessDeniedError");
+    }
+    return QStringLiteral("UnknownError");
+}
+
 }  // namespace
 
 VideoPlayerWidget::VideoPlayerWidget(QWidget* parent) : QWidget(parent) {
@@ -182,12 +193,13 @@ bool VideoPlayerWidget::openLocalFile(const QString& path) {
 
     player_->stop();
     currentLocalFile_ = info.absoluteFilePath();
+    currentSource_ = QUrl::fromLocalFile(currentLocalFile_);
     durationMs_ = 0;
     resetPlaybackDiagnostics();
     positionSlider_->setRange(0, 0);
     positionLabel_->setText(QStringLiteral("00:00 / 00:00"));
     videoStack_->setCurrentWidget(videoOutput_);
-    player_->setSource(QUrl::fromLocalFile(currentLocalFile_));
+    player_->setSource(currentSource_);
     setStateText(QStringLiteral("Player: loaded %1").arg(info.fileName()));
     emit log(QStringLiteral("player loaded local media: %1").arg(currentLocalFile_));
     return true;
@@ -203,6 +215,7 @@ bool VideoPlayerWidget::openNetworkUrl(const QUrl& url) {
     }
     player_->stop();
     currentLocalFile_.clear();
+    currentSource_ = url;
     durationMs_ = 0;
     positionSlider_->setRange(0, 0);
     positionLabel_->setText(QStringLiteral("00:00 / 00:00"));
@@ -305,11 +318,32 @@ void VideoPlayerWidget::updateBufferProgress(float progress) {
 
 void VideoPlayerWidget::reportError(QMediaPlayer::Error error, const QString& message) {
     if (error == QMediaPlayer::NoError) return;
-    const QString detail = message.isEmpty() ? QStringLiteral("unknown media error") : message;
-    emptyMediaLabel_->setText(QStringLiteral("Unable to play local media\n%1").arg(detail));
+    const QString backendDetail = player_->errorString().trimmed();
+    const QString detail = !message.trimmed().isEmpty() ? message.trimmed()
+        : (!backendDetail.isEmpty() ? backendDetail : QStringLiteral("unknown media error"));
+    const QString sourceKind = currentSource_.isLocalFile()
+        ? QStringLiteral("local") : QStringLiteral("network");
+    const QString errorName = mediaErrorText(error);
+    const QString source = currentSource_.isEmpty()
+        ? QStringLiteral("not reported") : currentSource_.toDisplayString();
+    const QString diagnostic = QStringLiteral(
+        "Unable to play %1 media\n"
+        "Qt error: %2 (%3)\n"
+        "Backend detail: %4\n"
+        "Media status: %5\n"
+        "Source: %6")
+        .arg(sourceKind, errorName)
+        .arg(static_cast<int>(error))
+        .arg(detail, mediaStatusText(player_->mediaStatus()), source);
+    emptyMediaLabel_->setText(diagnostic);
     videoStack_->setCurrentWidget(emptyMediaLabel_);
-    setStateText(QStringLiteral("Player error: %1").arg(detail));
-    emit log(QStringLiteral("player error code=%1: %2").arg(static_cast<int>(error)).arg(detail));
+    setStateText(QStringLiteral("Player error: %1 (%2): %3")
+        .arg(errorName).arg(static_cast<int>(error)).arg(detail));
+    emit log(QStringLiteral("player error source=%1 code=%2 (%3) status=%4 detail=%5")
+        .arg(source)
+        .arg(errorName)
+        .arg(static_cast<int>(error))
+        .arg(mediaStatusText(player_->mediaStatus()), detail));
 }
 
 void VideoPlayerWidget::updateMediaInfo() {

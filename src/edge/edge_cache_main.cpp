@@ -390,11 +390,14 @@ int main(int, char**) {
                                       const miniKV::network::TcpConnectionPtr&,
                                       const miniKV::http::DeferredResponse::Ptr&) {
         if (request.path() != "/healthz") {
-            miniKV::utils::logInfo(
+            // EdgeCache intentionally has no file logger initialization. Write the
+            // bounded request trace to stderr so `kubectl logs` can observe the
+            // client-side media backend without exposing cluster credentials.
+            std::cerr <<
                 "event=edge_request method=" + request.methodString() +
                 " path=" + request.path() +
                 " range=" + request.getHeader("Range") +
-                " user_agent=" + request.getHeader("User-Agent"));
+                " user_agent=" + request.getHeader("User-Agent") << '\n';
         }
         if (request.method() == HttpRequest::kGet && request.path() == "/healthz") {
             response->setStatusCode(HttpResponse::k200Ok);

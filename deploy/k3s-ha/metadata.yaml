@@ -1,0 +1,342 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: metadata-1
+  labels: &metadataLabels
+    app.kubernetes.io/name: minidriver
+    app.kubernetes.io/component: metadata
+    app.kubernetes.io/part-of: minidriver-ha
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: minidriver
+      app.kubernetes.io/component: metadata
+      minidriver.io/member: "1"
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: minidriver
+        app.kubernetes.io/component: metadata
+        app.kubernetes.io/part-of: minidriver-ha
+        minidriver.io/member: "1"
+    spec:
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+      nodeSelector:
+        kubernetes.io/hostname: minidriver-1
+      terminationGracePeriodSeconds: 30
+      securityContext: &podSecurityContext
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        fsGroupChangePolicy: OnRootMismatch
+      containers:
+        - name: metadata
+          image: minidriver:4.0-ha-k3s
+          imagePullPolicy: Never
+          command: ["/usr/local/bin/minikv_metadata_raft_service"]
+          env: &metadataCommonEnv
+            - name: MINIKV_METADATA_MEMBER_ID
+              value: "1"
+            - name: MINIKV_METADATA_PORT
+              value: "18101"
+            - name: MINIKV_METADATA_RAFT_PORT
+              value: "18001"
+            - name: MINIKV_METADATA_RAFT_MEMBERS
+              value: "1@192.168.137.10:18001,2@192.168.137.148:18001,3@192.168.137.151:18001"
+            - name: MINIKV_METADATA_IO_THREADS
+              value: "2"
+            - name: MINIKV_METADATA_DIR
+              value: /var/lib/minidriver/metadata
+            - name: MINIKV_METADATA_WAL_DIR
+              value: /var/lib/minidriver/metadata-wal
+            - name: MINIKV_V2_CLUSTER_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: cluster-secret
+                  key: cluster-secret
+            - name: MINIKV_LOG_LEVEL
+              value: info
+            # Disabled by default. Set to 1 only for a bounded diagnostic run;
+            # it emits asynchronous per-command span logs without altering Raft.
+            - name: MINIKV_METADATA_COMMAND_DIAGNOSTICS
+              value: "0"
+          ports:
+            - name: raft
+              containerPort: 18001
+              protocol: TCP
+            - name: metadata-http
+              containerPort: 18101
+              protocol: TCP
+          startupProbe: &metadataStartupProbe
+            httpGet:
+              path: /healthz
+              port: metadata-http
+            periodSeconds: 2
+            failureThreshold: 60
+          readinessProbe: &metadataReadinessProbe
+            httpGet:
+              path: /readyz
+              port: metadata-http
+            periodSeconds: 3
+            timeoutSeconds: 2
+            failureThreshold: 10
+          livenessProbe: &metadataLivenessProbe
+            httpGet:
+              path: /healthz
+              port: metadata-http
+            periodSeconds: 10
+            timeoutSeconds: 2
+            failureThreshold: 6
+          resources: &metadataResources
+            requests:
+              cpu: 250m
+              memory: 256Mi
+          securityContext: &containerSecurityContext
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: metadata-state
+              mountPath: /var/lib/minidriver/metadata
+            - name: metadata-wal
+              mountPath: /var/lib/minidriver/metadata-wal
+      volumes:
+        - name: metadata-state
+          hostPath:
+            path: /var/lib/minidriver-metadata/meta-1/state
+            type: Directory
+        - name: metadata-wal
+          hostPath:
+            path: /var/lib/minidriver-metadata/meta-1/wal
+            type: Directory
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: metadata-2
+  labels:
+    app.kubernetes.io/name: minidriver
+    app.kubernetes.io/component: metadata
+    app.kubernetes.io/part-of: minidriver-ha
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: minidriver
+      app.kubernetes.io/component: metadata
+      minidriver.io/member: "2"
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: minidriver
+        app.kubernetes.io/component: metadata
+        app.kubernetes.io/part-of: minidriver-ha
+        minidriver.io/member: "2"
+    spec:
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+      nodeSelector:
+        kubernetes.io/hostname: minidriver-2
+      terminationGracePeriodSeconds: 30
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        fsGroupChangePolicy: OnRootMismatch
+      containers:
+        - name: metadata
+          image: minidriver:4.0-ha-k3s
+          imagePullPolicy: Never
+          command: ["/usr/local/bin/minikv_metadata_raft_service"]
+          env:
+            - name: MINIKV_METADATA_MEMBER_ID
+              value: "2"
+            - name: MINIKV_METADATA_PORT
+              value: "18101"
+            - name: MINIKV_METADATA_RAFT_PORT
+              value: "18001"
+            - name: MINIKV_METADATA_RAFT_MEMBERS
+              value: "1@192.168.137.10:18001,2@192.168.137.148:18001,3@192.168.137.151:18001"
+            - name: MINIKV_METADATA_IO_THREADS
+              value: "2"
+            - name: MINIKV_METADATA_DIR
+              value: /var/lib/minidriver/metadata
+            - name: MINIKV_METADATA_WAL_DIR
+              value: /var/lib/minidriver/metadata-wal
+            - name: MINIKV_V2_CLUSTER_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: cluster-secret
+                  key: cluster-secret
+            - name: MINIKV_LOG_LEVEL
+              value: info
+            - name: MINIKV_METADATA_COMMAND_DIAGNOSTICS
+              value: "0"
+          ports:
+            - name: raft
+              containerPort: 18001
+            - name: metadata-http
+              containerPort: 18101
+          startupProbe:
+            httpGet:
+              path: /healthz
+              port: metadata-http
+            periodSeconds: 2
+            failureThreshold: 60
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: metadata-http
+            periodSeconds: 3
+            timeoutSeconds: 2
+            failureThreshold: 10
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: metadata-http
+            periodSeconds: 10
+            timeoutSeconds: 2
+            failureThreshold: 6
+          resources:
+            requests:
+              cpu: 250m
+              memory: 256Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: metadata-state
+              mountPath: /var/lib/minidriver/metadata
+            - name: metadata-wal
+              mountPath: /var/lib/minidriver/metadata-wal
+      volumes:
+        - name: metadata-state
+          hostPath:
+            path: /var/lib/minidriver-metadata/meta-2/state
+            type: Directory
+        - name: metadata-wal
+          hostPath:
+            path: /var/lib/minidriver-metadata/meta-2/wal
+            type: Directory
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: metadata-3
+  labels:
+    app.kubernetes.io/name: minidriver
+    app.kubernetes.io/component: metadata
+    app.kubernetes.io/part-of: minidriver-ha
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: minidriver
+      app.kubernetes.io/component: metadata
+      minidriver.io/member: "3"
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: minidriver
+        app.kubernetes.io/component: metadata
+        app.kubernetes.io/part-of: minidriver-ha
+        minidriver.io/member: "3"
+    spec:
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+      nodeSelector:
+        kubernetes.io/hostname: minidriver-3
+      terminationGracePeriodSeconds: 30
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        fsGroupChangePolicy: OnRootMismatch
+      containers:
+        - name: metadata
+          image: minidriver:4.0-ha-k3s
+          imagePullPolicy: Never
+          command: ["/usr/local/bin/minikv_metadata_raft_service"]
+          env:
+            - name: MINIKV_METADATA_MEMBER_ID
+              value: "3"
+            - name: MINIKV_METADATA_PORT
+              value: "18101"
+            - name: MINIKV_METADATA_RAFT_PORT
+              value: "18001"
+            - name: MINIKV_METADATA_RAFT_MEMBERS
+              value: "1@192.168.137.10:18001,2@192.168.137.148:18001,3@192.168.137.151:18001"
+            - name: MINIKV_METADATA_IO_THREADS
+              value: "2"
+            - name: MINIKV_METADATA_DIR
+              value: /var/lib/minidriver/metadata
+            - name: MINIKV_METADATA_WAL_DIR
+              value: /var/lib/minidriver/metadata-wal
+            - name: MINIKV_V2_CLUSTER_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: cluster-secret
+                  key: cluster-secret
+            - name: MINIKV_LOG_LEVEL
+              value: info
+            - name: MINIKV_METADATA_COMMAND_DIAGNOSTICS
+              value: "0"
+          ports:
+            - name: raft
+              containerPort: 18001
+            - name: metadata-http
+              containerPort: 18101
+          startupProbe:
+            httpGet:
+              path: /healthz
+              port: metadata-http
+            periodSeconds: 2
+            failureThreshold: 60
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: metadata-http
+            periodSeconds: 3
+            timeoutSeconds: 2
+            failureThreshold: 10
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: metadata-http
+            periodSeconds: 10
+            timeoutSeconds: 2
+            failureThreshold: 6
+          resources:
+            requests:
+              cpu: 250m
+              memory: 256Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: metadata-state
+              mountPath: /var/lib/minidriver/metadata
+            - name: metadata-wal
+              mountPath: /var/lib/minidriver/metadata-wal
+      volumes:
+        - name: metadata-state
+          hostPath:
+            path: /var/lib/minidriver-metadata/meta-3/state
+            type: Directory
+        - name: metadata-wal
+          hostPath:
+            path: /var/lib/minidriver-metadata/meta-3/wal
+            type: Directory

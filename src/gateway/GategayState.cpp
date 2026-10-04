@@ -1,8 +1,10 @@
 #include "gateway/GatewayState.hpp"
 #include "utils/Util.hpp"
+#include "utils/AsyncLogger.hpp"
 
 
 #include <algorithm>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
@@ -19,10 +21,208 @@
 #include <string>
 #include <utility>
 #include <vector>
+#include <cstdlib>
+#include <unordered_map>
 
 
 namespace miniKV {
 namespace gateway {
+
+namespace {
+bool legacyAiOutboxEnabled()
+{
+    const char* value = std::getenv("MINIKV_GATEWAY_AI_OUTBOX_ENABLED");
+    return value != nullptr && (std::string(value) == "1" || std::string(value) == "true" ||
+                                std::string(value) == "on");
+}
+}  // namespace
+
+GatewayLockMode GatewayLockManager::modeFromEnvironment()
+{
+    const char* value = std::getenv("MINIKV_GATEWAY_LOCK_MODE");
+    if (value != nullptr && std::string(value) == "sharded") return GatewayLockMode::kSharded;
+    return GatewayLockMode::kGlobal;
+}
+
+const char* GatewayLockManager::modeName(GatewayLockMode mode) noexcept
+{
+    return mode == GatewayLockMode::kSharded ? "sharded" : "global";
+}
+
+size_t GatewayLockManager::sessionShard(const std::string& sessionId) const noexcept
+{
+    return std::hash<std::string>{}(sessionId) % kShardCount;
+}
+
+size_t GatewayLockManager::objectShard(const std::string& canonicalKey) const noexcept
+{
+    return std::hash<std::string>{}(canonicalKey) % kShardCount;
+}
+
+namespace {
+struct GatewayMutexAggregate {
+    uint64_t count = 0;
+    uint64_t totalWaitUs = 0;
+    uint64_t totalHoldUs = 0;
+    uint64_t maxWaitUs = 0;
+    uint64_t maxHoldUs = 0;
+    uint64_t totalDbUs = 0;
+    uint64_t maxDbUs = 0;
+    std::vector<uint64_t> waits;
+    std::vector<uint64_t> holds;
+    std::vector<uint64_t> dbWrites;
+};
+std::mutex gatewayMutexMetricsMutex;
+std::unordered_map<std::string, GatewayMutexAggregate> gatewayMutexMetrics;
+std::chrono::steady_clock::time_point gatewayMutexFirstSample;
+std::vector<std::pair<uint64_t, uint64_t>> gatewayMutexIntervals;
+
+uint64_t percentile(std::vector<uint64_t> values, double p)
+{
+    if(values.empty()) return 0;
+    const size_t index = static_cast<size_t>(p * static_cast<double>(values.size() - 1));
+    std::nth_element(values.begin(), values.begin() + index, values.end());
+    return values[index];
+}
+}
+
+void recordGatewayMutexSample(const char* label, uint64_t waitUs, uint64_t holdUs) {
+    if(std::getenv("MINIKV_GATEWAY_MUTEX_DIAGNOSTICS") == nullptr) return;
+    std::lock_guard<std::mutex> lock(gatewayMutexMetricsMutex);
+    auto& metric = gatewayMutexMetrics[label == nullptr ? "unknown" : label];
+    if(gatewayMutexFirstSample == std::chrono::steady_clock::time_point{}) {
+        gatewayMutexFirstSample = std::chrono::steady_clock::now();
+    }
+    ++metric.count;
+    metric.totalWaitUs += waitUs;
+    metric.totalHoldUs += holdUs;
+    metric.maxWaitUs = std::max(metric.maxWaitUs, waitUs);
+    metric.maxHoldUs = std::max(metric.maxHoldUs, holdUs);
+    // Diagnostics are explicitly opt-in and only run during bounded benchmark
+    // cases, so retaining samples gives useful P50/P95/P99 values without
+    // affecting the normal storage path.
+    metric.waits.push_back(waitUs);
+    metric.holds.push_back(holdUs);
+    if(metric.count % 1000 == 0) {
+        miniKV::utils::logInfo("event=gateway_mutex_sample label=" +
+            std::string(label == nullptr ? "unknown" : label) +
+            " acquire_count=" + std::to_string(metric.count) +
+            " total_hold_us=" + std::to_string(metric.totalHoldUs) +
+            " max_hold_us=" + std::to_string(metric.maxHoldUs));
+    }
+}
+
+void recordGatewayMutexInterval(std::chrono::steady_clock::time_point start,
+                                std::chrono::steady_clock::time_point end) {
+    if(std::getenv("MINIKV_GATEWAY_MUTEX_DIAGNOSTICS") == nullptr) return;
+    const uint64_t startNs = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+        start.time_since_epoch()).count());
+    const uint64_t endNs = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+        end.time_since_epoch()).count());
+    if(endNs <= startNs) return;
+    std::lock_guard<std::mutex> lock(gatewayMutexMetricsMutex);
+    gatewayMutexIntervals.emplace_back(startNs, endNs);
+}
+
+void recordGatewayLevelDbSample(const char* label, uint64_t durationUs) {
+    if(std::getenv("MINIKV_GATEWAY_MUTEX_DIAGNOSTICS") == nullptr) return;
+    std::lock_guard<std::mutex> lock(gatewayMutexMetricsMutex);
+    auto& metric = gatewayMutexMetrics[label == nullptr ? "unknown" : label];
+    metric.totalDbUs += durationUs;
+    metric.maxDbUs = std::max(metric.maxDbUs, durationUs);
+    metric.dbWrites.push_back(durationUs);
+}
+
+void resetGatewayMutexDiagnostics() {
+    if(std::getenv("MINIKV_GATEWAY_MUTEX_DIAGNOSTICS") == nullptr) return;
+    std::lock_guard<std::mutex> lock(gatewayMutexMetricsMutex);
+    gatewayMutexMetrics.clear();
+    gatewayMutexIntervals.clear();
+    gatewayMutexFirstSample = std::chrono::steady_clock::now();
+    miniKV::utils::logInfo("event=gateway_mutex_diagnostics_reset");
+}
+
+void flushGatewayMutexDiagnostics() {
+    if(std::getenv("MINIKV_GATEWAY_MUTEX_DIAGNOSTICS") == nullptr) return;
+    std::lock_guard<std::mutex> lock(gatewayMutexMetricsMutex);
+    const auto now = std::chrono::steady_clock::now();
+    const uint64_t windowUs = gatewayMutexFirstSample == std::chrono::steady_clock::time_point{}
+        ? 0 : static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
+            now - gatewayMutexFirstSample).count());
+    uint64_t totalHoldUs = 0;
+    uint64_t totalCount = 0;
+    for(const auto& [label, metric] : gatewayMutexMetrics) {
+        totalHoldUs += metric.totalHoldUs;
+        totalCount += metric.count;
+        miniKV::utils::logInfo("event=gateway_mutex_summary label=" + label +
+            " acquire_count=" + std::to_string(metric.count) +
+            " mutex_wait_p50_us=" + std::to_string(percentile(metric.waits, 0.50)) +
+            " mutex_wait_p95_us=" + std::to_string(percentile(metric.waits, 0.95)) +
+            " mutex_wait_p99_us=" + std::to_string(percentile(metric.waits, 0.99)) +
+            " mutex_wait_p999_us=" + std::to_string(percentile(metric.waits, 0.999)) +
+            " mutex_wait_max_us=" + std::to_string(metric.maxWaitUs) +
+            " lock_hold_p50_us=" + std::to_string(percentile(metric.holds, 0.50)) +
+            " lock_hold_p95_us=" + std::to_string(percentile(metric.holds, 0.95)) +
+            " lock_hold_p99_us=" + std::to_string(percentile(metric.holds, 0.99)) +
+            " lock_hold_p999_us=" + std::to_string(percentile(metric.holds, 0.999)) +
+            " lock_hold_max_us=" + std::to_string(metric.maxHoldUs) +
+            " sum_lock_hold_us=" + std::to_string(metric.totalHoldUs) +
+            " leveldb_write_p50_us=" + std::to_string(percentile(metric.dbWrites, 0.50)) +
+            " leveldb_write_p95_us=" + std::to_string(percentile(metric.dbWrites, 0.95)) +
+            " leveldb_write_p99_us=" + std::to_string(percentile(metric.dbWrites, 0.99)) +
+            " leveldb_write_p999_us=" + std::to_string(percentile(metric.dbWrites, 0.999)) +
+            " leveldb_write_max_us=" + std::to_string(metric.maxDbUs) +
+            " window_us=" + std::to_string(windowUs));
+    }
+    // Sum of holds is useful for per-shard utilization but may exceed wall
+    // time when independent shards are held concurrently.  The union of
+    // intervals is the process-wide occupancy and is therefore bounded by
+    // 100%, matching the definition used for the global mutex baseline.
+    uint64_t busyUs = 0;
+    if (!gatewayMutexIntervals.empty()) {
+        const uint64_t windowStartNs = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+            gatewayMutexFirstSample.time_since_epoch()).count());
+        const uint64_t windowEndNs = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+            now.time_since_epoch()).count());
+        std::vector<std::pair<uint64_t, uint64_t>> clipped;
+        clipped.reserve(gatewayMutexIntervals.size());
+        for (const auto [rawStart, rawEnd] : gatewayMutexIntervals) {
+            const uint64_t start = std::max(rawStart, windowStartNs);
+            const uint64_t end = std::min(rawEnd, windowEndNs);
+            if (end > start) clipped.emplace_back(start, end);
+        }
+        std::sort(clipped.begin(), clipped.end());
+        if (clipped.empty()) {
+            gatewayMutexIntervals.clear();
+        } else {
+        uint64_t unionStart = clipped.front().first;
+        uint64_t unionEnd = clipped.front().second;
+        for (size_t i = 1; i < clipped.size(); ++i) {
+            const auto [start, end] = clipped[i];
+            if (start <= unionEnd) {
+                unionEnd = std::max(unionEnd, end);
+            } else {
+                busyUs += (unionEnd - unionStart) / 1000ULL;
+                unionStart = start;
+                unionEnd = end;
+            }
+        }
+        busyUs += (unionEnd - unionStart) / 1000ULL;
+        }
+    }
+    const uint64_t occupancy = windowUs == 0 ? 0 : (busyUs * 1000000ULL) / windowUs;
+    miniKV::utils::logInfo("event=gateway_mutex_summary_total acquire_count=" +
+        std::to_string(totalCount) + " sum_lock_hold_us=" + std::to_string(totalHoldUs) +
+        " busy_union_us=" + std::to_string(busyUs) +
+        " window_us=" + std::to_string(windowUs) +
+        " mutex_occupancy_ppm=" + std::to_string(occupancy));
+}
+
+namespace {
+struct GatewayMutexDiagnosticsAtExit {
+    ~GatewayMutexDiagnosticsAtExit() { flushGatewayMutexDiagnostics(); }
+} gatewayMutexDiagnosticsAtExit;
+}
 
 using namespace util;
 
@@ -720,7 +920,7 @@ PlacementPlan GatewayState::selectPlacementLocked(const SessionState& session, u
     });
     PlacementPlan plan;
     plan.chunkIndex = index;
-    for(size_t i = 0; i < candidates.size() && i < 2; i++)
+    for(size_t i = 0; i < candidates.size() && i < replicationFactor_; i++)
     {
         plan.chain.push_back(candidates[i].node);
     }
@@ -733,7 +933,11 @@ bool GatewayState::reserveLeaseLocked(const SessionState& session,
                                       int64_t now)
 {
     if(plan.chain.empty()) return false;
-    plan.leaseId = randomId();
+    const std::string randomLeaseId = randomId();
+    if (randomLeaseId.empty()) return false;
+    plan.leaseId = useShardedLocks()
+        ? std::to_string(locks_.sessionShard(session.sessionId)) + ":" + randomLeaseId
+        : randomLeaseId;
     if(plan.leaseId.empty()) return false;
     plan.routeVersion = std::hash<std::string>{}(plan.leaseId);
     plan.expiresAt = now + 120;
@@ -758,23 +962,42 @@ bool GatewayState::reserveLeaseLocked(const SessionState& session,
     lease.chunkSize = request.chunkSize;
     lease.expiresAt = plan.expiresAt;
     lease.plan = plan;
+    lease.reservation.tokenId = lease.leaseId;
+    lease.reservation.bytes = request.chunkSize;
 
     for(const auto& node : plan.chain) {
         ++reservedWritesByNode_[node.record.nodeId];
         reservedBytesByNode_[node.record.nodeId] += request.chunkSize;
+        lease.reservation.nodeIds.push_back(node.record.nodeId);
     }
-    leaseByRequestKey_[lease.requestKey] = lease.leaseId;
-    leases_[lease.leaseId] = std::move(lease);
+    if (useShardedLocks()) {
+        const size_t shard = locks_.sessionShard(session.sessionId);
+        shardedLeaseByRequestKey_[shard][lease.requestKey] = lease.leaseId;
+        shardedLeases_[shard][lease.leaseId] = std::move(lease);
+    } else {
+        leaseByRequestKey_[lease.requestKey] = lease.leaseId;
+        leases_[lease.leaseId] = std::move(lease);
+    }
     return true;
 }
 
-void GatewayState::releaseLeaseLocked(const std::string& leaseId)
+bool GatewayState::releaseLeaseLocked(const std::string& leaseId,
+                                      ReservationToken::State terminalState)
 {
-    const auto it = leases_.find(leaseId);
-    if(it == leases_.end()) return;
+    const size_t shard = useShardedLocks() ? leaseShard(leaseId) : kLockShardCount;
+    auto* leaseMap = useShardedLocks() && shard < kLockShardCount
+        ? &shardedLeases_[shard] : &leases_;
+    auto* requestMap = useShardedLocks() && shard < kLockShardCount
+        ? &shardedLeaseByRequestKey_[shard] : &leaseByRequestKey_;
+    const auto it = leaseMap->find(leaseId);
+    // Erasing the token is the idempotence boundary: a retry, timeout scan or
+    // disconnect cleanup can call this again, but only the first caller may
+    // decrement NodeRegistry reservation counters.
+    if(it == leaseMap->end()) return false;
 
-    for(const auto& node : it->second.plan.chain) {
-        const std::string& nodeId = node.record.nodeId;
+    auto& token = it->second.reservation;
+    token.state = terminalState;
+    for(const auto& nodeId : token.nodeIds) {
         auto writes = reservedWritesByNode_.find(nodeId);
         if(writes != reservedWritesByNode_.end()) {
             if(writes->second <= 1) reservedWritesByNode_.erase(writes);
@@ -782,20 +1005,31 @@ void GatewayState::releaseLeaseLocked(const std::string& leaseId)
         }
         auto bytes = reservedBytesByNode_.find(nodeId);
         if(bytes != reservedBytesByNode_.end()) {
-            if(bytes->second <= it->second.chunkSize) reservedBytesByNode_.erase(bytes);
-            else bytes->second -= it->second.chunkSize;
+            if(bytes->second <= token.bytes) reservedBytesByNode_.erase(bytes);
+            else bytes->second -= token.bytes;
         }
     }
-    const auto request = leaseByRequestKey_.find(it->second.requestKey);
-    if(request != leaseByRequestKey_.end() && request->second == leaseId) {
-        leaseByRequestKey_.erase(request);
+    const auto request = requestMap->find(it->second.requestKey);
+    if(request != requestMap->end() && request->second == leaseId) {
+        requestMap->erase(request);
     }
-    leases_.erase(it);
+    leaseMap->erase(it);
+    return true;
 }
 
 void GatewayState::releaseExpiredLeasesLocked(int64_t now)
 {
     std::vector<std::string> expired;
+    if (useShardedLocks()) {
+        for (auto& shardLeases : shardedLeases_) {
+            expired.clear();
+            for (const auto& [leaseId, lease] : shardLeases) {
+                if (lease.expiresAt <= now) expired.push_back(leaseId);
+            }
+            for (const auto& leaseId : expired) releaseLeaseLocked(leaseId);
+        }
+        return;
+    }
     for(const auto& [leaseId, lease] : leases_) {
         if(lease.expiresAt <= now) expired.push_back(leaseId);
     }
@@ -805,6 +1039,18 @@ void GatewayState::releaseExpiredLeasesLocked(int64_t now)
 void GatewayState::releaseLeasesForNodeLocked(const std::string& nodeId)
 {
     std::vector<std::string> affected;
+    if (useShardedLocks()) {
+        for (auto& shardLeases : shardedLeases_) {
+            affected.clear();
+            for (const auto& [leaseId, lease] : shardLeases) {
+                const bool containsNode = std::any_of(lease.plan.chain.begin(), lease.plan.chain.end(),
+                    [&nodeId](const NodeSnapshot& node) { return node.record.nodeId == nodeId; });
+                if (containsNode) affected.push_back(leaseId);
+            }
+            for (const auto& leaseId : affected) releaseLeaseLocked(leaseId);
+        }
+        return;
+    }
     for(const auto& [leaseId, lease] : leases_) {
         const bool containsNode = std::any_of(lease.plan.chain.begin(), lease.plan.chain.end(),
             [&nodeId](const NodeSnapshot& node) { return node.record.nodeId == nodeId; });
@@ -814,8 +1060,11 @@ void GatewayState::releaseLeasesForNodeLocked(const std::string& nodeId)
 }
 
 //
-GatewayState::GatewayState(const std::string& dbPath)
-    : dbPath_(dbPath),
+GatewayState::GatewayState(const std::string& dbPath, uint32_t replicationFactor,
+                           GatewayLockMode lockMode)
+    : replicationFactor_(std::max<uint32_t>(1, replicationFactor)),
+      dbPath_(dbPath),
+      locks_(lockMode),
       objectCache_(ObjectMetaCache::Config{kObjectCacheMaxEntries, kObjectCacheMaxBytes}),
       fileCache_(FileMetaCache::Config{kFileCacheMaxEntries, kFileCacheMaxBytes}),
       routeCache_(ChunkRouteCache::Config{kRouteCacheMaxEntries, kRouteCacheMaxBytes}),
@@ -825,9 +1074,52 @@ GatewayState::GatewayState(const std::string& dbPath)
 }
 GatewayState::~GatewayState() = default;
 
+void GatewayState::configureRemoteMetadata(std::shared_ptr<metadata::MetadataClient> client)
+{
+    std::lock_guard<std::mutex> lock(locks_.lifecycle());
+    remoteMetadata_ = std::move(client);
+}
+
+std::mutex& GatewayState::sessionMutex(const std::string& sessionId) const noexcept
+{
+    return locks_.session(locks_.sessionShard(sessionId));
+}
+
+std::mutex& GatewayState::objectMutex(const std::string& canonicalKey) const noexcept
+{
+    return locks_.object(locks_.objectShard(canonicalKey));
+}
+
+size_t GatewayState::leaseShard(const std::string& leaseId) const noexcept
+{
+    if (leaseId.empty()) return kLockShardCount;
+    const auto separator = leaseId.find(':');
+    if (separator == std::string::npos || separator == 0) return kLockShardCount;
+    size_t shard = 0;
+    for (size_t index = 0; index < separator; ++index) {
+        const char character = leaseId[index];
+        if (character < '0' || character > '9') return kLockShardCount;
+        shard = shard * 10 + static_cast<size_t>(character - '0');
+        if (shard >= kLockShardCount) return kLockShardCount;
+    }
+    return shard;
+}
+
 bool GatewayState::open()
 {
-    std::lock_guard<std::mutex> lock(mutex_);
+    if (remoteMetadata_) {
+        // A raft-backed Gateway must never create or open a local metadata
+        // database.  Keeping this branch before LevelDB::Open is the concrete
+        // no-dual-write invariant for the frontend.
+        // Metadata election may still be in progress at process startup. The
+        // HTTP readiness endpoint probes it later; opening the frontend must
+        // not create a local fallback database or fail permanently during the
+        // election window.
+        return true;
+    }
+    // Startup/recovery owns the lifecycle lock; business shard locks are not
+    // touched until the recovered in-memory indexes are fully constructed.
+    GatewayMutexGuard lock(locks_.lifecycle(), __func__);
     leveldb::Options options;
     options.create_if_missing = true;
     leveldb::DB* raw = nullptr;
@@ -841,7 +1133,34 @@ bool GatewayState::open()
 bool GatewayState::registerNode(const NodeRecord& node)
 {
     if(node.nodeId.empty() || node.address.empty() || !hasCapability(node, "storage")) return false;
-    std::lock_guard<std::mutex> lock(mutex_);
+    if (remoteMetadata_) {
+        auto& bootId = remoteBootIds_[node.nodeId];
+        if (bootId.empty()) bootId = randomId();
+        metadata::MetadataCommand command;
+        command.commandId = metadata::MetadataClient::newCommandId("register-" + node.nodeId);
+        command.type = metadata::MetadataCommandType::kRegisterNode;
+        command.actorType = "gateway"; command.actorId = node.nodeId; command.issuedAt = unixSeconds();
+        metadata::RegisterNodePayload payload;
+        payload.nodeId = node.nodeId; payload.bootId = bootId; payload.address = node.address;
+        payload.dataPort = node.httpPort; payload.registeredCapacityBytes = node.maxStorageBytes;
+        payload.capabilities = node.capabilities; command.payload = std::move(payload);
+        const auto result = remoteMetadata_->propose(command);
+        if (result.status != metadata::ApplyStatus::kOk && result.status != metadata::ApplyStatus::kAlreadyApplied) return false;
+        remoteNodeEpochs_[node.nodeId] = result.nodeEpoch;
+        return true;
+    }
+    if (useShardedLocks()) {
+        // Persist first; the registry lock protects only the in-memory
+        // ownership update and is never held across LevelDB I/O.
+        if (!db_->Put(leveldb::WriteOptions(), "n:" + node.nodeId, nodeValue(node)).ok()) return false;
+        std::unique_lock<std::shared_mutex> lock(locks_.nodes());
+        const bool firstRegistration = nodeRecords_.find(node.nodeId) == nodeRecords_.end();
+        nodeRecords_[node.nodeId] = node;
+        if (firstRegistration) nodeRuntime_[node.nodeId].state = NodeLiveState::kRecovering;
+        manifestCache_.clear();
+        return true;
+    }
+    GatewayMutexGuard lock(mutex_, __func__);
     const bool firstRegistration = nodeRecords_.find(node.nodeId) == nodeRecords_.end();
     if (!db_->Put(leveldb::WriteOptions(), "n:"+node.nodeId, nodeValue(node)).ok()) return false;
     nodeRecords_[node.nodeId] = node;
@@ -851,7 +1170,47 @@ bool GatewayState::registerNode(const NodeRecord& node)
 }
 bool GatewayState::heartbeat(const std::string& nodeId, const NodeRuntime& runtime)
 {
-    std::lock_guard<std::mutex> lock(mutex_);
+    if (remoteMetadata_) {
+        uint64_t nodeEpoch = 0;
+        const auto cachedEpoch = remoteNodeEpochs_.find(nodeId);
+        if (cachedEpoch != remoteNodeEpochs_.end()) {
+            nodeEpoch = cachedEpoch->second;
+        } else {
+            // A Gateway may be restarted or may receive a heartbeat for a
+            // node registered through another frontend.  Reconstruct the
+            // durable epoch from Metadata instead of requiring sticky state.
+            for (const auto& node : remoteMetadata_->nodes()) {
+                if (node.nodeId == nodeId) { nodeEpoch = node.nodeEpoch; break; }
+            }
+            if (nodeEpoch == 0) {
+                miniKV::utils::logWarn("event=remote_node_heartbeat_rejected reason=missing_epoch node=" + nodeId);
+                return false;
+            }
+            remoteNodeEpochs_[nodeId] = nodeEpoch;
+        }
+        metadata::NodeHeartbeat heartbeat;
+        heartbeat.nodeId = nodeId; heartbeat.nodeEpoch = nodeEpoch; heartbeat.freeBytes = runtime.freeBytes;
+        heartbeat.activeUploads = runtime.activeUploads; heartbeat.activeDownloads = runtime.activeDownloads;
+        heartbeat.queueDepth = runtime.activeUploads; heartbeat.observedAtMs = static_cast<int64_t>(unixSeconds()) * 1000;
+        std::string error;
+        const bool accepted = remoteMetadata_->heartbeat(heartbeat, &error);
+        if(!accepted) {
+            miniKV::utils::logWarn("event=remote_node_heartbeat_rejected reason=" +
+                                   (error.empty() ? std::string("metadata_unavailable") : error) +
+                                   " node=" + nodeId + " epoch=" + std::to_string(nodeEpoch));
+        }
+        return accepted;
+    }
+    if (useShardedLocks()) {
+        std::unique_lock<std::shared_mutex> lock(locks_.nodes());
+        if(!nodeRecords_.count(nodeId)) return false;
+        NodeRuntime next = runtime;
+        next.state = NodeLiveState::kOnline;
+        next.lastHeartbeatAt = unixSeconds();
+        nodeRuntime_[nodeId] = next;
+        return true;
+    }
+    GatewayMutexGuard lock(mutex_, __func__);
     if(!nodeRecords_.count(nodeId)) return false;
     releaseExpiredLeasesLocked(unixSeconds());
     NodeRuntime next = runtime;
@@ -862,7 +1221,44 @@ bool GatewayState::heartbeat(const std::string& nodeId, const NodeRuntime& runti
 }
 void GatewayState::checkNodeTimeouts(int64_t now, int64_t suspectAfterSeconds, int64_t offlineAfterSeconds)
 {
-    std::lock_guard<std::mutex> lock(mutex_);
+    if (remoteMetadata_) {
+        // Session expiration is an explicit replicated command.  The
+        // frontend only observes wall-clock time to decide when to propose;
+        // MetadataStateMachine validates the expected expiry deterministically.
+        for(const auto& session : remoteMetadata_->sessions()) {
+            if(session.expired || session.expiresAt <= 0 || session.expiresAt > now) continue;
+            metadata::MetadataCommand command;
+            command.commandId = "expire-session-" + session.sessionId + "-" + std::to_string(session.expiresAt);
+            command.type = metadata::MetadataCommandType::kExpireSession;
+            command.actorType = "gateway-expiry"; command.actorId = "admin"; command.issuedAt = now;
+            command.payload = metadata::ExpireSessionPayload{session.sessionId, session.expiresAt, now};
+            const auto result = remoteMetadata_->propose(command);
+            if(result.status != metadata::ApplyStatus::kOk && result.status != metadata::ApplyStatus::kAlreadyApplied &&
+               result.status != metadata::ApplyStatus::kFenced && result.status != metadata::ApplyStatus::kNotFound) {
+                miniKV::utils::logWarn("event=remote_session_expiry_failed session=" + session.sessionId +
+                                       " status=" + std::string(metadata::toString(result.status)));
+            }
+        }
+        return;
+    }
+    std::unique_ptr<GatewayMutexGuard> globalLock;
+    // Timeout cleanup scans every session-owned lease map. Acquire all session
+    // shards in ascending order before NodeRegistry, matching the hot-path
+    // SessionShard -> NodeRegistry order without a process-wide lease mutex.
+    std::array<std::unique_lock<std::mutex>, GatewayLockManager::kShardCount> sessionLocks;
+    if (useShardedLocks()) {
+        for (size_t shard = 0; shard < GatewayLockManager::kShardCount; ++shard) {
+            sessionLocks[shard] = std::unique_lock<std::mutex>(locks_.session(shard));
+        }
+    } else {
+        globalLock = std::make_unique<GatewayMutexGuard>(mutex_, __func__);
+    }
+    // In sharded mode nodeRuntime_ and reservation counters are owned by the
+    // NodeRegistry domain. No LevelDB I/O occurs while this lock is held.
+    std::unique_ptr<std::unique_lock<std::shared_mutex>> nodeLock;
+    if (useShardedLocks()) {
+        nodeLock = std::make_unique<std::unique_lock<std::shared_mutex>>(locks_.nodes());
+    }
     releaseExpiredLeasesLocked(now);
     for(auto& [id, runtime] : nodeRuntime_)
     {
@@ -879,7 +1275,32 @@ void GatewayState::checkNodeTimeouts(int64_t now, int64_t suspectAfterSeconds, i
 }
 std::vector<NodeSnapshot> GatewayState::nodes() const
 {
-    std::lock_guard<std::mutex> lock(mutex_);
+    if (remoteMetadata_) {
+        std::vector<NodeSnapshot> out;
+        for (const auto& node : remoteMetadata_->nodes()) {
+            NodeRecord record; record.nodeId = node.nodeId; record.address = node.address;
+            record.httpPort = node.dataPort; record.maxStorageBytes = node.registeredCapacityBytes;
+            record.capabilities = node.capabilities;
+            NodeRuntime runtime;
+            runtime.state = node.draining ? NodeLiveState::kDraining :
+                (node.health == metadata::NodeHealth::kOnline ? NodeLiveState::kOnline :
+                 node.health == metadata::NodeHealth::kSuspect ? NodeLiveState::kSuspect :
+                 node.health == metadata::NodeHealth::kOffline ? NodeLiveState::kOffline : NodeLiveState::kRecovering);
+            out.push_back({std::move(record), runtime});
+        }
+        return out;
+    }
+    if (useShardedLocks()) {
+        std::shared_lock<std::shared_mutex> lock(locks_.nodes());
+        std::vector<NodeSnapshot> out;
+        for(const auto& [id, record] : nodeRecords_)
+        {
+            const auto it = nodeRuntime_.find(id);
+            out.push_back({record, it == nodeRuntime_.end() ? NodeRuntime{} : it->second});
+        }
+        return out;
+    }
+    GatewayMutexGuard lock(mutex_, __func__);
     std::vector<NodeSnapshot> out;
     for(const auto& [id, recoed] : nodeRecords_)
     {
@@ -904,14 +1325,31 @@ std::string GatewayState::manifestHash(uint64_t fileSize, uint32_t chunkSize,
 }
 
 bool GatewayState::createSession(const std::string& fileName, const std::string& dirPath,
-        uint64_t fileSize, uint32_t chunkSize, SessionState& out)
+        uint64_t fileSize, uint32_t chunkSize, SessionState& out,
+        GatewayMutationTiming* timing)
 {
+    if (remoteMetadata_) {
+        // Schema-v2 requires chunk checksums in CreateSession.  The raft
+        // frontend therefore accepts the preflight API as the canonical
+        // session creation path; the legacy endpoint has no chunk manifest
+        // and is rejected rather than creating an incomplete remote object.
+        (void)fileName; (void)dirPath; (void)fileSize; (void)chunkSize; (void)out; (void)timing;
+        return false;
+    }
     if(fileName.empty() || fileSize == 0) return false;
-    std::lock_guard<std::mutex> lock(mutex_);
     out = {};
     out.sessionId = randomId();
     out.objectId = randomId();
     if(out.sessionId.empty() || out.objectId.empty()) return false;
+    const auto requestedAt = std::chrono::steady_clock::now();
+    std::mutex& selectedMutex = useShardedLocks() ? sessionMutex(out.sessionId) : mutex_;
+    const std::string lockLabel = useShardedLocks()
+        ? std::string("createSession.session.") + std::to_string(locks_.sessionShard(out.sessionId))
+        : __func__;
+    GatewayMutexGuard lock(selectedMutex, lockLabel.c_str());
+    const auto lockedAt = std::chrono::steady_clock::now();
+    if(timing != nullptr) timing->mutexWaitUs = static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::microseconds>(lockedAt - requestedAt).count());
     out.fileName = fileName;
     out.dirPath = dirPath;
     out.fileSize = fileSize;
@@ -920,7 +1358,16 @@ bool GatewayState::createSession(const std::string& fileName, const std::string&
     out.totalChunks = static_cast<uint32_t>((fileSize + out.chunkSize - 1) / out.chunkSize);
     out.createdAt = out.lastActivityAt = unixSeconds();
     sessions_[out.sessionId] = out;
-    return persistSessionLocked(out);
+    const auto writeStartedAt = std::chrono::steady_clock::now();
+    const bool persisted = persistSessionLocked(out);
+    const auto finishedAt = std::chrono::steady_clock::now();
+    if(timing != nullptr) {
+        timing->levelDbWriteUs = static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::microseconds>(finishedAt - writeStartedAt).count());
+        timing->criticalSectionUs = static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::microseconds>(finishedAt - lockedAt).count());
+    }
+    return persisted;
 }
 
 FileCommitStatus GatewayState::createObjectLinkLocked(const std::string& fileName,
@@ -972,19 +1419,6 @@ FileCommitStatus GatewayState::createObjectLinkLocked(const std::string& fileNam
     }
     batch.Put("obj:" + object.objectId, objectValue(object));
     batch.Put("path:" + pathKey, object.objectId);
-    media::AiIndexEvent aiEvent;
-    // objectId is stable and unique for this logical directory entry, so it
-    // is safe to use as the outbox event identity in the V2 single-Gateway
-    // model. V3 will replace this with a metadata command/event id.
-    aiEvent.eventId = object.objectId;
-    aiEvent.objectId = object.objectId;
-    aiEvent.objectVersion = object.objectVersion;
-    aiEvent.metadataVersion = object.metadataVersion;
-    aiEvent.objectKey = childPath(parentPath, name);
-    aiEvent.fileHash = out.fileHash;
-    aiEvent.fileSize = out.fileSize;
-    aiEvent.occurredAt = out.createdAt;
-    batch.Put("ai:" + aiEvent.eventId, media::serializeAiIndexEvent(aiEvent));
     if (!db_->Write(leveldb::WriteOptions(), &batch).ok()) return FileCommitStatus::kInvalidRequest;
 
     objectCache_.erase(object.objectId);
@@ -996,6 +1430,93 @@ FileCommitStatus GatewayState::createObjectLinkLocked(const std::string& fileNam
 PreflightStatus GatewayState::preflightUpload(const UploadPreflightRequest& request,
                                               UploadPreflightResult& out)
 {
+    if (remoteMetadata_) {
+        if(request.fileName.empty() || request.fileSize == 0 || request.chunks.empty()) return PreflightStatus::kInvalidRequest;
+        const std::string commandId = request.commandId.empty()
+            ? metadata::MetadataClient::newCommandId("create-session") : request.commandId;
+        const std::string sessionId = request.commandId.empty()
+            ? metadata::MetadataClient::newCommandId("session") : "session-" + request.commandId;
+        const std::string objectId = request.commandId.empty()
+            ? metadata::MetadataClient::newCommandId("object") : "object-" + request.commandId;
+        metadata::MetadataCommand command;
+        command.commandId = commandId;
+        command.type = metadata::MetadataCommandType::kCreateSession;
+        command.actorType = "gateway"; command.actorId = "admin"; command.issuedAt = 0;
+        metadata::CreateSessionPayload payload;
+        payload.sessionId = sessionId; payload.objectId = objectId; payload.ownerId = "admin";
+        payload.parentPath = request.dirPath; payload.name = request.fileName; payload.contentHash = request.manifestHash;
+        payload.fileSize = request.fileSize; payload.chunkSize = request.chunkSize == 0 ? 4U * 1024U * 1024U : request.chunkSize;
+        payload.desiredRf = replicationFactor_; payload.expiresAt = unixSeconds() + 300;
+        std::vector<metadata::ReserveLeaseRequest> preflightReserves;
+        for(const auto& input : request.chunks) {
+            metadata::InitialChunk chunk; chunk.index = input.chunkIndex; chunk.routeKey = sessionId + "/route/" + std::to_string(input.chunkIndex);
+            // Opaque chunk identities are used as DataNode URL paths. Keep
+            // them URL-safe and deterministic across command retries; a
+            // slash here would be escaped by the SDK and no longer match the
+            // capability identity validated by the DataNode.
+            const std::string identitySeed = objectId + "\n" +
+                std::to_string(input.chunkIndex) + "\n" +
+                (input.checksumDigest.empty() ? input.chunkHash : input.checksumDigest);
+            chunk.storageIdentity = "chk-" +
+                sha256Hex(identitySeed.data(), identitySeed.size()).substr(0, 40);
+            chunk.identityScheme = input.identityScheme == "cas-sha256" ? metadata::IdentityScheme::kContentHash : metadata::IdentityScheme::kOpaque;
+            chunk.checksumType = input.checksumType == "sha256" ? metadata::ChecksumType::kSha256 : metadata::ChecksumType::kCrc32c;
+            chunk.checksumDigest = input.checksumDigest.empty() ? input.chunkHash : input.checksumDigest;
+            chunk.size = input.chunkSize; chunk.generation = 1; payload.chunks.push_back(std::move(chunk));
+            metadata::ReserveLeaseRequest reserve;
+            reserve.commandId = "reserve-" + sessionId + "-" + std::to_string(input.chunkIndex);
+            reserve.actorType = "gateway"; reserve.actorId = "admin";
+            reserve.leaseId = "lease-" + sessionId + "-" + std::to_string(input.chunkIndex);
+            reserve.requestKey = sessionId + "/" + std::to_string(input.chunkIndex) + "/" + input.chunkHash;
+            reserve.sessionId = sessionId; reserve.chunkIndex = input.chunkIndex;
+            reserve.routeKey = sessionId + "/route/" + std::to_string(input.chunkIndex);
+            reserve.chunkSize = input.chunkSize; reserve.generation = 1; reserve.desiredRf = replicationFactor_;
+            reserve.expiresAt = payload.expiresAt; reserve.nowMs = static_cast<int64_t>(unixSeconds()) * 1000;
+            preflightReserves.push_back(std::move(reserve));
+        }
+        command.payload = std::move(payload);
+        std::string metadataError;
+        // Create the session and reserve all chunk leases in one append batch.
+        // This is safe because placement is computed by the authoritative
+        // Metadata leader and the state machine applies CreateSession first.
+        const auto detailedResult = remoteMetadata_->createSessionAndReserveDetailed(
+            command, preflightReserves, &metadataError);
+        const auto& result = detailedResult.result;
+        if(result.status == metadata::ApplyStatus::kConflict) {
+            miniKV::utils::logWarn("event=remote_preflight_rejected status=CONFLICT command_id=" +
+                                   command.commandId + " message=" + result.message);
+            return PreflightStatus::kPathConflict;
+        }
+        if(result.status != metadata::ApplyStatus::kOk && result.status != metadata::ApplyStatus::kAlreadyApplied) {
+            miniKV::utils::logWarn("event=remote_preflight_rejected status=" +
+                                   std::string(metadata::toString(result.status)) +
+                                   " command_id=" + command.commandId + " message=" +
+                                   (result.message.empty() ? metadataError : result.message));
+            return PreflightStatus::kInvalidRequest;
+        }
+        // The create+reserve response contains the records produced by the
+        // same committed batch.  Keep the point-read fallback for rolling
+        // upgrades or an older MetadataService, but the normal Raft path now
+        // avoids two additional ReadIndex HTTP round trips.
+        auto session = detailedResult.session;
+        auto object = detailedResult.object;
+        if(!session) session = remoteMetadata_->session(sessionId);
+        if(!object) object = remoteMetadata_->object(objectId);
+        if(!session || !object) {
+            miniKV::utils::logWarn("event=remote_preflight_missing_state session_id=" + sessionId +
+                                   " object_id=" + objectId);
+            return PreflightStatus::kInvalidRequest;
+        }
+        out = {}; out.session.sessionId = session->sessionId; out.session.objectId = session->objectId;
+        out.session.objectVersion = session->objectVersion; out.session.ownerId = session->ownerId; out.session.fileSize = session->fileSize;
+        out.session.chunkSize = session->chunkSize; out.session.totalChunks = session->totalChunks; out.session.createdAt = unixSeconds();
+        out.session.lastActivityAt = out.session.createdAt; out.session.fileName = request.fileName; out.session.dirPath = request.dirPath;
+        out.session.manifestHash = request.manifestHash; out.object.objectId = object->objectId; out.object.objectVersion = object->objectVersion;
+        out.object.metadataVersion = object->metadataVersion; out.object.ownerId = object->ownerId; out.object.parentPath = object->parentPath;
+        out.object.name = object->name; out.object.fileHash = object->contentHash; out.object.fileSize = object->fileSize;
+        out.object.state = FileState::kProtecting; out.missingChunks = request.chunks;
+        return PreflightStatus::kUploadRequired;
+    }
     out = {};
     std::string parentPath;
     std::string name;
@@ -1024,8 +1545,10 @@ PreflightStatus GatewayState::preflightUpload(const UploadPreflightRequest& requ
         return PreflightStatus::kInvalidRequest;
     }
 
-    std::lock_guard<std::mutex> lock(mutex_);
-    const std::string pathKey = catalogPathKey("admin", childPath(parentPath, name));
+    const std::string pathOwnerKey = catalogPathKey("admin", childPath(parentPath, name));
+    std::mutex& selectedMutex = useShardedLocks() ? objectMutex(pathOwnerKey) : mutex_;
+    GatewayMutexGuard lock(selectedMutex, __func__);
+    const std::string pathKey = pathOwnerKey;
     std::string existingObjectId;
     const leveldb::Status pathStatus = db_->Get(leveldb::ReadOptions(), "path:" + pathKey, &existingObjectId);
     if (pathStatus.ok()) return PreflightStatus::kPathConflict;
@@ -1101,7 +1624,8 @@ bool GatewayState::createDerivedUpload(const std::string& jobId, const std::stri
     }
 
     const int64_t now = unixSeconds();
-    std::lock_guard<std::mutex> lock(mutex_);
+    std::mutex& selectedMutex = useShardedLocks() ? sessionMutex(jobId) : mutex_;
+    GatewayMutexGuard lock(selectedMutex, __func__);
     media::MediaJob job;
     if(!getMediaJobLocked(jobId, job) || job.type != media::JobType::kThumbnail ||
        job.state != media::JobState::kRunning || job.leaseToken != leaseToken ||
@@ -1143,7 +1667,23 @@ bool GatewayState::createDerivedUpload(const std::string& jobId, const std::stri
 
 bool GatewayState::getSession(const std::string& sessionId, SessionState& out) const
 {
-    std::lock_guard<std::mutex> lock(mutex_);
+    if (remoteMetadata_) {
+        const auto value = remoteMetadata_->session(sessionId);
+        if(!value) return false;
+        out = {}; out.sessionId = value->sessionId; out.objectId = value->objectId; out.objectVersion = value->objectVersion;
+        const auto object = remoteMetadata_->object(value->objectId);
+        if(!object) return false;
+        out.metadataVersion = object->metadataVersion; out.ownerId = value->ownerId;
+        out.fileSize = value->fileSize; out.chunkSize = value->chunkSize; out.totalChunks = value->totalChunks;
+        out.completedChunks = value->completedChunks;
+        out.createdAt = unixSeconds(); out.lastActivityAt = out.createdAt;
+        return true;
+    }
+    std::mutex& selectedMutex = useShardedLocks() ? sessionMutex(sessionId) : mutex_;
+    const std::string lockLabel = useShardedLocks()
+        ? std::string("getSession.session.") + std::to_string(locks_.sessionShard(sessionId))
+        : __func__;
+    GatewayMutexGuard lock(selectedMutex, lockLabel.c_str());
     const auto it = sessions_.find(sessionId);
     if(it == sessions_.end()) return false;
     out = it->second;
@@ -1151,14 +1691,151 @@ bool GatewayState::getSession(const std::string& sessionId, SessionState& out) c
 }
 RoutePlanStatus GatewayState::planRoutes(const std::string& sessionId,
                                          const std::vector<ChunkRouteRequest>& requests,
-                                         std::vector<PlacementPlan>& out)
+                                         std::vector<PlacementPlan>& out,
+                                         GatewayMutationTiming* timing)
 {
-    std::lock_guard<std::mutex> lock(mutex_);
+    if (remoteMetadata_) {
+        out.clear();
+        if(requests.empty()) return RoutePlanStatus::kInvalidRequest;
+
+        // The normal route path historically fetched session, nodes, chunks
+        // and leases independently.  In Raft mode that meant one ReadIndex
+        // confirmation and HTTP round trip per metadata object.  Try the
+        // read-only aggregate first; if a lease is missing/expired, fall back
+        // to the existing reservation path below so retries preserve its
+        // capacity and fencing semantics.
+        std::vector<uint32_t> requestedIndexes;
+        requestedIndexes.reserve(requests.size());
+        for(const auto& request : requests) requestedIndexes.push_back(request.chunkIndex);
+        const auto aggregate = remoteMetadata_->uploadRoutes(sessionId, requestedIndexes);
+        if(aggregate && aggregate->routes.size() == requests.size()) {
+            std::unordered_map<std::string, NodeRecord> nodes;
+            for(const auto& node : aggregate->nodes) {
+                NodeRecord converted;
+                converted.nodeId = node.nodeId;
+                converted.address = node.address;
+                converted.httpPort = node.dataPort;
+                converted.maxStorageBytes = node.registeredCapacityBytes;
+                converted.capabilities = node.capabilities;
+                nodes.emplace(converted.nodeId, std::move(converted));
+            }
+            std::unordered_map<uint32_t, const metadata::UploadRouteView*> routes;
+            for(const auto& route : aggregate->routes) routes.emplace(route.index, &route);
+            bool valid = true;
+            std::vector<PlacementPlan> fastPlans;
+            fastPlans.reserve(requests.size());
+            for(const auto& request : requests) {
+                const auto routeIt = routes.find(request.chunkIndex);
+                if(routeIt == routes.end()) { valid = false; break; }
+                const auto& route = *routeIt->second;
+                const auto& chunk = route.chunk;
+                const auto& lease = route.lease;
+                if(chunk.state != metadata::ChunkState::kAllocated ||
+                   chunk.size != request.chunkSize || lease.state != metadata::LeaseState::kActive ||
+                   lease.sessionId != sessionId || lease.chunkIndex != request.chunkIndex ||
+                   (!request.checksumDigest.empty() && request.checksumDigest != chunk.checksumDigest) ||
+                   (request.chunkHash != chunk.checksumDigest && request.identityScheme == "cas-sha256")) {
+                    valid = false; break;
+                }
+                PlacementPlan plan;
+                plan.chunkIndex = request.chunkIndex;
+                plan.leaseId = lease.leaseId;
+                plan.routeVersion = lease.generation;
+                plan.expiresAt = lease.expiresAt;
+                plan.identityScheme = chunk.identityScheme == metadata::IdentityScheme::kContentHash
+                    ? "cas-sha256" : "opaque-chunk-id";
+                plan.chunkId = chunk.storageIdentity;
+                plan.checksumType = metadata::toString(chunk.checksumType);
+                plan.checksumDigest = chunk.checksumDigest;
+                plan.objectVersion = aggregate->session.objectVersion;
+                for(const auto& target : lease.targets) {
+                    const auto nodeIt = nodes.find(target.nodeId);
+                    if(nodeIt == nodes.end()) { valid = false; break; }
+                    NodeSnapshot snapshot;
+                    snapshot.record = nodeIt->second;
+                    snapshot.runtime.state = NodeLiveState::kOnline;
+                    plan.chain.push_back(std::move(snapshot));
+                }
+                if(!valid || plan.chain.size() != replicationFactor_) { valid = false; break; }
+                fastPlans.push_back(std::move(plan));
+            }
+            if(valid && fastPlans.size() == requests.size()) {
+                out = std::move(fastPlans);
+                return RoutePlanStatus::kOk;
+            }
+            out.clear();
+        }
+
+        SessionState session;
+        if(!getSession(sessionId, session)) return RoutePlanStatus::kInvalidRequest;
+        const auto nodeRecords = remoteMetadata_->nodes();
+        std::map<std::string, NodeRecord> nodes;
+        for(const auto& node : nodeRecords) { NodeRecord converted; converted.nodeId=node.nodeId; converted.address=node.address; converted.httpPort=node.dataPort; converted.maxStorageBytes=node.registeredCapacityBytes; converted.capabilities=node.capabilities; nodes.emplace(converted.nodeId, std::move(converted)); }
+        std::vector<metadata::ReserveLeaseRequest> reserves;
+        std::vector<metadata::ReserveLeaseRequest> allReserves;
+        std::vector<metadata::ChunkRouteRecord> chunks;
+        reserves.reserve(requests.size()); allReserves.reserve(requests.size()); chunks.reserve(requests.size());
+        const int64_t leaseExpires = unixSeconds() + 300;
+        const int64_t observedAt = static_cast<int64_t>(unixSeconds()) * 1000;
+        for(const auto& request : requests) {
+            const auto chunk = remoteMetadata_->chunk(session.objectId, request.chunkIndex);
+            if(!chunk || chunk->state != metadata::ChunkState::kAllocated || chunk->size != request.chunkSize) { out.clear(); return RoutePlanStatus::kInvalidRequest; }
+            metadata::ReserveLeaseRequest reserve; reserve.commandId = "reserve-" + sessionId + "-" + std::to_string(request.chunkIndex);
+            reserve.actorType = "gateway"; reserve.actorId = "admin"; reserve.leaseId = "lease-" + sessionId + "-" + std::to_string(request.chunkIndex);
+            reserve.requestKey = sessionId + "/" + std::to_string(request.chunkIndex) + "/" + request.chunkHash;
+            reserve.sessionId = sessionId; reserve.chunkIndex = request.chunkIndex; reserve.routeKey = chunk->routeKey;
+            reserve.chunkSize = request.chunkSize; reserve.generation = chunk->generation; reserve.desiredRf = replicationFactor_;
+            reserve.expiresAt = leaseExpires; reserve.nowMs = observedAt;
+            allReserves.push_back(reserve);
+            // A retry after the preflight create+reserve batch already has a
+            // durable lease.  Reuse it rather than appending another entry.
+            if(!remoteMetadata_->lease(reserve.leaseId)) reserves.push_back(reserve);
+            chunks.push_back(*chunk);
+        }
+        // Placement is still decided by the Metadata leader, but all lease
+        // commands are appended as one Raft batch.  Each command retains its
+        // own commandId and state-machine validation; only the WAL fsync
+        // boundary is shared.
+        if(!reserves.empty()) {
+            const auto batchResult = remoteMetadata_->reserveLeaseBatch(reserves);
+            if(batchResult.status == metadata::ApplyStatus::kUnavailable) { out.clear(); return RoutePlanStatus::kNoCapacity; }
+            if(batchResult.status != metadata::ApplyStatus::kOk && batchResult.status != metadata::ApplyStatus::kAlreadyApplied) { out.clear(); return RoutePlanStatus::kNoCapacity; }
+        }
+        for(size_t i = 0; i < requests.size(); ++i) {
+            const auto& request = requests[i]; const auto& chunk = chunks[i]; const auto& reserve = allReserves[i];
+            const auto lease = remoteMetadata_->lease(reserve.leaseId); if(!lease) { out.clear(); return RoutePlanStatus::kNoCapacity; }
+            PlacementPlan plan; plan.chunkIndex=request.chunkIndex; plan.leaseId=lease->leaseId; plan.routeVersion=lease->generation; plan.expiresAt=lease->expiresAt;
+            plan.identityScheme = chunk.identityScheme == metadata::IdentityScheme::kContentHash ? "cas-sha256" : "opaque-chunk-id";
+            plan.chunkId = chunk.storageIdentity; plan.checksumType = metadata::toString(chunk.checksumType); plan.checksumDigest = chunk.checksumDigest; plan.objectVersion=session.objectVersion;
+            for(const auto& target : lease->targets) { const auto it=nodes.find(target.nodeId); if(it==nodes.end()) { out.clear(); return RoutePlanStatus::kNoCapacity; } NodeSnapshot snapshot; snapshot.record=it->second; snapshot.runtime.state=NodeLiveState::kOnline; snapshot.record.maxStorageBytes=it->second.maxStorageBytes; plan.chain.push_back(std::move(snapshot)); }
+            if(plan.chain.size() != replicationFactor_) { out.clear(); return RoutePlanStatus::kNoCapacity; }
+            out.push_back(std::move(plan));
+        }
+        return RoutePlanStatus::kOk;
+    }
+    const auto requestedAt = std::chrono::steady_clock::now();
+    std::mutex& selectedMutex = useShardedLocks() ? sessionMutex(sessionId) : mutex_;
+    const std::string lockLabel = useShardedLocks()
+        ? std::string("planRoutes.session.") + std::to_string(locks_.sessionShard(sessionId))
+        : __func__;
+    GatewayMutexGuard lock(selectedMutex, lockLabel.c_str());
+    const auto lockedAt = std::chrono::steady_clock::now();
+    if(timing != nullptr) timing->mutexWaitUs = static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::microseconds>(lockedAt - requestedAt).count());
     const auto it = sessions_.find(sessionId);
     if(it == sessions_.end() || requests.empty()) return RoutePlanStatus::kInvalidRequest;
+    // Reservation counters are part of NodeRegistry ownership.  This is an
+    // exclusive, short-lived lock (no LevelDB I/O occurs in this section).
+    std::unique_lock<std::shared_mutex> nodeLock;
+    if (useShardedLocks()) nodeLock = std::unique_lock<std::shared_mutex>(locks_.nodes());
     out.clear();
     const int64_t now = unixSeconds();
-    releaseExpiredLeasesLocked(now);
+    if (!useShardedLocks()) releaseExpiredLeasesLocked(now);
+    const size_t sessionShardIndex = locks_.sessionShard(sessionId);
+    auto& leaseRequestIndex = useShardedLocks()
+        ? shardedLeaseByRequestKey_[sessionShardIndex] : leaseByRequestKey_;
+    auto& leaseIndex = useShardedLocks()
+        ? shardedLeases_[sessionShardIndex] : leases_;
     std::vector<std::string> createdLeaseIds;
     for(const auto& originalRequest : requests)
     {
@@ -1200,14 +1877,14 @@ RoutePlanStatus GatewayState::planRoutes(const std::string& sessionId,
         }
 
         const std::string requestKey = routeRequestKey(sessionId, request);
-        const auto existingId = leaseByRequestKey_.find(requestKey);
-        if(existingId != leaseByRequestKey_.end()) {
-            const auto existingLease = leases_.find(existingId->second);
-            if(existingLease != leases_.end()) {
+        const auto existingId = leaseRequestIndex.find(requestKey);
+        if(existingId != leaseRequestIndex.end()) {
+            const auto existingLease = leaseIndex.find(existingId->second);
+            if(existingLease != leaseIndex.end()) {
                 out.push_back(existingLease->second.plan);
                 continue;
             }
-            leaseByRequestKey_.erase(existingId);
+            leaseRequestIndex.erase(existingId);
         }
 
         PlacementPlan plan = selectPlacementLocked(it->second, index);
@@ -1219,37 +1896,110 @@ RoutePlanStatus GatewayState::planRoutes(const std::string& sessionId,
         createdLeaseIds.push_back(plan.leaseId);
         out.push_back(std::move(plan));
     }
+    if(timing != nullptr) timing->criticalSectionUs = static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - lockedAt).count());
     return RoutePlanStatus::kOk;
 }
 CommitChunkStatus GatewayState::commitChunk(const std::string& sessionId, uint32_t index,
                                             const std::string& chunkHash, uint64_t size,
                                             const std::vector<std::string>& successfulNodes,
-                                            const std::string& leaseId)
+                                            const std::string& leaseId,
+                                            GatewayMutationTiming* timing)
 {
+    if (remoteMetadata_) {
+        SessionState session; if(!getSession(sessionId, session)) return CommitChunkStatus::kInvalidRequest;
+        const auto chunk = remoteMetadata_->chunk(session.objectId, index); const auto lease = remoteMetadata_->lease(leaseId);
+        if(!chunk || !lease || lease->state != metadata::LeaseState::kActive) return CommitChunkStatus::kInvalidRequest;
+        metadata::MetadataCommand command; command.commandId = "commit-chunk-" + sessionId + "-" + std::to_string(index) + "-" + std::to_string(chunk->generation);
+        command.type = metadata::MetadataCommandType::kCommitChunk; command.actorType="gateway"; command.actorId="admin"; command.generation=chunk->generation; command.issuedAt=unixSeconds();
+        metadata::CommitChunkPayload payload; payload.sessionId=sessionId; payload.leaseId=leaseId; payload.chunkIndex=index; payload.routeKey=chunk->routeKey; payload.chunkSize=size; payload.checksumType=chunk->checksumType; payload.checksumDigest=chunk->checksumDigest;
+        for(const auto& nodeId : successfulNodes) { auto target=std::find_if(lease->targets.begin(), lease->targets.end(), [&](const auto& candidate){ return candidate.nodeId==nodeId; }); if(target==lease->targets.end()) return CommitChunkStatus::kInvalidRequest; payload.replicas.push_back({nodeId,target->nodeEpoch,chunk->checksumDigest,unixSeconds()}); }
+        command.payload=std::move(payload);
+        // Once this is the final not-yet-committed chunk, there is no reason
+        // to publish CommitChunk and CommitFile as separate durable entries.
+        // Append the independently-idempotent commands in one Raft batch;
+        // the state machine still applies and validates them in order, and
+        // the later public commitFile call observes the already-committed
+        // object without appending another entry.  A stale remote session
+        // snapshot merely falls back to the explicit public CommitFile.
+        metadata::ApplyResult result;
+        const auto remoteObject = remoteMetadata_->object(session.objectId);
+        const bool finalChunk = session.completedChunks + 1 == session.totalChunks;
+        if(finalChunk) {
+            if(!remoteObject) return CommitChunkStatus::kInvalidRequest;
+            metadata::MetadataCommand fileCommand;
+            fileCommand.commandId = "commit-file-" + sessionId;
+            fileCommand.type = metadata::MetadataCommandType::kCommitFile;
+            fileCommand.actorType = "gateway"; fileCommand.actorId = "admin"; fileCommand.issuedAt = unixSeconds();
+            fileCommand.payload = metadata::CommitFilePayload{sessionId, session.objectId, session.objectVersion, remoteObject->contentHash};
+            result = remoteMetadata_->proposeBatch({command, fileCommand});
+        } else {
+            result = remoteMetadata_->propose(command);
+        }
+        if(result.status==metadata::ApplyStatus::kAlreadyApplied) return CommitChunkStatus::kAlreadyCommitted;
+        return result.status==metadata::ApplyStatus::kOk ? CommitChunkStatus::kCommitted : CommitChunkStatus::kInvalidRequest;
+    }
     //确认单个分片写入成功
     if(chunkHash.empty() || successfulNodes.empty()) return CommitChunkStatus::kInvalidRequest;
-    std::lock_guard<std::mutex> lock(mutex_);
-    releaseExpiredLeasesLocked(unixSeconds());
+    const auto requestedAt = std::chrono::steady_clock::now();
+    std::mutex& selectedMutex = useShardedLocks() ? sessionMutex(sessionId) : mutex_;
+    const std::string lockLabel = useShardedLocks()
+        ? std::string("commitChunk.session.") + std::to_string(locks_.sessionShard(sessionId))
+        : __func__;
+    GatewayMutexGuard lock(selectedMutex, lockLabel.c_str());
+    const auto lockedAt = std::chrono::steady_clock::now();
+    if(timing != nullptr) {
+        timing->mutexWaitUs = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
+            lockedAt - requestedAt).count());
+    }
+    // Reservation expiry is maintained by the compatibility cleanup path until
+    // the reservation index is fully migrated into NodeRegistry.  Skipping it
+    // here avoids mutating NodeRegistry-owned maps without its exclusive lock.
+    if (!useShardedLocks()) releaseExpiredLeasesLocked(unixSeconds());
+    // Keep invalid commit diagnostics close to the state validation.  In
+    // sharded mode an HTTP 400 can otherwise be reported by the DataNode
+    // without identifying which lease/session invariant rejected it.  This
+    // is observation only; the validation and return statuses are unchanged.
+    const auto invalid = [&](const char* reason, const std::string& detail = std::string()) {
+        miniKV::utils::logWarn("event=chunk_commit_rejected reason=" + std::string(reason) +
+            " session=" + sessionId + " index=" + std::to_string(index) +
+            " chunk=" + chunkHash + " lease=" + leaseId +
+            " successful_nodes=" + join(successfulNodes, ',') +
+            " detail=" + (detail.empty() ? "-" : detail));
+        return CommitChunkStatus::kInvalidRequest;
+    };
     auto sessionIt = sessions_.find(sessionId);
-    if(sessionIt == sessions_.end() || index >= sessionIt->second.totalChunks) return CommitChunkStatus::kInvalidRequest;
+    if(sessionIt == sessions_.end()) return invalid("session_missing");
+    if(index >= sessionIt->second.totalChunks) {
+        return invalid("chunk_index_out_of_range", "total_chunks=" + std::to_string(sessionIt->second.totalChunks));
+    }
     const uint64_t expected = index + 1 == sessionIt->second.totalChunks ? sessionIt->second.fileSize - static_cast<uint64_t>(index) * sessionIt->second.chunkSize : sessionIt->second.chunkSize;
-    if(size != expected) return CommitChunkStatus::kInvalidRequest;
+    if(size != expected) return invalid("chunk_size_mismatch", "expected=" + std::to_string(expected) +
+        " actual=" + std::to_string(size));
 
     const auto completed = sessionIt->second.completed.find(index);
     if(completed != sessionIt->second.completed.end()) {
         return completed->second.chunkHash == chunkHash && completed->second.size == size
             ? CommitChunkStatus::kAlreadyCommitted
-            : CommitChunkStatus::kInvalidRequest;
+            : invalid("duplicate_chunk_mismatch");
     }
 
-    const auto lease = leases_.find(leaseId);
-    if(lease == leases_.end() || lease->second.sessionId != sessionId ||
-       lease->second.chunkIndex != index || lease->second.chunkHash != chunkHash ||
-       lease->second.chunkSize != size) return CommitChunkStatus::kInvalidRequest;
+    const size_t leaseShardIndex = useShardedLocks() ? leaseShard(leaseId) : kLockShardCount;
+    auto& leaseIndex = useShardedLocks() && leaseShardIndex < kLockShardCount
+        ? shardedLeases_[leaseShardIndex] : leases_;
+    const auto lease = leaseIndex.find(leaseId);
+    if(lease == leaseIndex.end()) return invalid("lease_missing");
+    if(lease->second.sessionId != sessionId) return invalid("lease_session_mismatch",
+        "lease_session=" + lease->second.sessionId);
+    if(lease->second.chunkIndex != index) return invalid("lease_index_mismatch",
+        "lease_index=" + std::to_string(lease->second.chunkIndex));
+    if(lease->second.chunkHash != chunkHash) return invalid("lease_hash_mismatch");
+    if(lease->second.chunkSize != size) return invalid("lease_size_mismatch",
+        "lease_size=" + std::to_string(lease->second.chunkSize));
     for(const auto& nodeId : successfulNodes) {
         const bool allowed = std::any_of(lease->second.plan.chain.begin(), lease->second.plan.chain.end(),
             [&nodeId](const NodeSnapshot& node) { return node.record.nodeId == nodeId; });
-        if(!allowed) return CommitChunkStatus::kInvalidRequest;
+        if(!allowed) return invalid("node_not_in_lease", nodeId);
     }
     sessionIt->second.completed[index] = {index, chunkHash, size};
     sessionIt->second.lastActivityAt = unixSeconds();
@@ -1264,6 +2014,7 @@ CommitChunkStatus GatewayState::commitChunk(const std::string& sessionId, uint32
     route.objectVersion = lease->second.plan.objectVersion;
     route.generation = lease->second.plan.routeVersion;
     route.size = size;
+    route.desiredReplicas = replicationFactor_;
     route.updateAt = unixSeconds();
     for(const auto& node : successfulNodes)
     {
@@ -1272,27 +2023,83 @@ CommitChunkStatus GatewayState::commitChunk(const std::string& sessionId, uint32
             route.replicas.push_back(node);
         }
     }
+    const auto writeStartedAt = std::chrono::steady_clock::now();
     const bool persisted = persistRouteLocked(route) && persistSessionLocked(sessionIt->second);
+    const auto writeFinishedAt = std::chrono::steady_clock::now();
     if (persisted) {
         routeCache_.put(chunkHash, std::make_shared<const ChunkRoute>(route),
                         estimatedRouteBytes(route), kRouteCacheTtlSeconds);
         manifestCache_.clear();
     }
-    if(persisted) releaseLeaseLocked(leaseId);
+    if (persisted) {
+        if (useShardedLocks()) {
+            std::unique_lock<std::shared_mutex> nodeLock(locks_.nodes());
+            releaseLeaseLocked(leaseId, ReservationToken::State::kCommitted);
+        } else {
+            releaseLeaseLocked(leaseId, ReservationToken::State::kCommitted);
+        }
+    }
+    if(timing != nullptr) {
+        timing->levelDbWriteUs = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
+            writeFinishedAt - writeStartedAt).count());
+        timing->criticalSectionUs = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now() - lockedAt).count());
+    }
     return persisted ? CommitChunkStatus::kCommitted : CommitChunkStatus::kInvalidRequest;
 }
 
 bool GatewayState::releaseLease(const std::string& leaseId)
 {
     if(leaseId.empty()) return false;
-    std::lock_guard<std::mutex> lock(mutex_);
-    if(leases_.find(leaseId) == leases_.end()) return false;
-    releaseLeaseLocked(leaseId);
-    return true;
+    if (remoteMetadata_) {
+        const auto lease = remoteMetadata_->lease(leaseId); if(!lease) return false;
+        metadata::MetadataCommand command; command.commandId = "release-lease-" + leaseId + "-" + std::to_string(lease->generation);
+        command.type = metadata::MetadataCommandType::kReleaseLease; command.actorType="gateway"; command.actorId="admin"; command.issuedAt=unixSeconds();
+        command.payload = metadata::ReleaseLeasePayload{leaseId, lease->generation};
+        const auto result = remoteMetadata_->propose(command); return result.status==metadata::ApplyStatus::kOk || result.status==metadata::ApplyStatus::kAlreadyApplied;
+    }
+    if (useShardedLocks()) {
+        const size_t shard = leaseShard(leaseId);
+        if (shard >= kLockShardCount) return false;
+        std::unique_lock<std::mutex> sessionLock(locks_.session(shard));
+        if (shardedLeases_[shard].find(leaseId) == shardedLeases_[shard].end()) return false;
+        std::unique_lock<std::shared_mutex> nodeLock(locks_.nodes());
+        return releaseLeaseLocked(leaseId, ReservationToken::State::kRolledBack);
+    }
+    GatewayMutexGuard lock(mutex_, __func__);
+    return releaseLeaseLocked(leaseId, ReservationToken::State::kRolledBack);
 }
-FileCommitStatus GatewayState::commitFile(const std::string& sessionId, FileMeta& out)
+FileCommitStatus GatewayState::commitFile(const std::string& sessionId, FileMeta& out,
+                                          GatewayMutationTiming* timing)
 {
-    std::lock_guard<std::mutex> lock(mutex_);
+    if (remoteMetadata_) {
+        SessionState session; if(!getSession(sessionId, session)) return FileCommitStatus::kInvalidRequest;
+        const auto object = remoteMetadata_->object(session.objectId); if(!object) return FileCommitStatus::kInvalidRequest;
+        if(object->state == metadata::ObjectState::kCommitted) {
+            out={}; out.objectId=object->objectId; out.objectVersion=object->objectVersion; out.metadataVersion=object->metadataVersion;
+            out.ownerId=object->ownerId; out.fileName=object->name; out.dirPath=object->parentPath; out.fileHash=object->contentHash;
+            out.fileSize=object->fileSize; out.chunkSize=object->chunkSize; out.state=FileState::kAvailable; out.createdAt=unixSeconds();
+            return FileCommitStatus::kCommitted;
+        }
+        metadata::MetadataCommand command; command.commandId = "commit-file-" + sessionId; command.type=metadata::MetadataCommandType::kCommitFile;
+        command.actorType="gateway"; command.actorId="admin"; command.issuedAt=unixSeconds(); command.payload=metadata::CommitFilePayload{sessionId, session.objectId, session.objectVersion, object->contentHash};
+        const auto result=remoteMetadata_->propose(command);
+        if(result.status!=metadata::ApplyStatus::kOk && result.status!=metadata::ApplyStatus::kAlreadyApplied) return FileCommitStatus::kInvalidRequest;
+        const auto committed=remoteMetadata_->object(session.objectId); if(!committed) return FileCommitStatus::kInvalidRequest;
+        out={}; out.objectId=committed->objectId; out.objectVersion=committed->objectVersion; out.metadataVersion=committed->metadataVersion; out.ownerId=committed->ownerId; out.fileName=committed->name; out.dirPath=committed->parentPath; out.fileHash=committed->contentHash; out.fileSize=committed->fileSize; out.chunkSize=committed->chunkSize; out.state=FileState::kAvailable; out.createdAt=unixSeconds();
+        return FileCommitStatus::kCommitted;
+    }
+    const auto requestedAt = std::chrono::steady_clock::now();
+    std::mutex& selectedMutex = useShardedLocks() ? sessionMutex(sessionId) : mutex_;
+    const std::string lockLabel = useShardedLocks()
+        ? std::string("commitFile.session.") + std::to_string(locks_.sessionShard(sessionId))
+        : __func__;
+    GatewayMutexGuard lock(selectedMutex, lockLabel.c_str());
+    const auto lockedAt = std::chrono::steady_clock::now();
+    if(timing != nullptr) {
+        timing->mutexWaitUs = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
+            lockedAt - requestedAt).count());
+    }
     const auto sessionIt = sessions_.find(sessionId);
     if(sessionIt == sessions_.end() || sessionIt->second.completed.size() != sessionIt->second.totalChunks)
     {
@@ -1316,7 +2123,7 @@ FileCommitStatus GatewayState::commitFile(const std::string& sessionId, FileMeta
         legacyManifest += chunk->second.chunkHash + ":" + std::to_string(chunk->second.size) + ";";
         manifestChunks.push_back({static_cast<uint32_t>(i), chunk->second.chunkHash, chunk->second.size});
         ChunkRoute route;
-        if (!getRouteLocked(chunk->second.chunkHash, route) || route.replicas.size() < 2) {
+        if (!getRouteLocked(chunk->second.chunkHash, route) || route.replicas.size() < replicationFactor_) {
             out.state = FileState::kProtecting;
         }
     }
@@ -1339,6 +2146,20 @@ FileCommitStatus GatewayState::commitFile(const std::string& sessionId, FileMeta
     }
     out.dirPath = parentPath;
     out.fileName = name;
+
+    // Object and namespace/path records are both owned by ObjectShard.  A
+    // commit may touch two different shards, so acquire them in shard-number
+    // order after the SessionShard.  In global mode the compatibility guard
+    // above already serializes the operation and no extra lock is needed.
+    std::unique_ptr<GatewayShardMultiLock> objectAndPathLock;
+    if (useShardedLocks()) {
+        const std::string objectKey = sessionIt->second.objectId.empty()
+            ? (sessionId + "#object") : sessionIt->second.objectId;
+        const std::string pathKeyForShard = catalogPathKey(out.ownerId, childPath(parentPath, name));
+        objectAndPathLock = std::make_unique<GatewayShardMultiLock>(
+            objectMutex(objectKey), locks_.objectShard(objectKey),
+            objectMutex(pathKeyForShard), locks_.objectShard(pathKeyForShard));
+    }
 
     const std::string pathKey = catalogPathKey(out.ownerId, childPath(parentPath, name));
     std::string existingObjectId;
@@ -1403,22 +2224,32 @@ FileCommitStatus GatewayState::commitFile(const std::string& sessionId, FileMeta
     }
     batch.Put("obj:" + object.objectId, objectValue(object));
     batch.Put("path:" + pathKey, object.objectId);
-    media::AiIndexEvent aiEvent;
-    aiEvent.eventId = object.objectId;
-    aiEvent.objectId = object.objectId;
-    aiEvent.objectVersion = object.objectVersion;
-    aiEvent.metadataVersion = object.metadataVersion;
-    aiEvent.objectKey = childPath(parentPath, name);
-    aiEvent.fileHash = out.fileHash;
-    aiEvent.fileSize = out.fileSize;
-    aiEvent.occurredAt = out.createdAt;
-    batch.Put("ai:" + aiEvent.eventId, media::serializeAiIndexEvent(aiEvent));
+    if(legacyAiOutboxEnabled()) {
+        media::AiIndexEvent aiEvent;
+        aiEvent.eventId = object.objectId;
+        aiEvent.objectId = object.objectId;
+        aiEvent.objectVersion = object.objectVersion;
+        aiEvent.metadataVersion = object.metadataVersion;
+        aiEvent.objectKey = childPath(parentPath, name);
+        aiEvent.fileHash = out.fileHash;
+        aiEvent.fileSize = out.fileSize;
+        aiEvent.occurredAt = out.createdAt;
+        batch.Put("ai:" + aiEvent.eventId, media::serializeAiIndexEvent(aiEvent));
+    }
+    const auto writeStartedAt = std::chrono::steady_clock::now();
     if (!db_->Write(leveldb::WriteOptions(), &batch).ok()) return FileCommitStatus::kInvalidRequest;
+    const auto writeFinishedAt = std::chrono::steady_clock::now();
 
     objectCache_.erase(object.objectId);
     fileCache_.erase(out.fileHash);
     catalogCache_.clear();
     manifestCache_.erase(out.fileHash);
+    if(timing != nullptr) {
+        timing->levelDbWriteUs = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
+            writeFinishedAt - writeStartedAt).count());
+        timing->criticalSectionUs = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now() - lockedAt).count());
+    }
     return FileCommitStatus::kCommitted;
 }
 
@@ -1430,7 +2261,8 @@ FileCommitStatus GatewayState::commitDerivedUpload(const std::string& jobId,
     out = {};
     if(jobId.empty() || leaseToken.empty() || sessionId.empty()) return FileCommitStatus::kInvalidRequest;
     const int64_t now = unixSeconds();
-    std::lock_guard<std::mutex> lock(mutex_);
+    std::mutex& selectedMutex = useShardedLocks() ? sessionMutex(sessionId) : mutex_;
+    GatewayMutexGuard lock(selectedMutex, __func__);
     const auto sessionIt = sessions_.find(sessionId);
     if(sessionIt == sessions_.end() || sessionIt->second.derivedJobId != jobId ||
        sessionIt->second.completed.size() != sessionIt->second.totalChunks) {
@@ -1458,7 +2290,7 @@ FileCommitStatus GatewayState::commitDerivedUpload(const std::string& jobId,
         out.chunkHashes.push_back(completed->second.chunkHash);
         manifestChunks.push_back({index, completed->second.chunkHash, completed->second.size});
         ChunkRoute route;
-        if(!getRouteLocked(completed->second.chunkHash, route) || route.replicas.size() < 2) {
+        if(!getRouteLocked(completed->second.chunkHash, route) || route.replicas.size() < replicationFactor_) {
             out.state = FileState::kProtecting;
         }
     }
@@ -1516,19 +2348,30 @@ FileCommitStatus GatewayState::commitDerivedUpload(const std::string& jobId,
 bool GatewayState::getFile(const std::string& fileHash, FileMeta& out) const
 {
     //false -- 没找到， true 找到
-    std::lock_guard<std::mutex> lock(mutex_);
+    std::mutex& selectedMutex = useShardedLocks() ? objectMutex(fileHash) : mutex_;
+    GatewayMutexGuard lock(selectedMutex, __func__);
     return getFileLocked(fileHash, out);
 }
 bool GatewayState::getRoute(const std::string& chunkHash, ChunkRoute& out) const
 {
-    std::lock_guard<std::mutex> lock(mutex_);
+    std::mutex& selectedMutex = useShardedLocks() ? objectMutex(chunkHash) : mutex_;
+    GatewayMutexGuard lock(selectedMutex, __func__);
     return getRouteLocked(chunkHash, out);
 }
 
 bool GatewayState::buildManifestSnapshot(const std::string& fileHash,
                                          ManifestSnapshot& out) const
 {
-    std::lock_guard<std::mutex> lock(mutex_);
+    // NodeRegistry is a separate ownership domain.  Copy the static node
+    // records under its short-lived shared lock before taking ObjectShard;
+    // never hold NodeRegistry while doing LevelDB/cache I/O.
+    std::map<std::string, NodeRecord> nodeSnapshot;
+    if (useShardedLocks()) {
+        std::shared_lock<std::shared_mutex> nodeLock(locks_.nodes());
+        nodeSnapshot = nodeRecords_;
+    }
+    std::mutex& selectedMutex = useShardedLocks() ? objectMutex(fileHash) : mutex_;
+    GatewayMutexGuard lock(selectedMutex, __func__);
     if (const auto cached = manifestCache_.get(fileHash)) {
         out = *cached;
         return true;
@@ -1544,9 +2387,15 @@ bool GatewayState::buildManifestSnapshot(const std::string& fileHash,
         if (!getRouteLocked(chunkHash, route)) return false;
         snapshot.routes.push_back(route);
         for(const auto& nodeId : route.replicas) {
-            const auto node = nodeRecords_.find(nodeId);
-            if(node == nodeRecords_.end()) return false;
-            snapshot.nodes.emplace(nodeId, node->second);
+            if (useShardedLocks()) {
+                const auto node = nodeSnapshot.find(nodeId);
+                if (node == nodeSnapshot.end()) return false;
+                snapshot.nodes.emplace(nodeId, node->second);
+            } else {
+                const auto node = nodeRecords_.find(nodeId);
+                if (node == nodeRecords_.end()) return false;
+                snapshot.nodes.emplace(nodeId, node->second);
+            }
         }
     }
     manifestCache_.put(fileHash, std::make_shared<const ManifestSnapshot>(snapshot),
@@ -1558,8 +2407,27 @@ bool GatewayState::buildManifestSnapshot(const std::string& fileHash,
 bool GatewayState::buildObjectReadDescriptor(
     const std::string& objectId, control::ObjectReadDescriptor& out) const
 {
+    if (remoteMetadata_) {
+        const auto object = remoteMetadata_->object(objectId); if(!object || object->state != metadata::ObjectState::kCommitted) return false;
+        const auto descriptor = remoteMetadata_->readDescriptor(objectId, object->objectVersion); if(!descriptor) return false;
+        const auto metadataNodes = remoteMetadata_->nodes(); std::map<std::string, metadata::NodeRecord> nodes;
+        for(const auto& node : metadataNodes) nodes.emplace(node.nodeId, node);
+        out = {}; out.objectId=descriptor->object.objectId; out.objectVersion=descriptor->object.objectVersion; out.metadataVersion=descriptor->object.metadataVersion; out.fileSize=descriptor->object.fileSize; out.chunkSize=descriptor->object.chunkSize;
+        for(const auto& source : descriptor->chunks) {
+            control::ChunkReadDescriptor chunk; chunk.index=source.index; chunk.chunkId=source.storageIdentity; chunk.storageIdentity=source.storageIdentity; chunk.size=source.size; chunk.checksumType=metadata::toString(source.checksumType); chunk.checksumDigest=source.checksumDigest; chunk.generation=source.generation;
+            for(const auto& replica : source.replicas) { const auto it=nodes.find(replica.nodeId); if(it==nodes.end()) return false; chunk.replicas.push_back({it->second.nodeId,it->second.address,it->second.dataPort}); }
+            if(chunk.replicas.empty()) return false; out.chunks.push_back(std::move(chunk));
+        }
+        return !out.chunks.empty();
+    }
     out = {};
-    std::lock_guard<std::mutex> lock(mutex_);
+    std::map<std::string, NodeRecord> nodeSnapshot;
+    if (useShardedLocks()) {
+        std::shared_lock<std::shared_mutex> nodeLock(locks_.nodes());
+        nodeSnapshot = nodeRecords_;
+    }
+    std::mutex& selectedMutex = useShardedLocks() ? objectMutex(objectId) : mutex_;
+    GatewayMutexGuard lock(selectedMutex, __func__);
     ObjectMeta object;
     if(!getObjectLocked(objectId, object)) return false;
     FileMeta file;
@@ -1585,10 +2453,17 @@ bool GatewayState::buildObjectReadDescriptor(
         chunk.checksumDigest = route.checksumDigest;
         chunk.generation = route.generation;
         for(const auto& nodeId : route.replicas) {
-            const auto node = nodeRecords_.find(nodeId);
-            if(node == nodeRecords_.end()) return false;
-            chunk.replicas.push_back(
-                {node->second.nodeId, node->second.address, node->second.httpPort});
+            const NodeRecord* node = nullptr;
+            if (useShardedLocks()) {
+                const auto found = nodeSnapshot.find(nodeId);
+                if (found == nodeSnapshot.end()) return false;
+                node = &found->second;
+            } else {
+                const auto found = nodeRecords_.find(nodeId);
+                if (found == nodeRecords_.end()) return false;
+                node = &found->second;
+            }
+            chunk.replicas.push_back({node->nodeId, node->address, node->httpPort});
         }
         if(chunk.storageIdentity.empty() || chunk.replicas.empty()) return false;
         descriptor.chunks.push_back(std::move(chunk));
@@ -1604,7 +2479,29 @@ bool GatewayState::createDirectory(const std::string& parentPath, const std::str
     std::string entryName;
     if (!normalizeDirectoryPath(parentPath, parent) || !normalizeEntryName(name, entryName)) return false;
 
-    std::lock_guard<std::mutex> lock(mutex_);
+    const std::string lockKey = catalogPathKey("admin", parent);
+    if (remoteMetadata_) {
+        const std::string path = childPath(parent, entryName);
+        if (parent != "/") {
+            const auto slash = parent.find_last_of('/');
+            const std::string grandparent = slash <= 0 ? "/" : parent.substr(0, slash);
+            const auto children = remoteMetadata_->directories("admin", grandparent);
+            const bool parentExists = std::any_of(children.begin(), children.end(),
+                [&](const metadata::DirectoryRecord& directory) { return directory.path == parent; });
+            if(!parentExists) return false;
+        }
+        metadata::MetadataCommand command;
+        command.commandId = metadata::MetadataClient::newCommandId("create-directory");
+        command.type = metadata::MetadataCommandType::kCreateDirectory;
+        command.actorType = "gateway"; command.actorId = "admin"; command.issuedAt = unixSeconds();
+        command.payload = metadata::CreateDirectoryPayload{"admin", path, unixSeconds()};
+        const auto result = remoteMetadata_->propose(command);
+        if(result.status != metadata::ApplyStatus::kOk && result.status != metadata::ApplyStatus::kAlreadyApplied) return false;
+        if(out) *out = DirectoryMeta{"admin", path, unixSeconds()};
+        return true;
+    }
+    std::mutex& selectedMutex = useShardedLocks() ? objectMutex(lockKey) : mutex_;
+    GatewayMutexGuard lock(selectedMutex, __func__);
     DirectoryMeta parentDirectory;
     if (parent != "/" && !getDirectoryLocked("admin", parent, parentDirectory)) return false;
     const std::string path = childPath(parent, entryName);
@@ -1676,7 +2573,31 @@ bool GatewayState::listCatalog(const std::string& path, CatalogSnapshot& out) co
 {
     std::string normalized;
     if (!normalizeDirectoryPath(path, normalized)) return false;
-    std::lock_guard<std::mutex> lock(mutex_);
+    if (remoteMetadata_) {
+        out = {}; out.path = normalized; out.breadcrumbs = breadcrumbsFor(normalized);
+        if(normalized != "/" && remoteMetadata_->directories("admin", normalized).empty()) {
+            // The endpoint returns children, so verify that the requested path
+            // itself exists by checking its parent list (root is implicit).
+            const auto slash = normalized.find_last_of('/');
+            const std::string parent = slash == 0 ? "/" : normalized.substr(0, slash);
+            const auto children = remoteMetadata_->directories("admin", parent);
+            const bool exists = std::any_of(children.begin(), children.end(),
+                [&](const metadata::DirectoryRecord& directory) { return directory.path == normalized; });
+            if(!exists) return false;
+        }
+        for(const auto& directory : remoteMetadata_->directories("admin", normalized))
+            out.directories.push_back({directory.ownerId, directory.path, directory.createdAt});
+        for(const auto& object : remoteMetadata_->objects("admin", normalized)) {
+            ObjectMeta converted; converted.objectId=object.objectId; converted.objectVersion=object.objectVersion;
+            converted.metadataVersion=object.metadataVersion; converted.ownerId=object.ownerId; converted.parentPath=object.parentPath;
+            converted.name=object.name; converted.fileHash=object.contentHash; converted.fileSize=object.fileSize;
+            converted.contentType="application/octet-stream"; converted.state=object.state==metadata::ObjectState::kCommitted ? FileState::kAvailable : FileState::kProtecting;
+            converted.createdAt=unixSeconds(); out.files.push_back(std::move(converted));
+        }
+        return true;
+    }
+    std::mutex& selectedMutex = useShardedLocks() ? objectMutex(catalogPathKey("admin", normalized)) : mutex_;
+    GatewayMutexGuard lock(selectedMutex, __func__);
     if (const auto cached = catalogCache_.get(normalized)) {
         out = *cached;
         return true;
@@ -1693,7 +2614,17 @@ bool GatewayState::listCatalog(const std::string& path, CatalogSnapshot& out) co
 
 bool GatewayState::getObject(const std::string& objectId, ObjectMeta& out) const
 {
-    std::lock_guard<std::mutex> lock(mutex_);
+    if (remoteMetadata_) {
+        const auto object = remoteMetadata_->object(objectId);
+        // A replicated delete first moves the authoritative metadata record
+        // to kDeleting while DataNode cleanup is still asynchronous.  Do not
+        // expose that tombstone through the ordinary object lookup API: the
+        // catalog/read contract is that only committed objects are readable.
+        if(!object || object->state != metadata::ObjectState::kCommitted) return false;
+        out={}; out.objectId=object->objectId; out.objectVersion=object->objectVersion; out.metadataVersion=object->metadataVersion; out.ownerId=object->ownerId; out.parentPath=object->parentPath; out.name=object->name; out.fileHash=object->contentHash; out.fileSize=object->fileSize; out.contentType="application/octet-stream"; out.state=object->state==metadata::ObjectState::kCommitted?FileState::kAvailable:FileState::kProtecting; out.createdAt=unixSeconds(); return true;
+    }
+    std::mutex& selectedMutex = useShardedLocks() ? objectMutex(objectId) : mutex_;
+    GatewayMutexGuard lock(selectedMutex, __func__);
     return getObjectLocked(objectId, out);
 }
 
@@ -1703,7 +2634,8 @@ ThumbnailEnqueueResult GatewayState::enqueueThumbnail(const std::string& sourceF
     ThumbnailEnqueueResult result;
     if (sourceFileHash.empty() || profile.empty()) return result;
 
-    std::lock_guard<std::mutex> lock(mutex_);
+    std::mutex& selectedMutex = useShardedLocks() ? objectMutex(sourceFileHash + "\n" + profile) : mutex_;
+    GatewayMutexGuard lock(selectedMutex, __func__);
     if (!db_) return result;
 
     media::ThumbnailMeta thumbnail;
@@ -1766,14 +2698,16 @@ ThumbnailEnqueueResult GatewayState::enqueueThumbnail(const std::string& sourceF
 
 bool GatewayState::getMediaJob(const std::string& jobId, media::MediaJob& out) const
 {
-    std::lock_guard<std::mutex> lock(mutex_);
+    std::mutex& selectedMutex = useShardedLocks() ? sessionMutex(jobId) : mutex_;
+    GatewayMutexGuard lock(selectedMutex, __func__);
     return getMediaJobLocked(jobId, out);
 }
 
 bool GatewayState::getThumbnail(const std::string& sourceFileHash, const std::string& profile,
                                 media::ThumbnailMeta& out) const
 {
-    std::lock_guard<std::mutex> lock(mutex_);
+    std::mutex& selectedMutex = useShardedLocks() ? objectMutex(sourceFileHash + "\n" + profile) : mutex_;
+    GatewayMutexGuard lock(selectedMutex, __func__);
     return getThumbnailLocked(sourceFileHash, profile, out);
 }
 
@@ -1781,7 +2715,8 @@ bool GatewayState::claimMediaJob(const std::string& jobId, int64_t now, int64_t 
                                  media::MediaJob& out)
 {
     if (jobId.empty() || leaseSeconds <= 0 || leaseSeconds > 3600) return false;
-    std::lock_guard<std::mutex> lock(mutex_);
+    std::mutex& selectedMutex = useShardedLocks() ? sessionMutex(jobId) : mutex_;
+    GatewayMutexGuard lock(selectedMutex, __func__);
 
     media::MediaJob job;
     if (!getMediaJobLocked(jobId, job) || !isClaimableMediaJob(job, now)) return false;
@@ -1815,7 +2750,8 @@ bool GatewayState::completeMediaJob(const std::string& jobId, const std::string&
                                     const std::string& derivedFileHash, int64_t now)
 {
     if (jobId.empty() || leaseToken.empty() || derivedObjectId.empty() || derivedFileHash.empty()) return false;
-    std::lock_guard<std::mutex> lock(mutex_);
+    std::mutex& selectedMutex = useShardedLocks() ? sessionMutex(jobId) : mutex_;
+    GatewayMutexGuard lock(selectedMutex, __func__);
 
     media::MediaJob job;
     if (!getMediaJobLocked(jobId, job) || job.state != media::JobState::kRunning ||
@@ -1851,7 +2787,8 @@ bool GatewayState::failMediaJob(const std::string& jobId, const std::string& lea
                                 int64_t now)
 {
     if (jobId.empty() || leaseToken.empty() || error.empty()) return false;
-    std::lock_guard<std::mutex> lock(mutex_);
+    std::mutex& selectedMutex = useShardedLocks() ? sessionMutex(jobId) : mutex_;
+    GatewayMutexGuard lock(selectedMutex, __func__);
 
     media::MediaJob job;
     if (!getMediaJobLocked(jobId, job) || job.state != media::JobState::kRunning ||
@@ -1883,7 +2820,8 @@ bool GatewayState::failMediaJob(const std::string& jobId, const std::string& lea
 bool GatewayState::deferMediaJobDispatch(const std::string& jobId, int64_t nextDispatchAt)
 {
     if (jobId.empty() || nextDispatchAt <= 0) return false;
-    std::lock_guard<std::mutex> lock(mutex_);
+    std::mutex& selectedMutex = useShardedLocks() ? sessionMutex(jobId) : mutex_;
+    GatewayMutexGuard lock(selectedMutex, __func__);
 
     media::MediaJob job;
     if (!getMediaJobLocked(jobId, job) || job.state != media::JobState::kPending) return false;
@@ -1897,7 +2835,7 @@ bool GatewayState::deferMediaJobDispatch(const std::string& jobId, int64_t nextD
 
 std::vector<media::MediaJob> GatewayState::dueMediaJobs(int64_t now, size_t maxJobs) const
 {
-    std::lock_guard<std::mutex> lock(mutex_);
+    GatewayMutexGuard lock(mutex_, __func__);
     std::vector<media::MediaJob> result;
     if (!db_ || maxJobs == 0) return result;
 
@@ -1920,7 +2858,7 @@ std::vector<media::MediaJob> GatewayState::dueMediaJobs(int64_t now, size_t maxJ
 std::vector<media::AiIndexEvent> GatewayState::dueAiIndexEvents(int64_t now,
                                                                  size_t maxEvents) const
 {
-    std::lock_guard<std::mutex> lock(mutex_);
+    GatewayMutexGuard lock(mutex_, __func__);
     std::vector<media::AiIndexEvent> result;
     if(!db_ || maxEvents == 0) return result;
 
@@ -1939,7 +2877,7 @@ std::vector<media::AiIndexEvent> GatewayState::dueAiIndexEvents(int64_t now,
 bool GatewayState::markAiIndexEventPublished(const std::string& eventId, int64_t now)
 {
     if(eventId.empty() || now <= 0) return false;
-    std::lock_guard<std::mutex> lock(mutex_);
+    GatewayMutexGuard lock(mutex_, __func__);
     if(!db_) return false;
     std::string value;
     if(!db_->Get(leveldb::ReadOptions(), "ai:" + eventId, &value).ok()) return false;
@@ -1953,25 +2891,25 @@ bool GatewayState::markAiIndexEventPublished(const std::string& eventId, int64_t
 
 ObjectMetaCache::Stats GatewayState::objectCacheStats() const
 {
-    std::lock_guard<std::mutex> lock(mutex_);
+    GatewayMutexGuard lock(mutex_, __func__);
     return objectCache_.stats();
 }
 
 CatalogCache::Stats GatewayState::catalogCacheStats() const
 {
-    std::lock_guard<std::mutex> lock(mutex_);
+    GatewayMutexGuard lock(mutex_, __func__);
     return catalogCache_.stats();
 }
 
 ManifestCache::Stats GatewayState::manifestCacheStats() const
 {
-    std::lock_guard<std::mutex> lock(mutex_);
+    GatewayMutexGuard lock(mutex_, __func__);
     return manifestCache_.stats();
 }
 
 MetadataCacheUsage GatewayState::metadataCacheUsage() const
 {
-    std::lock_guard<std::mutex> lock(mutex_);
+    GatewayMutexGuard lock(mutex_, __func__);
     return {objectCache_.size(), fileCache_.size(), routeCache_.size(),
             catalogCache_.size(), manifestCache_.size()};
 }
@@ -1979,7 +2917,19 @@ MetadataCacheUsage GatewayState::metadataCacheUsage() const
 DeleteStatus GatewayState::deleteObject(const std::string& objectId, uint64_t expectedObjectVersion)
 {
     if (objectId.empty()) return DeleteStatus::kInvalidRequest;
-    std::lock_guard<std::mutex> lock(mutex_);
+    if (remoteMetadata_) {
+        const auto object = remoteMetadata_->object(objectId);
+        if(!object || (expectedObjectVersion != 0 && object->objectVersion != expectedObjectVersion)) return DeleteStatus::kNotFound;
+        metadata::MetadataCommand command; command.commandId = metadata::MetadataClient::newCommandId("delete-object");
+        command.type = metadata::MetadataCommandType::kDeleteObject; command.actorType = "gateway"; command.actorId = "admin";
+        command.issuedAt = unixSeconds(); command.payload = metadata::DeleteObjectPayload{objectId, object->objectVersion};
+        const auto result = remoteMetadata_->propose(command);
+        if(result.status == metadata::ApplyStatus::kNotFound) return DeleteStatus::kNotFound;
+        if(result.status != metadata::ApplyStatus::kOk && result.status != metadata::ApplyStatus::kAlreadyApplied) return DeleteStatus::kInvalidRequest;
+        return DeleteStatus::kDeleted;
+    }
+    std::mutex& selectedMutex = useShardedLocks() ? objectMutex(objectId) : mutex_;
+    GatewayMutexGuard lock(selectedMutex, __func__);
     ObjectMeta object;
     if (!getObjectLocked(objectId, object)) return DeleteStatus::kNotFound;
     if (expectedObjectVersion != 0 && object.objectVersion != expectedObjectVersion) {
@@ -1995,7 +2945,24 @@ DeleteStatus GatewayState::deleteDirectory(const std::string& path)
         return DeleteStatus::kInvalidRequest;
     }
 
-    std::lock_guard<std::mutex> lock(mutex_);
+    if (remoteMetadata_) {
+        const auto slash = normalized.find_last_of('/');
+        const std::string parent = slash == 0 ? "/" : normalized.substr(0, slash);
+        const auto children = remoteMetadata_->directories("admin", parent);
+        const bool exists = std::any_of(children.begin(), children.end(),
+            [&](const metadata::DirectoryRecord& directory) { return directory.path == normalized; });
+        if(!exists) return DeleteStatus::kNotFound;
+        metadata::MetadataCommand command; command.commandId = metadata::MetadataClient::newCommandId("delete-directory");
+        command.type = metadata::MetadataCommandType::kDeleteDirectory; command.actorType = "gateway"; command.actorId = "admin";
+        command.issuedAt = unixSeconds(); command.payload = metadata::DeleteDirectoryPayload{"admin", normalized};
+        const auto result = remoteMetadata_->propose(command);
+        if(result.status == metadata::ApplyStatus::kNotFound) return DeleteStatus::kNotFound;
+        return (result.status == metadata::ApplyStatus::kOk || result.status == metadata::ApplyStatus::kAlreadyApplied)
+            ? DeleteStatus::kDeleted : DeleteStatus::kInvalidRequest;
+    }
+
+    std::mutex& selectedMutex = useShardedLocks() ? objectMutex(catalogPathKey("admin", normalized)) : mutex_;
+    GatewayMutexGuard lock(selectedMutex, __func__);
     const std::string rootKey = catalogPathKey("admin", normalized);
     DirectoryMeta rootDirectory;
     if (!getDirectoryLocked("admin", normalized, rootDirectory)) return DeleteStatus::kNotFound;
@@ -2030,7 +2997,16 @@ DeleteStatus GatewayState::deleteDirectory(const std::string& path)
 
 std::vector<DeleteTaskSnapshot> GatewayState::pendingDeletesForNode(const std::string& nodeId) const
 {
-    std::lock_guard<std::mutex> lock(mutex_);
+    if (remoteMetadata_) {
+        std::vector<DeleteTaskSnapshot> pending;
+        for(const auto& task : remoteMetadata_->deleteTasks(nodeId)) {
+            std::vector<std::string> nodeIds;
+            for(const auto& replica : task.pendingReplicas) nodeIds.push_back(replica.nodeId);
+            pending.push_back({task.objectId + "\n" + std::to_string(task.chunkIndex), task.storageIdentity, std::move(nodeIds)});
+        }
+        return pending;
+    }
+    GatewayMutexGuard lock(mutex_, __func__);
     std::vector<DeleteTaskSnapshot> pending;
     for (const auto& [chunkHash, task] : deleteTasks_) {
         if (std::find(task.pendingNodeIds.begin(), task.pendingNodeIds.end(), nodeId) !=
@@ -2044,7 +3020,28 @@ std::vector<DeleteTaskSnapshot> GatewayState::pendingDeletesForNode(const std::s
 bool GatewayState::acknowledgeDelete(const std::string& chunkHash, const std::string& nodeId)
 {
     if (chunkHash.empty() || nodeId.empty()) return false;
-    std::lock_guard<std::mutex> lock(mutex_);
+    if (remoteMetadata_) {
+        const auto separator = chunkHash.rfind('\n');
+        if(separator == std::string::npos) return false;
+        const std::string objectId = chunkHash.substr(0, separator);
+        uint32_t index = 0; try { index = static_cast<uint32_t>(std::stoul(chunkHash.substr(separator + 1))); } catch(...) { return false; }
+        const auto task = remoteMetadata_->deleteTasks(nodeId);
+        auto found = std::find_if(task.begin(), task.end(), [&](const metadata::DeleteTaskRecord& candidate) {
+            return candidate.objectId == objectId && candidate.chunkIndex == index;
+        });
+        if(found == task.end()) return true;
+        auto replica = std::find_if(found->pendingReplicas.begin(), found->pendingReplicas.end(),
+            [&](const metadata::LeaseTarget& target) { return target.nodeId == nodeId; });
+        if(replica == found->pendingReplicas.end()) return true;
+        metadata::MetadataCommand command; command.commandId = metadata::MetadataClient::newCommandId("ack-delete");
+        command.type = metadata::MetadataCommandType::kAcknowledgeDelete; command.actorType = "gateway"; command.actorId = nodeId;
+        command.nodeEpoch = replica->nodeEpoch; command.issuedAt = unixSeconds();
+        command.payload = metadata::AcknowledgeDeletePayload{objectId, found->objectVersion, index, nodeId, replica->nodeEpoch};
+        const auto result = remoteMetadata_->propose(command);
+        return result.status == metadata::ApplyStatus::kOk || result.status == metadata::ApplyStatus::kAlreadyApplied;
+    }
+    std::mutex& selectedMutex = useShardedLocks() ? objectMutex(chunkHash) : mutex_;
+    GatewayMutexGuard lock(selectedMutex, __func__);
     const auto taskIt = deleteTasks_.find(chunkHash);
     if (taskIt == deleteTasks_.end()) return true;
 

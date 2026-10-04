@@ -51,6 +51,7 @@ HttpChunkUploadDecodeResult HttpChunkUploadAdapter::decode(
         ? 1 : capability.objectVersion;
     descriptor.generation = capability.generation;
     descriptor.sessionId = capability.sessionId;
+    descriptor.leaseId = capability.leaseId;
     descriptor.chunkIndex = capability.chunkIndex;
     descriptor.contentLength = capability.chunkSize;
     descriptor.checksum.segmentBytes = capability.checksumSegmentBytes;

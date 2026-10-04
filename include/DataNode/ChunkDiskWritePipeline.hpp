@@ -6,6 +6,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <chrono>
 #include <deque>
 #include <functional>
 #include <memory>
@@ -21,6 +22,11 @@ public:
     using Ptr = std::shared_ptr<ChunkDiskWritePipeline>;
     using ReadyCallback = std::function<void()>;
     using FinishCallback = std::function<void(bool success, bool alreadyExists)>;
+    // Optional, opt-in lifecycle observer used by bounded diagnostics. The
+    // callback is invoked on the event-loop thread and must not alter flow
+    // control or storage semantics.
+    using StageCallback = std::function<void(const char* stage,
+                                             std::chrono::steady_clock::time_point at)>;
 
     struct Metrics {
         uint64_t queuedBytes = 0;
@@ -41,6 +47,7 @@ public:
         WriteMode writeMode = WriteMode::kPwritev;
         size_t targetBatchBytes = 256 * 1024;
         uint64_t maxBatchDelayUs = 1000;
+        StageCallback stageCallback;
     };
 
     static constexpr size_t kHighWatermarkBytes = 1024 * 1024;

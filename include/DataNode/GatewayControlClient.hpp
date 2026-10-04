@@ -10,6 +10,7 @@ namespace miniKV::datanode {
 struct RpcResult {
     bool ok = false;
     int httpStatus = 0;
+    uint64_t nodeEpoch = 0;
     std::string error;
 };
 
@@ -17,6 +18,7 @@ using RpcCallback = std::function<void(RpcResult)>;
 
 struct NodeRegistration {
     std::string nodeId;
+    std::string bootId;
     std::string address;
     uint16_t httpPort = 0;
     uint64_t maxStorageBytes = 0;
@@ -42,11 +44,13 @@ struct ChunkCommit {
     std::string chunkHash;
     uint64_t size = 0;
     std::vector<std::string> successfulNodes;
+    std::string leaseId;
     std::string uploadToken;
     std::string requestId;
 };
 
 struct LeaseRelease {
+    std::string leaseId;
     std::string uploadToken;
     std::string requestId;
 };

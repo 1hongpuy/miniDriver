@@ -6,6 +6,7 @@
 #include <string>
 #include <map>
 #include <algorithm>
+#include <cctype>
 #include <cstring>
 #include <strings.h>
 #include <tuple>
@@ -152,16 +153,19 @@ public:
     }
 
     std::string getHeader(const std::string& field) const{
-        auto it = headers_.find(field);
-        if(it != headers_.end())
-        {
-            return it->second;
+        const std::string wanted = normalizedHeaderName(field);
+        for(const auto& [name, value] : headers_) {
+            if(normalizedHeaderName(name) == wanted) return value;
         }
         return "";
     }
 
     bool hashHeader(const std::string& field) const {
-        return headers_.find(field) != headers_.end();
+        const std::string wanted = normalizedHeaderName(field);
+        for(const auto& [name, value] : headers_) {
+            if(normalizedHeaderName(name) == wanted) return true;
+        }
+        return false;
     }
 
     size_t contentLength() const {
@@ -181,6 +185,15 @@ public:
     }
 
 private:
+    static std::string normalizedHeaderName(const std::string& name) {
+        std::string normalized;
+        normalized.reserve(name.size());
+        for(const unsigned char c : name) {
+            normalized.push_back(static_cast<char>(std::tolower(c)));
+        }
+        return normalized;
+    }
+
     Method method_;
     std::string path_;
     std::string query_;
@@ -195,7 +208,6 @@ private:
 
 }
 }
-
 
 
 

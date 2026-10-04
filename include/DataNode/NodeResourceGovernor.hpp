@@ -22,6 +22,12 @@ public:
     struct Snapshot {
         uint32_t activeUploads = 0;
         uint32_t activeDownloads = 0;
+        uint64_t uploadAcquireAttempts = 0;
+        uint64_t uploadAcquireSuccesses = 0;
+        uint64_t uploadRejects = 0;
+        uint64_t uploadRejectsGlobal = 0;
+        uint64_t uploadRejectsPerClient = 0;
+        uint64_t uploadReleases = 0;
     };
 
 private:
@@ -85,7 +91,12 @@ public:
 
     std::optional<UploadLease> tryAcquireUpload(std::string clientId)
     {
-        return tryAcquire(ResourceKind::Upload, normalizeClientId(std::move(clientId)));
+        return tryAcquireUpload(std::move(clientId), nullptr);
+    }
+
+    std::optional<UploadLease> tryAcquireUpload(std::string clientId, std::string* rejectReason)
+    {
+        return tryAcquire(ResourceKind::Upload, normalizeClientId(std::move(clientId)), rejectReason);
     }
 
     std::optional<DownloadLease> tryAcquireDownload(std::string clientId)
@@ -96,7 +107,16 @@ public:
     Snapshot snapshot() const
     {
         std::lock_guard<std::mutex> lock(mutex_);
-        return {activeUploads_, activeDownloads_};
+        Snapshot result;
+        result.activeUploads = activeUploads_;
+        result.activeDownloads = activeDownloads_;
+        result.uploadAcquireAttempts = uploadAcquireAttempts_;
+        result.uploadAcquireSuccesses = uploadAcquireSuccesses_;
+        result.uploadRejects = uploadRejects_;
+        result.uploadRejectsGlobal = uploadRejectsGlobal_;
+        result.uploadRejectsPerClient = uploadRejectsPerClient_;
+        result.uploadReleases = uploadReleases_;
+        return result;
     }
 
     const Config& config() const { return config_; }
@@ -123,9 +143,11 @@ private:
         return clientId;
     }
 
-    std::optional<Lease> tryAcquire(ResourceKind kind, std::string clientId)
+    std::optional<Lease> tryAcquire(ResourceKind kind, std::string clientId,
+                                    std::string* rejectReason = nullptr)
     {
         std::lock_guard<std::mutex> lock(mutex_);
+        if(kind == ResourceKind::Upload) ++uploadAcquireAttempts_;
         uint32_t& active = kind == ResourceKind::Upload ? activeUploads_ : activeDownloads_;
         const uint32_t globalLimit = kind == ResourceKind::Upload
             ? config_.maxActiveUploads : config_.maxActiveDownloads;
@@ -133,12 +155,21 @@ private:
             ? config_.maxUploadsPerClient : config_.maxDownloadsPerClient;
         auto& clients = kind == ResourceKind::Upload ? uploadClients_ : downloadClients_;
         uint32_t& clientActive = clients[clientId];
-        if(active >= globalLimit || clientActive >= clientLimit) {
+        const bool globalRejected = active >= globalLimit;
+        const bool clientRejected = clientActive >= clientLimit;
+        if(globalRejected || clientRejected) {
+            if(kind == ResourceKind::Upload) {
+                ++uploadRejects_;
+                if(globalRejected) ++uploadRejectsGlobal_;
+                if(clientRejected) ++uploadRejectsPerClient_;
+                if(rejectReason) *rejectReason = globalRejected ? "global_limit" : "per_client_limit";
+            }
             if(clientActive == 0) clients.erase(clientId);
             return std::nullopt;
         }
         ++active;
         ++clientActive;
+        if(kind == ResourceKind::Upload) ++uploadAcquireSuccesses_;
         return Lease(this, kind, std::move(clientId));
     }
 
@@ -153,6 +184,7 @@ private:
             else clients.erase(it);
         }
         if(active > 0) --active;
+        if(kind == ResourceKind::Upload) ++uploadReleases_;
     }
 
     const Config config_;
@@ -161,6 +193,12 @@ private:
     uint32_t activeDownloads_ = 0;
     std::unordered_map<std::string, uint32_t> uploadClients_;
     std::unordered_map<std::string, uint32_t> downloadClients_;
+    uint64_t uploadAcquireAttempts_ = 0;
+    uint64_t uploadAcquireSuccesses_ = 0;
+    uint64_t uploadRejects_ = 0;
+    uint64_t uploadRejectsGlobal_ = 0;
+    uint64_t uploadRejectsPerClient_ = 0;
+    uint64_t uploadReleases_ = 0;
 };
 
 }  // namespace miniKV::datanode

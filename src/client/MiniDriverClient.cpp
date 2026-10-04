@@ -7,12 +7,15 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <cstdlib>
 #include <fstream>
 #include <map>
 #include <mutex>
 #include <openssl/evp.h>
 #include <set>
+#include <sstream>
 #include <thread>
+#include <tuple>
 #include <utility>
 
 namespace miniKV::client {
@@ -277,13 +280,18 @@ bool replicaChain(const std::string& route, std::string& out, std::string& error
 
 bool putChunk(const ClientConfig& config, const std::filesystem::path& inputPath,
               const std::string& sessionId, uint64_t fileSize, uint64_t chunkSize,
-              uint32_t chunkIndex, const std::string& checksumType, std::string& error) {
+              uint32_t chunkIndex, const std::string& checksumType,
+              UploadPhaseTimings& timings, std::string& error) {
+    const auto chunkStartedAt = std::chrono::steady_clock::now();
     const uint64_t offset = static_cast<uint64_t>(chunkIndex) * chunkSize;
     const uint64_t size = std::min<uint64_t>(chunkSize, fileSize - offset);
     std::string sha256;
     std::string crc32c;
     const bool strongContent = checksumType == "sha256";
+    const auto checksumStartedAt = std::chrono::steady_clock::now();
     if (!chunkDigests(inputPath, offset, size, strongContent, sha256, crc32c, error)) return false;
+    timings.checksumPreparationMs += std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - checksumStartedAt).count();
     const std::string checksum = checksumType == "sha256" ? sha256 : crc32c;
     // V2 calls this field `hash`, but target opaque-chunk-id objects must not
     // turn it into a synchronous content-addressing key. It is only a stable
@@ -297,6 +305,7 @@ bool putChunk(const ClientConfig& config, const std::filesystem::path& inputPath
     HttpResponse routes;
     const std::string routePath = "/api/v2/upload/sessions/" + pathEscape(sessionId) + "/routes";
     bool routed = false;
+    const auto routeStartedAt = std::chrono::steady_clock::now();
     for (uint32_t attempt = 0; attempt < 6; ++attempt) {
         std::string routeError;
         if (!httpRequest(config.gateway, "POST", routePath, {{"Content-Type", "application/json"}}, routeBody,
@@ -314,6 +323,8 @@ bool putChunk(const ClientConfig& config, const std::filesystem::path& inputPath
         std::this_thread::sleep_for(std::chrono::milliseconds(25U * (attempt + 1U)));
     }
     if (!routed) return false;
+    timings.routeCapabilityMs += std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - routeStartedAt).count();
     const std::vector<std::string> values = miniKV::util::jsonObjectArray(routes.body, "routes");
     if (values.size() != 1) { error = "invalid route response"; return false; }
     const std::string& route = values.front();
@@ -339,6 +350,7 @@ bool putChunk(const ClientConfig& config, const std::filesystem::path& inputPath
         {"X-Gateway-Address", config.gateway.host}, {"X-Gateway-Port", std::to_string(config.gateway.port)},
         {"X-Replica-Chain", chain}, {"X-Replica-Position", "0"}, {"X-Upload-Token", token},
     };
+    const auto dataNodeStartedAt = std::chrono::steady_clock::now();
     StreamingRequest request;
     if (!request.open(primary, "PUT", "/v2/chunks/" + pathEscape(identity), headers, size,
                       config.dataNodeTimeoutMs, error)) return false;
@@ -359,6 +371,10 @@ bool putChunk(const ClientConfig& config, const std::filesystem::path& inputPath
         error = "DataNode PUT HTTP " + std::to_string(response.status) + ": " + response.body;
         return false;
     }
+    timings.dataNodeUploadMs += std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - dataNodeStartedAt).count();
+    timings.chunkUploadTotalMs += std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - chunkStartedAt).count();
     return true;
 }
 
@@ -380,7 +396,11 @@ bool MiniDriverClient::getReadPlan(const ObjectRef& object, ObjectReadPlan& out,
     if (!httpRequest(config_.gateway, "POST", "/internal/v3/objects/" + pathEscape(object.objectId) +
                      "/versions/" + std::to_string(object.objectVersion) + "/read-plan",
                      headers, "", config_.gatewayTimeoutMs, response, error)) return false;
-    if (response.status != 200) { error = "read-plan HTTP " + std::to_string(response.status); return false; }
+    if (response.status != 200) {
+        error = "read-plan HTTP " + std::to_string(response.status) +
+                (response.body.empty() ? std::string{} : ": " + response.body);
+        return false;
+    }
     ObjectReadPlan parsed;
     parsed.object.objectId = miniKV::util::jsonString(response.body, "objectId");
     parsed.object.objectVersion = miniKV::util::jsonUint(response.body, "objectVersion");
@@ -429,16 +449,101 @@ bool MiniDriverClient::uploadFile(const std::filesystem::path& input, const std:
         return false;
     }
     HttpResponse created;
-    const std::string createBody = "{\"fileName\":\"" + miniKV::util::jsonEscape(fileName) +
-        "\",\"dirPath\":\"" + miniKV::util::jsonEscape(dirPath) + "\",\"fileSize\":" +
-        std::to_string(fileSize) + "}";
-    if (!requestSuccess(config_.gateway, "POST", "/api/v2/upload/sessions", createBody,
-                        config_.gatewayTimeoutMs, created, error)) return false;
+    const bool raftMetadata = [] {
+        const char* value = std::getenv("MINIKV_METADATA_MODE");
+        return value != nullptr && std::string(value) == "raft";
+    }();
+    std::string controlCommandId = options.commandId;
+    if(controlCommandId.empty()) {
+        // Uploads may be started concurrently by several benchmark or
+        // application threads.  A steady-clock value alone can collide when
+        // two calls enter this function within the same clock tick; that
+        // would incorrectly reuse the Raft idempotency key for different
+        // manifests.  Keep the clock component for log readability and add a
+        // process-wide monotonic sequence for uniqueness.
+        static std::atomic<uint64_t> uploadCommandSequence{1};
+        controlCommandId = "sdk-upload-" + std::to_string(
+            std::chrono::steady_clock::now().time_since_epoch().count()) + "-" +
+            std::to_string(uploadCommandSequence.fetch_add(1, std::memory_order_relaxed));
+    }
+    uint32_t preflightChunkSize = 4U * 1024U * 1024U;
+    std::string createBody;
+    if(raftMetadata) {
+        std::ostringstream body;
+        body << "{\"commandId\":\"" << miniKV::util::jsonEscape(controlCommandId)
+             << "\",\"fileName\":\"" << miniKV::util::jsonEscape(fileName)
+             << "\",\"dirPath\":\"" << miniKV::util::jsonEscape(dirPath)
+             << "\",\"fileSize\":" << fileSize << ",\"chunkSize\":" << preflightChunkSize
+             << ",\"manifestHash\":\"";
+        std::vector<std::tuple<uint32_t, uint64_t, std::string, std::string>> chunks;
+        const uint32_t total = static_cast<uint32_t>((fileSize + preflightChunkSize - 1) / preflightChunkSize);
+        std::string canonical = "minikv-manifest-v1\n" + std::to_string(fileSize) + "\n" +
+                                std::to_string(preflightChunkSize) + "\n";
+        for(uint32_t index = 0; index < total; ++index) {
+            const uint64_t offset = static_cast<uint64_t>(index) * preflightChunkSize;
+            const uint64_t size = std::min<uint64_t>(preflightChunkSize, fileSize - offset);
+            std::string sha, crc, digestError;
+            if(!chunkDigests(input, offset, size, options.checksumType == "sha256", sha, crc, digestError)) {
+                error = digestError; return false;
+            }
+            const std::string routeKey = "upload:" + controlCommandId + ":" + std::to_string(index);
+            const std::string checksum = options.checksumType == "sha256" ? sha : crc;
+            canonical += std::to_string(index) + ":" + routeKey + ":" + std::to_string(size) + "\n";
+            chunks.emplace_back(index, size, routeKey, checksum);
+        }
+        const std::string manifestHash = miniKV::util::sha256Hex(canonical.data(), canonical.size());
+        body << miniKV::util::jsonEscape(manifestHash) << "\",\"chunks\":[";
+        for(size_t i = 0; i < chunks.size(); ++i) {
+            if(i) body << ',';
+            body << "{\"index\":" << std::get<0>(chunks[i]) << ",\"hash\":\""
+                 << miniKV::util::jsonEscape(std::get<2>(chunks[i])) << "\",\"size\":"
+                 << std::get<1>(chunks[i]) << ",\"checksumType\":\""
+                 << miniKV::util::jsonEscape(options.checksumType) << "\",\"checksumDigest\":\""
+                 << std::get<3>(chunks[i]) << "\"}";
+        }
+        body << "]}";
+        createBody = body.str();
+    } else {
+        const std::string createBodyLegacy = "{\"fileName\":\"" + miniKV::util::jsonEscape(fileName) +
+            "\",\"dirPath\":\"" + miniKV::util::jsonEscape(dirPath) + "\",\"fileSize\":" +
+            std::to_string(fileSize) + "}";
+        createBody = createBodyLegacy;
+    }
+    const auto createStartedAt = std::chrono::steady_clock::now();
+    const std::string createPath = raftMetadata ? "/api/v2/upload/preflight" : "/api/v2/upload/sessions";
+    const std::map<std::string, std::string> createHeaders = raftMetadata
+        ? std::map<std::string, std::string>{{"Content-Type", "application/json"},
+                                             {"X-Minidriver-Command-Id", controlCommandId}}
+        : std::map<std::string, std::string>{};
+    if (!httpRequest(config_.gateway, "POST", createPath, createHeaders, createBody,
+                     config_.gatewayTimeoutMs, created, error) || created.status < 200 || created.status >= 300) {
+        if(error.empty()) error = "POST " + createPath + " HTTP " + std::to_string(created.status) + ": " + created.body;
+        return false;
+    }
+    out.timings.createSessionMs = std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - createStartedAt).count();
     const std::string sessionId = miniKV::util::jsonString(created.body, "sessionId");
     if (sessionId.empty()) { error = "Gateway returned no sessionId"; return false; }
     HttpResponse session;
-    if (!requestSuccess(config_.gateway, "GET", "/api/v2/upload/sessions/" + pathEscape(sessionId), "",
-                        config_.gatewayTimeoutMs, session, error)) return false;
+    // Raft preflight already returns the committed session contract.  Reading
+    // it back immediately would add another ReadIndex/HTTP round trip to
+    // every small-object upload.  Legacy session creation keeps the explicit
+    // GET because its response does not carry the negotiated checksum and
+    // completion state.
+    const bool preflightHasSession = raftMetadata &&
+        miniKV::util::jsonString(created.body, "status") == "UPLOAD_REQUIRED" &&
+        miniKV::util::jsonUint(created.body, "chunkSize") != 0 &&
+        miniKV::util::jsonUint(created.body, "totalChunks") != 0;
+    if(preflightHasSession) {
+        session.status = created.status;
+        session.body = created.body;
+    } else {
+        const auto getSessionStartedAt = std::chrono::steady_clock::now();
+        if (!requestSuccess(config_.gateway, "GET", "/api/v2/upload/sessions/" + pathEscape(sessionId), "",
+                            config_.gatewayTimeoutMs, session, error)) return false;
+        out.timings.getSessionMs = std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - getSessionStartedAt).count();
+    }
     const uint64_t chunkSize = miniKV::util::jsonUint(session.body, "chunkSize");
     const uint32_t totalChunks = static_cast<uint32_t>(miniKV::util::jsonUint(session.body, "totalChunks"));
     const std::string gatewayChecksum = miniKV::util::jsonString(session.body, "checksumType");
@@ -454,6 +559,20 @@ bool MiniDriverClient::uploadFile(const std::filesystem::path& input, const std:
     }
     const std::vector<uint32_t> completedValues = miniKV::util::jsonUIntArray(session.body, "completed");
     const std::set<uint32_t> completed(completedValues.begin(), completedValues.end());
+    std::atomic<uint64_t> completedBytes{0};
+    uint32_t validCompletedChunks = 0;
+    for(const uint32_t index : completed) {
+        if(index >= totalChunks) continue;
+        ++validCompletedChunks;
+        const uint64_t offset = static_cast<uint64_t>(index) * chunkSize;
+        completedBytes.fetch_add(std::min<uint64_t>(chunkSize, fileSize - offset),
+                                 std::memory_order_relaxed);
+    }
+    std::atomic<uint32_t> completedChunkCount{validCompletedChunks};
+    if(options.onProgress) {
+        options.onProgress({completedBytes.load(std::memory_order_relaxed), fileSize,
+                            validCompletedChunks, totalChunks});
+    }
     std::vector<uint32_t> pending;
     pending.reserve(totalChunks);
     for (uint32_t index = 0; index < totalChunks; ++index) {
@@ -462,6 +581,7 @@ bool MiniDriverClient::uploadFile(const std::filesystem::path& input, const std:
     std::atomic<size_t> next{0};
     std::atomic<bool> failed{false};
     std::mutex errorMutex;
+    std::mutex timingMutex;
     std::string chunkError;
     const uint32_t workerCount = std::min<uint32_t>(options.chunkWindow,
         static_cast<uint32_t>(pending.size()));
@@ -473,15 +593,43 @@ bool MiniDriverClient::uploadFile(const std::filesystem::path& input, const std:
                 const size_t task = next.fetch_add(1);
                 if (task >= pending.size()) return;
                 std::string currentError;
-                if (options.acquireChunk) options.acquireChunk();
+                UploadPhaseTimings chunkTimings;
+                if (options.acquireChunkTimed) {
+                    chunkTimings.chunkBudgetWaitMs = options.acquireChunkTimed();
+                } else if (options.acquireChunk) {
+                    options.acquireChunk();
+                }
                 const bool uploaded = putChunk(config_, input, sessionId, fileSize, chunkSize, pending[task],
-                                               gatewayChecksum, currentError);
+                                               gatewayChecksum, chunkTimings, currentError);
                 if (options.releaseChunk) options.releaseChunk();
+                {
+                    std::lock_guard<std::mutex> lock(timingMutex);
+                    // Keep the admission wait even when the subsequent PUT
+                    // fails; otherwise failed c16 requests hide the very
+                    // queueing delay this diagnostic is meant to expose.
+                    out.timings.chunkBudgetWaitMs += chunkTimings.chunkBudgetWaitMs;
+                    if (uploaded) {
+                        out.timings.checksumPreparationMs += chunkTimings.checksumPreparationMs;
+                        out.timings.routeCapabilityMs += chunkTimings.routeCapabilityMs;
+                        out.timings.dataNodeUploadMs += chunkTimings.dataNodeUploadMs;
+                        out.timings.chunkUploadTotalMs += chunkTimings.chunkUploadTotalMs;
+                    }
+                }
                 if (!uploaded) {
                     std::lock_guard<std::mutex> lock(errorMutex);
                     if (!failed.exchange(true)) chunkError = "chunk " + std::to_string(pending[task]) +
                         ": " + currentError;
                     return;
+                }
+                if(options.onProgress) {
+                    const uint32_t chunkIndex = pending[task];
+                    const uint64_t offset = static_cast<uint64_t>(chunkIndex) * chunkSize;
+                    const uint64_t chunkBytes = std::min<uint64_t>(chunkSize, fileSize - offset);
+                    const uint64_t logical = completedBytes.fetch_add(
+                        chunkBytes, std::memory_order_relaxed) + chunkBytes;
+                    const uint32_t done = completedChunkCount.fetch_add(
+                        1, std::memory_order_relaxed) + 1;
+                    options.onProgress({logical, fileSize, done, totalChunks});
                 }
             }
         });
@@ -489,8 +637,11 @@ bool MiniDriverClient::uploadFile(const std::filesystem::path& input, const std:
     for (std::thread& worker : workers) worker.join();
     if (failed.load()) { error = chunkError; return false; }
     HttpResponse committed;
+    const auto commitStartedAt = std::chrono::steady_clock::now();
     if (!requestSuccess(config_.gateway, "POST", "/api/v2/upload/sessions/" + pathEscape(sessionId) +
                         "/commit", "{}", config_.gatewayTimeoutMs, committed, error)) return false;
+    out.timings.objectCommitMs = std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - commitStartedAt).count();
     out.sessionId = sessionId;
     out.object.objectId = miniKV::util::jsonString(committed.body, "objectId");
     out.object.objectVersion = miniKV::util::jsonUint(committed.body, "objectVersion", 1);

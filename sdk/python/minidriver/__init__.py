@@ -5,6 +5,8 @@ from .client import (
     ClientConfig,
     IntegrityStatus,
     NodeReadHint,
+    ObjectLayout,
+    ObjectLayoutChunk,
     ObjectInfo,
     ObjectReadHints,
     ObjectRef,
@@ -15,7 +17,8 @@ from .client import (
 )
 
 __all__ = [
-    "Client", "ClientConfig", "IntegrityStatus", "NodeReadHint", "ObjectInfo",
+    "Client", "ClientConfig", "IntegrityStatus", "NodeReadHint", "ObjectLayout",
+    "ObjectLayoutChunk", "ObjectInfo",
     "ObjectReadHints", "ObjectRef", "PutOptions", "RangeReadResult",
     "ReadOptions", "TransferStats",
 ]

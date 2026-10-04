@@ -38,8 +38,9 @@ bool parseSizes(const std::string& text, std::vector<uint64_t>& sizes) {
 
 std::string benchmarkUsage() {
     return "usage: minikv_v2_bench local --gateway HOST:PORT --work-dir ABSOLUTE_PATH "
-           "[--sizes 64KiB,4MiB,32MiB,256MiB,1GiB] [--runs 3] [--concurrency 1] [--chunk-window 1|2] [--global-chunk-budget 2] [--upload-checksum crc32c|sha256] [--fixture-settle-ms 0] "
+           "[--sizes 64KiB,4MiB,32MiB,256MiB,1GiB] [--runs 3] [--duration-seconds 0] [--warmup-seconds 0] [--concurrency 1] [--chunk-window 1|2] [--global-chunk-budget 2] [--upload-checksum crc32c|sha256] [--fixture-settle-ms 0] "
            "[--mode end-to-end|upload|download|mixed] [--read-profile independent|hot-object|mixed-size] "
+           "[--read-share 50] [--download-fixtures 0] [--download-fixture-manifest RUNS_CSV] "
            "[--connection-mode close|keep-alive] [--requests-per-worker 1] "
            "[--download-verification strict|transport-only] "
            "[--slow-reader-workers 0] [--slow-reader-bytes-per-sec 1MiB] "
@@ -54,10 +55,14 @@ bool parseBenchmarkOptions(const std::vector<std::string>& args,
                      256ULL * 1024ULL * 1024ULL, 1024ULL * 1024ULL * 1024ULL};
     options.runs = 3;
     options.concurrency = 1;
+    options.durationSeconds = 0;
+    options.warmupSeconds = 0;
     options.chunkWindow = 1;
     options.globalChunkBudget = 2;
     options.uploadChecksumType = "crc32c";
     options.fixtureSettleMs = 0;
+    options.readSharePercent = 50;
+    options.downloadFixtureCount = 0;
     options.keepAlive = false;
     options.requestsPerWorker = 1;
     options.slowReaderWorkers = 0;
@@ -83,6 +88,14 @@ bool parseBenchmarkOptions(const std::vector<std::string>& args,
             if (!parseSizes(value, options.sizes)) { error = "invalid --sizes list"; return false; }
         } else if (flag == "--runs") {
             if (!parseRuns(value, options.runs)) { error = "invalid --runs count"; return false; }
+        } else if (flag == "--duration-seconds") {
+            if (!parseRuns(value, options.durationSeconds)) {
+                error = "invalid --duration-seconds"; return false;
+            }
+        } else if (flag == "--warmup-seconds") {
+            if (!parseRuns(value, options.warmupSeconds)) {
+                error = "invalid --warmup-seconds"; return false;
+            }
         } else if (flag == "--concurrency") {
             if (!parseRuns(value, options.concurrency)) { error = "invalid --concurrency count"; return false; }
         } else if (flag == "--chunk-window") {
@@ -103,6 +116,17 @@ bool parseBenchmarkOptions(const std::vector<std::string>& args,
             if (!parseRuns(value, options.fixtureSettleMs) || options.fixtureSettleMs > 60000) {
                 error = "--fixture-settle-ms must be 1..60000"; return false;
             }
+        } else if (flag == "--read-share") {
+            if (!parseRuns(value, options.readSharePercent) || options.readSharePercent >= 100) {
+                error = "--read-share must be 1..99"; return false;
+            }
+        } else if (flag == "--download-fixtures") {
+            if (!parseRuns(value, options.downloadFixtureCount)) {
+                error = "--download-fixtures must be positive"; return false;
+            }
+        } else if (flag == "--download-fixture-manifest") {
+            if (value.empty()) { error = "--download-fixture-manifest must not be empty"; return false; }
+            options.downloadFixtureManifest = value;
         } else if (flag == "--mode") {
             if(value == "end-to-end") options.mode = BenchmarkMode::kEndToEnd;
             else if(value == "upload") options.mode = BenchmarkMode::kUploadOnly;
@@ -153,6 +177,22 @@ bool parseBenchmarkOptions(const std::vector<std::string>& args,
         }
     }
     if (!gatewaySet || !workDirSet) { error = "--gateway and --work-dir are required"; return false; }
+    if (options.durationSeconds > 0 && options.sizes.size() != 1) {
+        error = "duration mode requires exactly one --sizes value";
+        return false;
+    }
+    if (options.durationSeconds > 0 && options.mode == BenchmarkMode::kEndToEnd) {
+        error = "duration mode requires --mode upload, download, or mixed";
+        return false;
+    }
+    if (options.durationSeconds == 0 && options.warmupSeconds > 0) {
+        error = "--warmup-seconds requires --duration-seconds";
+        return false;
+    }
+    if (options.durationSeconds > 0 && options.warmupSeconds >= options.durationSeconds) {
+        error = "--warmup-seconds must be less than --duration-seconds";
+        return false;
+    }
     if (options.mode == BenchmarkMode::kMixed && options.concurrency < 2) {
         error = "--mode mixed requires --concurrency >= 2";
         return false;

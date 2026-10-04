@@ -54,6 +54,29 @@ void json(HttpResponse* response, int status, const std::string& body) {
     response->setContentType("application/json"); response->setBody(body);
 }
 
+// Slow-lock diagnostics are opt-in and emitted only when a mutation's
+// measured critical section crosses one of the investigation thresholds.
+// The logger supplies the wall-clock timestamp; session identifies the
+// logical PUT operation and leveldb_us identifies the DB portion of the hold.
+void logSlowGatewayMutation(const char* endpoint, const std::string& sessionId,
+                            const GatewayMutationTiming& timing)
+{
+    if(std::getenv("MINIKV_GATEWAY_MUTEX_DIAGNOSTICS") == nullptr) return;
+    constexpr uint64_t kThresholdsUs[] = {10000, 50000, 100000};
+    for(const uint64_t thresholdUs : kThresholdsUs) {
+        if(timing.criticalSectionUs < thresholdUs) continue;
+        miniKV::utils::logWarn("event=gateway_slow_lock endpoint=" +
+            std::string(endpoint == nullptr ? "unknown" : endpoint) +
+            " threshold_us=" + std::to_string(thresholdUs) +
+            " session=" + (sessionId.empty() ? "-" : sessionId) +
+            " lock_hold_us=" + std::to_string(timing.criticalSectionUs) +
+            " mutex_wait_us=" + std::to_string(timing.mutexWaitUs) +
+            " leveldb_operation=" +
+            std::string(endpoint == nullptr ? "unknown" : endpoint) +
+            " leveldb_duration_us=" + std::to_string(timing.levelDbWriteUs));
+    }
+}
+
 std::string configuredSecret(int argc, char** argv) {
     if (argc > 3) return argv[3];
     if (const char* value = std::getenv("MINIKV_V2_CLUSTER_SECRET")) return value;
@@ -125,6 +148,13 @@ miniKV::media::RedisAiEventPublisherConfig configuredAiEventPublisher()
     if(const char* value = std::getenv("MINIKV_V2_REDIS_AI_STREAM")) config.stream = value;
     config.streamMaxLen = configuredUint("MINIKV_V2_REDIS_STREAM_MAXLEN", config.streamMaxLen);
     return config;
+}
+
+bool configuredAiOutboxEnabled()
+{
+    const char* value = std::getenv("MINIKV_GATEWAY_AI_OUTBOX_ENABLED");
+    if(value == nullptr) return false;
+    return std::string(value) == "1" || std::string(value) == "true" || std::string(value) == "on";
 }
 
 bool isDerivedImageSourceFileName(const std::string& fileName)
@@ -226,6 +256,39 @@ std::string manifestJson(const ManifestSnapshot& snapshot) {
                 << "\",\"httpPort\":" << node->second.httpPort << "}";
         }
         out << "]}";
+    }
+    out << "]}";
+    return out.str();
+}
+
+// Static object placement metadata for Compute Plane schedulers.  Unlike a
+// read plan this response contains no short-lived DataNode capabilities and
+// is therefore safe to persist as a placement hint.  It deliberately exposes
+// only stable node identities, never DataNode filesystem paths.
+std::string objectLayoutJson(const ManifestSnapshot& snapshot) {
+    std::ostringstream out;
+    out << "{\"objectId\":\"" << jsonEscape(snapshot.file.objectId)
+        << "\",\"version\":" << snapshot.file.objectVersion
+        << ",\"size\":" << snapshot.file.fileSize << ",\"chunks\":[";
+    uint64_t offset = 0;
+    for (size_t index = 0; index < snapshot.routes.size(); ++index) {
+        if (index) out << ',';
+        const ChunkRoute& route = snapshot.routes[index];
+        out << "{\"index\":" << index << ",\"chunkId\":\""
+            << jsonEscape(route.chunkId) << "\",\"offset\":" << offset
+            << ",\"size\":" << route.size
+            << ",\"checksumType\":\"" << jsonEscape(route.checksumType)
+            << "\",\"checksumDigest\":\"" << jsonEscape(route.checksumDigest)
+            << "\",\"replicas\":[";
+        bool first = true;
+        for (const auto& nodeId : route.replicas) {
+            if (snapshot.nodes.find(nodeId) == snapshot.nodes.end()) continue;
+            if (!first) out << ',';
+            first = false;
+            out << "\"" << jsonEscape(nodeId) << "\"";
+        }
+        out << "]}";
+        offset += route.size;
     }
     out << "]}";
     return out.str();
@@ -473,9 +536,20 @@ std::string objectReadHintsJson(const miniKV::control::ObjectReadDescriptor& des
 }  // namespace
 
 int main(int argc, char** argv) {
+    if(std::getenv("MINIKV_GATEWAY_AI_OUTBOX_ENABLED") == nullptr) {
+        ::setenv("MINIKV_GATEWAY_AI_OUTBOX_ENABLED", "0", 1);
+    }
     const int port = argc > 1 ? std::stoi(argv[1]) : 8081;
     const std::string dataDir = argc > 2 ? argv[2] : "./v2_gateway_data";
     const std::string clusterSecret = configuredSecret(argc, argv);
+    const std::string metadataMode = [] {
+        const char* value = std::getenv("MINIKV_METADATA_MODE");
+        return value && *value ? std::string(value) : std::string("legacy");
+    }();
+    if(metadataMode != "legacy" && metadataMode != "raft") {
+        std::cerr << "MINIKV_METADATA_MODE must be legacy or raft\n";
+        return 2;
+    }
     if (clusterSecret.empty()) {
         std::cerr << "MINIKV_V2_CLUSTER_SECRET or a command-line clusterSecret is required\n";
         return 2;
@@ -490,8 +564,39 @@ int main(int argc, char** argv) {
            "gateway", configuredNodeId(), dataDir + "/logs/gateway.log"))) {
         std::cerr << "cannot initialize Gateway async logger\n";
     }
-    std::string stateDir = dataDir + "/metadata";
-    GatewayState state(stateDir);
+    const uint64_t configuredReplication = configuredUint("MINIKV_V3_REPLICATION_FACTOR", 2);
+    if(configuredReplication > 3) {
+        std::cerr << "MINIKV_V3_REPLICATION_FACTOR must be 1, 2, or 3\n";
+        return 2;
+    }
+    std::shared_ptr<miniKV::metadata::MetadataClient> metadataClient;
+    if(metadataMode == "raft") {
+        const char* endpoints = std::getenv("MINIKV_METADATA_ENDPOINTS");
+        if(endpoints == nullptr || *endpoints == '\0') {
+            std::cerr << "MINIKV_METADATA_ENDPOINTS is required in raft mode\n";
+            return 2;
+        }
+        metadataClient = std::make_shared<miniKV::metadata::MetadataClient>(
+            miniKV::metadata::MetadataClient::parseEndpoints(endpoints), clusterSecret, 1000);
+    }
+    const char* configuredMetadataDir = std::getenv("MINIKV_V3_GATEWAY_METADATA_DIR");
+    const std::string defaultStateDir = dataDir + "/metadata";
+    std::string stateDir = configuredMetadataDir != nullptr && *configuredMetadataDir != '\0'
+        ? configuredMetadataDir : defaultStateDir;
+    // A custom metadata directory is an explicit deployment choice.  Never
+    // silently open an empty database when a legacy database is still present;
+    // operators must run the migration helper first.  A completely fresh
+    // deployment (neither source nor target exists) remains valid.
+    if (metadataMode != "raft" && stateDir != defaultStateDir && !std::filesystem::exists(stateDir) &&
+        std::filesystem::exists(defaultStateDir)) {
+        miniKV::utils::logError("event=gateway_metadata_migration_required source=" +
+                                defaultStateDir + " target=" + stateDir);
+        std::cerr << "metadata migration required: run tools/migrate_gateway_metadata.sh "
+                  << defaultStateDir << " " << stateDir << "\n";
+        return 1;
+    }
+    GatewayState state(stateDir, static_cast<uint32_t>(configuredReplication));
+    if(metadataClient) state.configureRemoteMetadata(metadataClient);
     if (!state.open()) {
         miniKV::utils::logError("event=gateway_metadata_open_failed path=" + stateDir);
         std::cerr << "cannot open Gateway metadata\n";
@@ -500,6 +605,12 @@ int main(int argc, char** argv) {
     miniKV::utils::logInfo("event=gateway_chunk_protocol identity_scheme=" +
                            chunkProtocol.identityScheme + " checksum_type=" +
                            chunkProtocol.checksumType);
+    miniKV::utils::logInfo("event=gateway_replication_factor value=" +
+                           std::to_string(configuredReplication));
+    miniKV::utils::logInfo("event=gateway_lock_config mode=" +
+                           std::string(miniKV::gateway::GatewayLockManager::modeName(state.lockMode())) +
+                           " shard_count=" + std::to_string(GatewayState::kLockShardCount) +
+                           " metadata_dir=" + stateDir);
 
     ThreadPool workers(4);
     EventLoop loop;
@@ -524,11 +635,13 @@ int main(int argc, char** argv) {
             std::lock_guard<std::mutex> lock(aiEventDispatchMutex);
             aiEventsInFlight.erase(event.eventId);
         });
-    if(!aiEventPublisher.start()) {
-        miniKV::utils::logError("event=ai_index_publisher_start_failed");
-        std::cerr << "cannot start AI index event publisher\n";
+    const bool aiOutboxEnabled = configuredAiOutboxEnabled();
+    if(aiOutboxEnabled && !aiEventPublisher.start()) {
+        miniKV::utils::logError("event=ai_event_publisher_start_failed");
+        std::cerr << "cannot start legacy AI event publisher\n";
         return 1;
     }
+    miniKV::utils::logInfo("event=gateway_ai_outbox enabled=" + std::string(aiOutboxEnabled ? "true" : "false"));
     miniKV::http::HttpServer server(&loop, &workers, port);
     std::set<std::string> deleteRequestsInFlight;
     std::function<void()> dispatchPendingDeletes;
@@ -588,6 +701,7 @@ int main(int argc, char** argv) {
         }
     };
     const auto dispatchAiIndexEvent = [&](const miniKV::media::AiIndexEvent& event) {
+        if(!aiOutboxEnabled) return;
         {
             std::lock_guard<std::mutex> lock(aiEventDispatchMutex);
             if(!aiEventsInFlight.insert(event.eventId).second) return;
@@ -601,6 +715,7 @@ int main(int argc, char** argv) {
                                " reason=publisher_queue_full");
     };
     const auto dispatchPendingAiIndexEvents = [&] {
+        if(!aiOutboxEnabled) return;
         constexpr size_t kDispatchBatchSize = 128;
         for(const miniKV::media::AiIndexEvent& event :
             state.dueAiIndexEvents(unixSeconds(), kDispatchBatchSize)) {
@@ -620,7 +735,39 @@ int main(int argc, char** argv) {
             return;
         }
         if(request.method() == HttpRequest::kGet && path == "/readyz") {
-            json(response, 200, "{\"status\":\"ready\",\"component\":\"gateway\"}");
+            const bool metadataReady = !metadataClient || metadataClient->available();
+            json(response, metadataReady ? 200 : 503,
+                 metadataReady ? "{\"status\":\"ready\",\"component\":\"gateway\"}"
+                                : "{\"status\":\"metadata_unavailable\",\"component\":\"gateway\"}");
+            return;
+        }
+        if(request.method() == HttpRequest::kGet && path == "/storage-readyz") {
+            const bool metadataReady = !metadataClient || metadataClient->available();
+            json(response, metadataReady ? 200 : 503,
+                 metadataReady ? "{\"status\":\"ready\",\"component\":\"gateway\"}"
+                                : "{\"status\":\"metadata_unavailable\",\"component\":\"gateway\"}");
+            return;
+        }
+        if(request.method() == HttpRequest::kPost &&
+           path == "/internal/v3/admin/diagnostics/reset") {
+            if(!constantTimeEquals(request.getHeader("X-Cluster-Internal-Token"), clusterSecret) ||
+               request.getHeader("X-Service-Principal").empty()) {
+                json(response, 403, jsonError("invalid diagnostics credentials"));
+                return;
+            }
+            resetGatewayMutexDiagnostics();
+            json(response, 200, "{\"status\":\"reset\"}");
+            return;
+        }
+        if(request.method() == HttpRequest::kPost &&
+           path == "/internal/v3/admin/diagnostics/flush") {
+            if(!constantTimeEquals(request.getHeader("X-Cluster-Internal-Token"), clusterSecret) ||
+               request.getHeader("X-Service-Principal").empty()) {
+                json(response, 403, jsonError("invalid diagnostics credentials"));
+                return;
+            }
+            flushGatewayMutexDiagnostics();
+            json(response, 200, "{\"status\":\"flushed\"}");
             return;
         }
         std::string readObjectId;
@@ -787,12 +934,25 @@ int main(int argc, char** argv) {
         }
         if (request.method() == HttpRequest::kPost && path == "/api/v2/upload/preflight") {
             UploadPreflightRequest preflight;
+            preflight.commandId = request.getHeader("X-Minidriver-Command-Id");
+            if(preflight.commandId.empty()) preflight.commandId = jsonString(body, "commandId");
             preflight.fileName = jsonString(body, "fileName");
             preflight.dirPath = jsonString(body, "dirPath");
             preflight.fileSize = jsonUint(body, "fileSize");
             preflight.chunkSize = static_cast<uint32_t>(jsonUint(body, "chunkSize"));
             preflight.manifestHash = jsonString(body, "manifestHash");
             preflight.chunks = parseRouteRequests(body);
+            // The request parser's compatibility defaults are the legacy
+            // CAS/SHA values.  Preflight must use the active gateway write
+            // protocol just like the subsequent /routes call, otherwise a
+            // CRC32C opaque upload is recorded as a CAS route before routing.
+            for(auto& chunk : preflight.chunks) {
+                chunk.identityScheme = chunkProtocol.identityScheme;
+                chunk.checksumType = chunkProtocol.checksumType;
+                if(chunkProtocol.checksumType == "sha256") {
+                    chunk.checksumDigest = chunk.chunkHash;
+                }
+            }
 
             UploadPreflightResult result;
             const auto preflightStarted = Clock::now();
@@ -816,10 +976,16 @@ int main(int argc, char** argv) {
         if (request.method() == HttpRequest::kPost && path == "/api/v2/upload/sessions") {
             SessionState session;
             const auto sessionStarted = Clock::now();
-            const bool created = state.createSession(jsonString(body, "fileName"), jsonString(body, "dirPath"), jsonUint(body, "fileSize"), static_cast<uint32_t>(jsonUint(body, "chunkSize")), session);
+            GatewayMutationTiming timing;
+            const bool created = state.createSession(jsonString(body, "fileName"), jsonString(body, "dirPath"), jsonUint(body, "fileSize"), static_cast<uint32_t>(jsonUint(body, "chunkSize")), session, &timing);
+            recordGatewayLevelDbSample("createSession", timing.levelDbWriteUs);
+            logSlowGatewayMutation("createSession", session.sessionId, timing);
             miniKV::utils::logInfo("event=upload_session_create created=" +
                                    std::string(created ? "true" : "false") + " elapsed_us=" +
-                                   std::to_string(elapsedMicroseconds(sessionStarted, Clock::now())));
+                                   std::to_string(elapsedMicroseconds(sessionStarted, Clock::now())) +
+                                   " mutex_wait_us=" + std::to_string(timing.mutexWaitUs) +
+                                   " critical_section_us=" + std::to_string(timing.criticalSectionUs) +
+                                   " leveldb_write_us=" + std::to_string(timing.levelDbWriteUs));
             if (!created) { json(response, 400, jsonError("fileName and positive fileSize are required")); return; }
             json(response, 200, "{\"sessionId\":\"" + session.sessionId +
                 "\",\"objectId\":\"" + jsonEscape(session.objectId) +
@@ -858,11 +1024,16 @@ int main(int argc, char** argv) {
             }
             std::vector<PlacementPlan> plans;
             const auto routeStarted = Clock::now();
-            const RoutePlanStatus routeStatus = state.planRoutes(id, requests, plans);
+            GatewayMutationTiming timing;
+            const RoutePlanStatus routeStatus = state.planRoutes(id, requests, plans, &timing);
+            recordGatewayLevelDbSample("planRoutes", timing.levelDbWriteUs);
+            logSlowGatewayMutation("planRoutes", id, timing);
             miniKV::utils::logInfo("event=route_plan session=" + id + " chunks=" +
                                    std::to_string(requests.size()) + " status=" +
                                    std::to_string(static_cast<int>(routeStatus)) + " elapsed_us=" +
-                                   std::to_string(elapsedMicroseconds(routeStarted, Clock::now())));
+                                   std::to_string(elapsedMicroseconds(routeStarted, Clock::now())) +
+                                   " mutex_wait_us=" + std::to_string(timing.mutexWaitUs) +
+                                   " critical_section_us=" + std::to_string(timing.criticalSectionUs));
             if (requests.empty() || plans.size() != requests.size() ||
                 routeStatus != RoutePlanStatus::kOk) {
                 if (routeStatus == RoutePlanStatus::kNoCapacity) {
@@ -934,22 +1105,38 @@ int main(int argc, char** argv) {
         if (request.method() == HttpRequest::kPost && path == "/internal/v2/chunk-commits") {
             if (!constantTimeEquals(request.getHeader("X-Cluster-Internal-Token"), clusterSecret)) { json(response, 403, jsonError("invalid cluster token")); return; }
             UploadCapability capability;
-            if (!verifyUploadCapability(jsonString(body, "uploadToken"), clusterSecret, capability) ||
-                capability.sessionId != jsonString(body, "sessionId") ||
-                capability.chunkIndex != jsonUint(body, "chunkIndex") ||
-                capability.chunkHash != jsonString(body, "chunkHash") ||
-                capability.chunkSize != jsonUint(body, "size")) { json(response, 400, jsonError("invalid upload capability")); return; }
+            const std::string bodySession = jsonString(body, "sessionId");
+            const std::string bodyChunk = jsonString(body, "chunkHash");
+            const uint64_t bodyIndex = jsonUint(body, "chunkIndex");
+            const uint64_t bodySize = jsonUint(body, "size");
+            const bool capabilityValid = verifyUploadCapability(jsonString(body, "uploadToken"), clusterSecret, capability) &&
+                capability.sessionId == bodySession && capability.chunkIndex == bodyIndex &&
+                capability.chunkHash == bodyChunk && capability.chunkSize == bodySize;
+            if (!capabilityValid) {
+                miniKV::utils::logWarn("event=chunk_commit_rejected reason=invalid_upload_capability"+
+                    std::string(" session=") + bodySession + " index=" + std::to_string(bodyIndex) +
+                    " chunk=" + bodyChunk + " capability_session=" + capability.sessionId +
+                    " capability_index=" + std::to_string(capability.chunkIndex) +
+                    " capability_chunk=" + capability.chunkHash);
+                json(response, 400, jsonError("invalid upload capability")); return;
+            }
             const std::vector<std::string> nodes = split(jsonString(body, "successfulNodes"), ',');
             const auto chunkCommitStarted = Clock::now();
+            GatewayMutationTiming timing;
             const CommitChunkStatus status = state.commitChunk(
                 jsonString(body, "sessionId"), static_cast<uint32_t>(jsonUint(body, "chunkIndex")),
-                jsonString(body, "chunkHash"), jsonUint(body, "size"), nodes, capability.leaseId);
+                jsonString(body, "chunkHash"), jsonUint(body, "size"), nodes, capability.leaseId, &timing);
+            recordGatewayLevelDbSample("commitChunk", timing.levelDbWriteUs);
+            logSlowGatewayMutation("commitChunk", capability.sessionId, timing);
             miniKV::utils::logInfo("event=chunk_commit request_id=" + requestId +
                                    " session=" + capability.sessionId + " index=" +
                                    std::to_string(capability.chunkIndex) + " replicas=" +
                                    std::to_string(nodes.size()) + " status=" +
                                    std::to_string(static_cast<int>(status)) + " elapsed_us=" +
-                                   std::to_string(elapsedMicroseconds(chunkCommitStarted, Clock::now())));
+                                   std::to_string(elapsedMicroseconds(chunkCommitStarted, Clock::now())) +
+                                   " mutex_wait_us=" + std::to_string(timing.mutexWaitUs) +
+                                   " critical_section_us=" + std::to_string(timing.criticalSectionUs) +
+                                   " leveldb_write_us=" + std::to_string(timing.levelDbWriteUs));
             if (status == CommitChunkStatus::kInvalidRequest) {
                 json(response, 400, jsonError("invalid chunk commit"));
             } else {
@@ -1081,10 +1268,17 @@ int main(int argc, char** argv) {
         if (request.method() == HttpRequest::kPost && beginsWith(path, "/api/v2/upload/sessions/") && path.size() > 7 && path.rfind("/commit") == path.size() - 7) {
             FileMeta file;
             const auto fileCommitStarted = Clock::now();
-            const FileCommitStatus status = state.commitFile(pathTail(path, "/api/v2/upload/sessions/", "/commit"), file);
+            GatewayMutationTiming timing;
+            const FileCommitStatus status = state.commitFile(
+                pathTail(path, "/api/v2/upload/sessions/", "/commit"), file, &timing);
+            recordGatewayLevelDbSample("commitFile", timing.levelDbWriteUs);
+            logSlowGatewayMutation("commitFile", pathTail(path, "/api/v2/upload/sessions/", "/commit"), timing);
             miniKV::utils::logInfo("event=file_commit status=" + std::to_string(static_cast<int>(status)) +
                                    " object=" + file.objectId + " file=" + file.fileHash + " elapsed_us=" +
-                                   std::to_string(elapsedMicroseconds(fileCommitStarted, Clock::now())));
+                                   std::to_string(elapsedMicroseconds(fileCommitStarted, Clock::now())) +
+                                   " mutex_wait_us=" + std::to_string(timing.mutexWaitUs) +
+                                   " critical_section_us=" + std::to_string(timing.criticalSectionUs) +
+                                   " leveldb_write_us=" + std::to_string(timing.levelDbWriteUs));
             if (status == FileCommitStatus::kPathConflict) {
                 json(response, 409, jsonError("a file already exists at this path"));
                 return;
@@ -1092,13 +1286,6 @@ int main(int argc, char** argv) {
             if (status != FileCommitStatus::kCommitted) {
                 json(response, 400, jsonError("all chunks with at least one replica are required"));
                 return;
-            }
-            dispatchPendingAiIndexEvents();
-            if(isDerivedImageSourceFileName(file.fileName)) {
-                for(const char* profile : kJpegDerivedProfiles) {
-                    const auto derived = state.enqueueThumbnail(file.fileHash, profile, unixSeconds());
-                    if(derived.publishRequired) enqueueMediaJob(derived.job);
-                }
             }
             json(response, 200, "{\"objectId\":\"" + jsonEscape(file.objectId) +
                 "\",\"objectVersion\":" + std::to_string(file.objectVersion) +
@@ -1128,6 +1315,37 @@ int main(int argc, char** argv) {
                 snapshot.file.objectVersion = object.objectVersion;
                 snapshot.file.metadataVersion = object.metadataVersion;
                 json(response, 200, manifestJson(snapshot));
+            }
+            return;
+        }
+        if (request.method() == HttpRequest::kGet && beginsWith(path, "/api/v2/objects/") &&
+            path.size() > std::string("/api/v2/objects/").size() + std::string("/layout").size() &&
+            path.rfind("/layout") == path.size() - std::string("/layout").size()) {
+            if(!constantTimeEquals(request.getHeader("X-Cluster-Internal-Token"), clusterSecret) ||
+               request.getHeader("X-Service-Principal").empty()) {
+                json(response, 403, jsonError("invalid object control credentials"));
+                return;
+            }
+            const std::string objectId = pathTail(path, "/api/v2/objects/", "/layout");
+            const std::string versionValue = getQueryValue(request.query(), "version");
+            uint64_t requestedVersion = 0;
+            try {
+                size_t parsed = 0;
+                requestedVersion = std::stoull(versionValue, &parsed);
+                if (parsed != versionValue.size()) requestedVersion = 0;
+            } catch (...) { requestedVersion = 0; }
+            ObjectMeta object;
+            ManifestSnapshot snapshot;
+            const bool found = requestedVersion > 0 && state.getObject(objectId, object) &&
+                object.objectVersion == requestedVersion &&
+                state.buildManifestSnapshot(object.fileHash, snapshot);
+            if (!found) {
+                json(response, 404, jsonError("object version not found"));
+            } else {
+                snapshot.file.objectId = object.objectId;
+                snapshot.file.objectVersion = object.objectVersion;
+                snapshot.file.metadataVersion = object.metadataVersion;
+                json(response, 200, objectLayoutJson(snapshot));
             }
             return;
         }
@@ -1194,6 +1412,11 @@ int main(int argc, char** argv) {
         dispatchPendingMediaJobs();
         dispatchPendingAiIndexEvents();
     });
+    if(std::getenv("MINIKV_GATEWAY_MUTEX_DIAGNOSTICS") != nullptr) {
+        // Keep a live snapshot available even when the benchmark terminates
+        // the Gateway with SIGTERM (which does not run atexit handlers).
+        loop.runEvery(5000, [] { flushGatewayMutexDiagnostics(); });
+    }
     loop.runAfter(0, dispatchPendingDeletes);
     loop.runAfter(0, dispatchPendingMediaJobs);
     loop.runAfter(0, dispatchPendingAiIndexEvents);

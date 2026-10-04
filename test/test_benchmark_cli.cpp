@@ -23,6 +23,37 @@ int main() {
     MINIKV_CHECK(options.fixtureSettleMs == 9000);
     MINIKV_CHECK(options.remoteDir == "/benchmark");
 
+    const std::vector<std::string> duration{
+        "local", "--gateway", "127.0.0.1:18081", "--work-dir", "/tmp/minikv-bench",
+        "--sizes", "64KiB", "--duration-seconds", "180", "--warmup-seconds", "30",
+        "--mode", "mixed", "--concurrency", "8", "--read-share", "30",
+        "--download-fixtures", "10000"};
+    MINIKV_CHECK(miniKV::benchmark::parseBenchmarkOptions(duration, options, error));
+    MINIKV_CHECK(options.durationSeconds == 180);
+    MINIKV_CHECK(options.warmupSeconds == 30);
+    MINIKV_CHECK(options.readSharePercent == 30);
+    MINIKV_CHECK(options.downloadFixtureCount == 10000);
+
+    const std::vector<std::string> invalidDurationSizes{
+        "local", "--gateway", "127.0.0.1:18081", "--work-dir", "/tmp/minikv-bench",
+        "--sizes", "64KiB,1MiB", "--duration-seconds", "60"};
+    MINIKV_CHECK(!miniKV::benchmark::parseBenchmarkOptions(invalidDurationSizes, options, error));
+
+    const std::vector<std::string> invalidWarmup{
+        "local", "--gateway", "127.0.0.1:18081", "--work-dir", "/tmp/minikv-bench",
+        "--sizes", "64KiB", "--duration-seconds", "30", "--warmup-seconds", "30"};
+    MINIKV_CHECK(!miniKV::benchmark::parseBenchmarkOptions(invalidWarmup, options, error));
+
+    const std::vector<std::string> invalidDurationMode{
+        "local", "--gateway", "127.0.0.1:18081", "--work-dir", "/tmp/minikv-bench",
+        "--sizes", "64KiB", "--duration-seconds", "30"};
+    MINIKV_CHECK(!miniKV::benchmark::parseBenchmarkOptions(invalidDurationMode, options, error));
+
+    const std::vector<std::string> invalidReadShare{
+        "local", "--gateway", "127.0.0.1:18081", "--work-dir", "/tmp/minikv-bench",
+        "--mode", "mixed", "--concurrency", "8", "--read-share", "100"};
+    MINIKV_CHECK(!miniKV::benchmark::parseBenchmarkOptions(invalidReadShare, options, error));
+
     const std::vector<std::string> checksum{
         "local", "--gateway", "127.0.0.1:18081", "--work-dir", "/tmp/minikv-bench",
         "--upload-checksum", "sha256"};

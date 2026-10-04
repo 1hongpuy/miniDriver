@@ -10,6 +10,7 @@ import hashlib
 import json
 import os
 import secrets
+import tempfile
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
@@ -44,6 +45,7 @@ class ClientConfig:
 class PutOptions:
     checksum_type: str = "crc32c"
     chunk_window: int = 2
+    content_type: str = "application/octet-stream"
 
 
 @dataclass(frozen=True)
@@ -95,6 +97,24 @@ class ObjectReadHints:
     object: ObjectRef
     size: int
     candidates: tuple[NodeReadHint, ...]
+
+
+@dataclass(frozen=True)
+class ObjectLayoutChunk:
+    index: int
+    chunk_id: str
+    offset: int
+    size: int
+    checksum_type: str
+    checksum_digest: str
+    replicas: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class ObjectLayout:
+    object: ObjectRef
+    size: int
+    chunks: tuple[ObjectLayoutChunk, ...]
 
 
 @dataclass(frozen=True)
@@ -153,7 +173,7 @@ class Client:
 
         session = self._create_session(size)
         session_id = self._required_str(session, "sessionId")
-        session = self._get_json("GET", f"/api/v2/upload/sessions/{_escape(session_id)}", control=False)
+        session = self._get_json(f"/api/v2/upload/sessions/{_escape(session_id)}", control=False)
         chunk_size = self._required_int(session, "chunkSize")
         total_chunks = self._required_int(session, "totalChunks")
         checksum_type = self._required_str(session, "checksumType")
@@ -170,6 +190,15 @@ class Client:
         reference = ObjectRef(self._required_str(committed, "objectId"), self._required_int(committed, "objectVersion"))
         self._validate_ref(reference)
         return reference
+
+    def put_object(self, data: bytes, options: PutOptions = PutOptions()) -> ObjectRef:
+        """Upload bytes without exposing file-name or directory semantics."""
+        if not isinstance(data, (bytes, bytearray, memoryview)) or not data:
+            raise ValueError("data must be non-empty bytes")
+        with tempfile.NamedTemporaryFile(prefix="minidriver-object-", delete=True) as handle:
+            handle.write(bytes(data))
+            handle.flush()
+            return self.put_file(handle.name, options)
 
     def get_object(self, reference: ObjectRef, sink: Callable[[bytes], None],
                    options: ReadOptions = ReadOptions()) -> TransferStats:
@@ -228,6 +257,40 @@ class Client:
     def get_object_read_hints(self, reference: ObjectRef) -> ObjectReadHints:
         self._validate_ref(reference)
         return self._decode_hints(self._post_json(self._object_path(reference, "read-hints"), {}, control=True), reference)
+
+    def get_object_layout(self, reference: ObjectRef) -> ObjectLayout:
+        """Return static chunk placement metadata without read capabilities."""
+        self._validate_ref(reference)
+        response = self._get_json(
+            f"/api/v2/objects/{_escape(reference.object_id)}/layout?version={reference.object_version}",
+            control=True,
+        )
+        returned = ObjectRef(self._required_str(response, "objectId"), self._required_int(response, "version"))
+        if returned != reference:
+            raise MiniDriverError("mismatched object layout response")
+        size = self._required_int(response, "size")
+        chunks: list[ObjectLayoutChunk] = []
+        expected_offset = 0
+        for item in response.get("chunks", []):
+            if not isinstance(item, dict):
+                raise MiniDriverError("invalid object layout chunk")
+            index = self._required_int(item, "index")
+            offset = self._required_int(item, "offset")
+            chunk_size = self._required_int(item, "size")
+            chunk_id = self._required_str(item, "chunkId")
+            checksum_type = self._required_str(item, "checksumType")
+            checksum_digest = self._required_str(item, "checksumDigest")
+            replicas_value = item.get("replicas")
+            if (index != len(chunks) or offset != expected_offset or chunk_size == 0 or
+                    not isinstance(replicas_value, list) or not replicas_value or
+                    any(not isinstance(node, str) or not node for node in replicas_value)):
+                raise MiniDriverError("invalid object layout chunk")
+            chunks.append(ObjectLayoutChunk(index, chunk_id, offset, chunk_size,
+                                            checksum_type, checksum_digest, tuple(replicas_value)))
+            expected_offset += chunk_size
+        if not chunks or expected_offset != size:
+            raise MiniDriverError("object layout size/chunk mismatch")
+        return ObjectLayout(returned, size, tuple(chunks))
 
     def batch_get_object_read_hints(self, references: Iterable[ObjectRef]) -> list[ObjectReadHints]:
         refs = list(references)
@@ -320,7 +383,7 @@ class Client:
                 size=self._required_int(raw, "size"), checksum_type=self._required_str(raw, "checksumType"),
                 checksum_digest=self._required_str(raw, "checksumDigest"), read_capability=self._required_str(raw, "readCapability"),
                 replicas=tuple(_Replica(self._required_str(replica, "nodeId"), self._required_str(replica, "address"),
-                                        self._required_int(replica, "httpPort")) for replica in replicas),
+                                        self._replica_port(replica)) for replica in replicas),
             )
             if chunk.index != index or chunk.size <= 0:
                 raise MiniDriverError("invalid chunk read-plan")
@@ -420,6 +483,14 @@ class Client:
         if isinstance(result, bool) or not isinstance(result, int) or result < 0:
             raise MiniDriverError(f"invalid response field {key}")
         return result
+
+    @classmethod
+    def _replica_port(cls, value: dict) -> int:
+        # ReadPlan uses the canonical ``port`` field.  ``httpPort`` was used
+        # by an older SDK fixture and remains accepted for compatibility.
+        if "port" in value:
+            return cls._required_int(value, "port")
+        return cls._required_int(value, "httpPort")
 
     @staticmethod
     def _validate_ref(reference: ObjectRef) -> None:

@@ -10,6 +10,7 @@
 #include <fcntl.h>
 #include <memory>
 #include <mutex>
+#include <limits>
 #include <sys/sendfile.h>
 #include <sys/socket.h>
 #include <sys/types.h>
@@ -155,10 +156,15 @@ void TcpConnection::handleWrite(){
         {
             const size_t sentBytes = static_cast<size_t>(sent);
             sendFileCtx_->remaining -= sentBytes;
+            sendFileCtx_->totalRemaining -= sentBytes;
             ++sendFileCtx_->writeCalls;
             sendFileCtx_->maxBytesPerCall = std::max(sendFileCtx_->maxBytesPerCall,
                                                       sentBytes);
             if(sendFileCtx_->remaining > 0) {
+                channel_->enableWriteing();
+                return;
+            }
+            if(openNextSendFileSegment()) {
                 channel_->enableWriteing();
                 return;
             }
@@ -442,15 +448,31 @@ void TcpConnection::startSendFile(const std::string &filePath, size_t fileSize,
 void TcpConnection::startSendFile(const std::string& filePath, off_t offset, size_t fileSize,
                                   SendFileCompleteCallback callback)
 {
+    std::vector<SendFileSegment> segments;
+    segments.push_back({filePath, offset, fileSize});
+    startSendFileSequence(std::move(segments), std::move(callback));
+}
+
+void TcpConnection::startSendFileSequence(std::vector<SendFileSegment> segments,
+                                          SendFileCompleteCallback callback)
+{
     TcpConnectionPtr self(shared_from_this());
-    loop_->runInLoop([self, filePath, offset, fileSize, callback = std::move(callback)]() mutable {
-        self->startSendFileInLoop(filePath, offset, fileSize, std::move(callback));
+    loop_->runInLoop([self, segments = std::move(segments), callback = std::move(callback)]() mutable {
+        self->startSendFileSequenceInLoop(std::move(segments), std::move(callback));
     });
 }
 
 void TcpConnection::startSendFileInLoop(const std::string& filePath, off_t offset,
                                         size_t fileSize,
                                         SendFileCompleteCallback callback)
+{
+    std::vector<SendFileSegment> segments;
+    segments.push_back({filePath, offset, fileSize});
+    startSendFileSequenceInLoop(std::move(segments), std::move(callback));
+}
+
+void TcpConnection::startSendFileSequenceInLoop(std::vector<SendFileSegment> segments,
+                                                SendFileCompleteCallback callback)
 {
     if(state_ != kConnected)
     {
@@ -461,23 +483,26 @@ void TcpConnection::startSendFileInLoop(const std::string& filePath, off_t offse
         if(callback) callback({false, 0, 0, 0});
         return;
     }
-    int fd = ::open(filePath.c_str(), O_RDONLY);
-    if(fd < 0)
-    {
-        if(callback) callback({false, 0, 0, 0});
-        handleClose();
-        return;
-    }
-
     sendFileCtx_ = std::make_unique<SendFileCtx>();
-    sendFileCtx_->fd = fd;
-    sendFileCtx_->offset = offset;
-    sendFileCtx_->remaining = fileSize;
-    sendFileCtx_->totalBytes = fileSize;
+    sendFileCtx_->segments = std::move(segments);
+    for(const SendFileSegment& segment : sendFileCtx_->segments) {
+        if(segment.size > std::numeric_limits<size_t>::max() - sendFileCtx_->totalBytes) {
+            auto rejected = std::move(sendFileCtx_);
+            if(callback) callback({false, 0, 0, 0});
+            return;
+        }
+        sendFileCtx_->totalBytes += segment.size;
+    }
+    sendFileCtx_->totalRemaining = sendFileCtx_->totalBytes;
     sendFileCtx_->startedAt = std::chrono::steady_clock::now();
     sendFileCtx_->callback = std::move(callback);
 
-    if(fileSize == 0) {
+    if(!openNextSendFileSegment()) {
+        if(sendFileCtx_ && sendFileCtx_->fd == -2) {
+            finishSendFile(false);
+            handleClose();
+            return;
+        }
         finishSendFile(true);
         return;
     }
@@ -487,6 +512,30 @@ void TcpConnection::startSendFileInLoop(const std::string& filePath, off_t offse
     handleWrite();
 }
 
+bool TcpConnection::openNextSendFileSegment()
+{
+    if(!sendFileCtx_) return false;
+    if(sendFileCtx_->fd >= 0) {
+        ::close(sendFileCtx_->fd);
+        sendFileCtx_->fd = -1;
+    }
+    while(sendFileCtx_->segmentIndex < sendFileCtx_->segments.size()) {
+        const SendFileSegment& segment = sendFileCtx_->segments[sendFileCtx_->segmentIndex++];
+        if(segment.size == 0) continue;
+        const int fd = ::open(segment.path.c_str(), O_RDONLY);
+        if(fd < 0) {
+            sendFileCtx_->fd = -2;
+            return false;
+        }
+        sendFileCtx_->fd = fd;
+        sendFileCtx_->offset = segment.offset;
+        sendFileCtx_->remaining = segment.size;
+        return true;
+    }
+    sendFileCtx_->remaining = 0;
+    return false;
+}
+
 void TcpConnection::finishSendFile(bool success)
 {
     if(!sendFileCtx_) return;
@@ -494,8 +543,8 @@ void TcpConnection::finishSendFile(bool success)
     if(context->fd >= 0) ::close(context->fd);
 
     SendFileResult result;
-    result.success = success && context->remaining == 0;
-    result.bytesSent = context->totalBytes - context->remaining;
+    result.success = success && context->totalRemaining == 0;
+    result.bytesSent = context->totalBytes - context->totalRemaining;
     result.writeCalls = context->writeCalls;
     result.maxBytesPerCall = context->maxBytesPerCall;
     result.syscallNanoseconds = context->syscallNanoseconds;
@@ -508,9 +557,6 @@ void TcpConnection::finishSendFile(bool success)
 
 }
 }
-
-
-
 
 
 

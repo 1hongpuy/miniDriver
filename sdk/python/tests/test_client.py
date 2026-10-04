@@ -75,7 +75,13 @@ class ClientTest(unittest.TestCase):
 
             def do_GET(self):
                 if not self._authorized() or not self.path.endswith("/head"):
-                    self._json(403, {"error": "auth"})
+                    if self._authorized() and self.path == "/api/v2/objects/object-1/layout?version=1":
+                        self._json(200, {"objectId": "object-1", "version": 1, "size": len(DATA),
+                                         "chunks": [{"index": 0, "chunkId": "chunk-1", "offset": 0,
+                                         "size": len(DATA), "checksumType": "crc32c", "checksumDigest": digest,
+                                         "replicas": ["node-1"]}]})
+                    else:
+                        self._json(403, {"error": "auth"})
                     return
                 self._json(200, {"objectId": "object-1", "objectVersion": 1, "metadataVersion": 2,
                                  "fileSize": len(DATA), "state": "COMMITTED"})
@@ -111,6 +117,9 @@ class ClientTest(unittest.TestCase):
         self.assertEqual(stats.bytes_verified, len(DATA))
         self.assertEqual(self.client.head_object(reference).state, "COMMITTED")
         self.assertEqual(self.client.get_object_read_hints(reference).candidates[0].coverage_ratio, 1.0)
+        layout = self.client.get_object_layout(reference)
+        self.assertEqual(layout.chunks[0].replicas, ("node-1",))
+        self.assertEqual(layout.chunks[0].offset + layout.chunks[0].size, layout.size)
         self.assertEqual(len(self.client.batch_get_object_read_hints([reference])), 1)
         self.client.delete_object(reference)
 
@@ -124,4 +133,3 @@ class ClientTest(unittest.TestCase):
                 self.client.get_object(ObjectRef("object-1", 1), lambda _: None, ReadOptions())
         finally:
             module._checksum = original
-

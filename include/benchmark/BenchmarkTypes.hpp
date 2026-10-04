@@ -1,6 +1,6 @@
 #pragma once
 
-#include "client/HttpTransport.hpp"
+#include "client/MiniDriverClient.hpp"
 
 #include <cstdint>
 #include <filesystem>
@@ -25,6 +25,10 @@ struct BenchmarkOptions {
     std::vector<uint64_t> sizes;
     uint32_t runs = 3;
     uint32_t concurrency = 1;
+    // A non-zero duration switches the runner to a steady-state workload.
+    // runs remains the historical finite-round mode when durationSeconds is 0.
+    uint32_t durationSeconds = 0;
+    uint32_t warmupSeconds = 0;
     uint32_t chunkWindow = 1;
     // Process-wide ceiling across concurrent benchmark files.  It is the
     // client-side counterpart to the DataNode admission budget.
@@ -37,6 +41,17 @@ struct BenchmarkOptions {
     // can wait for DataNode/Gateway load reporting to settle before starting
     // the concurrent upload/download workers.
     uint32_t fixtureSettleMs = 0;
+    // Percentage of mixed workers assigned to GET.  For example, 30 means
+    // PUT:GET ~= 7:3.  The default preserves the historical 50:50 split.
+    uint32_t readSharePercent = 50;
+    // Number of distinct objects prepared for duration GET workloads. Zero
+    // uses one fixture per download worker; a larger value enables random
+    // multi-object sampling instead of a single hot-object test.
+    uint32_t downloadFixtureCount = 0;
+    // Optional prior duration runs.csv used as a read-only ObjectRef fixture
+    // manifest. It makes concurrency points share one random object set and
+    // keeps fixture creation outside the curve being measured.
+    std::filesystem::path downloadFixtureManifest;
     BenchmarkMode mode = BenchmarkMode::kEndToEnd;
     BenchmarkReadProfile readProfile = BenchmarkReadProfile::kIndependent;
     // Close remains the historical baseline. Keep-alive reuses a sequential
@@ -68,6 +83,7 @@ struct RunRecord {
     uint64_t sizeBytes = 0;
     uint32_t chunkCount = 0;
     double uploadMs = 0;
+    miniKV::client::UploadPhaseTimings uploadTimings;
     double downloadMs = 0;
     bool uploadOk = false;
     bool downloadOk = false;
@@ -81,6 +97,10 @@ struct RunRecord {
     std::string readerClass = "normal";
     std::string error;
     std::string fileHash;
+    // Diagnostic correlation key.  It lets server-side Chunk logs be matched
+    // to one benchmark sample without making session IDs part of the public
+    // object identity contract.
+    std::string uploadSessionId;
     // Logical identity returned by the upload Commit response.  A fileHash is
     // a content/manifest identity and can be shared by multiple catalog
     // entries, so it is deliberately insufficient for the V3 SDK ReadPlan.
@@ -88,22 +108,39 @@ struct RunRecord {
     uint64_t objectVersion = 0;
     std::string inputHash;
     std::string operation;
+    // Relative to the steady-state start.  These are populated by duration
+    // workloads and allow aggregate IOPS/throughput and per-second samples
+    // to be computed without pretending that request latency is throughput.
+    double startOffsetMs = 0;
+    double endOffsetMs = 0;
 };
 
 struct SizeSummary {
     uint64_t sizeBytes = 0;
     uint32_t requestedRuns = 0;
     uint32_t successCount = 0;
+    uint32_t uploadSuccessCount = 0;
+    uint32_t downloadSuccessCount = 0;
+    uint32_t uploadAttemptCount = 0;
+    uint32_t downloadAttemptCount = 0;
+    double uploadOpsPerSecond = 0;
+    double downloadOpsPerSecond = 0;
+    double uploadMiBPerSecond = 0;
+    double downloadMiBPerSecond = 0;
     double uploadMinMs = 0;
     double uploadMedianMs = 0;
     double uploadP95Ms = 0;
     double uploadP99Ms = 0;
+    double uploadP999Ms = 0;
     double uploadMeanMs = 0;
+    double uploadStddevMs = 0;
     double downloadMinMs = 0;
     double downloadMedianMs = 0;
     double downloadP95Ms = 0;
     double downloadP99Ms = 0;
+    double downloadP999Ms = 0;
     double downloadMeanMs = 0;
+    double downloadStddevMs = 0;
 };
 
 bool parseSize(std::string_view text, uint64_t& bytes);

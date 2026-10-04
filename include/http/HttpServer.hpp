@@ -12,6 +12,8 @@
 #include "utils/ThreadPool.hpp"
 #include <algorithm>
 #include <any>
+#include <chrono>
+#include <cstdlib>
 #include <asm-generic/errno-base.h>
 #include <asm-generic/errno.h>
 #include <cctype>
@@ -145,13 +147,32 @@ private:
                 if(httpCallback_ && threadPool_)
                 {
                     auto deferred = DeferredResponse::create(conn, !keepAlive);
-                    threadPool_->enqueue([this, conn, req = std::move(req), context, deferred]()mutable {
+                    const auto handlerQueuedAt = std::chrono::steady_clock::now();
+                    threadPool_->enqueue([this, conn, req = std::move(req), context, deferred, handlerQueuedAt]()mutable {
+                        const auto handlerStartedAt = std::chrono::steady_clock::now();
+                        const bool diagnostics = std::getenv("MINIKV_HTTP_DIAGNOSTICS") != nullptr;
+                        if(diagnostics) {
+                            miniKV::utils::logInfo("event=http_handler_start path=" + req.path() +
+                                " queue_wait_us=" + std::to_string(static_cast<uint64_t>(
+                                    std::chrono::duration_cast<std::chrono::microseconds>(
+                                        handlerStartedAt - handlerQueuedAt).count())));
+                        }
                         auto resp = std::make_shared<HttpResponse>();
                         resp->setCloseConnection(!isKeepAlive(req));
+                        const std::string requestPath = req.path();
 
                         httpCallback_(req, resp.get(), conn, deferred);
 
-                        conn->ownerLoop()->queueInLoop([conn, resp, context](){
+                        const auto responseQueuedAt = std::chrono::steady_clock::now();
+                        conn->ownerLoop()->queueInLoop([conn, resp, context, diagnostics, responseQueuedAt,
+                                                        requestPath](){
+                            if(diagnostics) {
+                                miniKV::utils::logInfo("event=http_response_send_queue path=" + requestPath +
+                                    " queue_wait_us=" +
+                                    std::to_string(static_cast<uint64_t>(
+                                        std::chrono::duration_cast<std::chrono::microseconds>(
+                                            std::chrono::steady_clock::now() - responseQueuedAt).count())));
+                            }
                             miniKV::utils::logDebug(
                                 "event=http_response_send file_body=" +
                                 std::to_string(resp->isSendFile()) + " file_size=" +
@@ -160,7 +181,17 @@ private:
                             resp->appendToBuffer(&outBuf);
                             conn->send(std::string(outBuf.peek(), outBuf.readableBytes()));
                             
-                            if(resp->isSendFile())
+                            if(resp->hasFileBodySequence())
+                            {
+                                std::vector<network::SendFileSegment> segments;
+                                segments.reserve(resp->bodyFileSegments().size());
+                                for(const auto& segment : resp->bodyFileSegments()) {
+                                    segments.push_back({segment.filePath, segment.fileOffset, segment.fileSize});
+                                }
+                                conn->startSendFileSequence(std::move(segments),
+                                                            resp->fileCompleteCallback());
+                            }
+                            else if(resp->isSendFile())
                             {
                                 conn->startSendFile(resp->bodyFilePath(), 
                                                     resp->bodyFileOffset(),
@@ -185,7 +216,16 @@ private:
                     network::Buffer outBuf;
                     resp.appendToBuffer(&outBuf);
                     conn->send(std::string(outBuf.peek(), outBuf.readableBytes()));
-                    if(resp.isSendFile())
+                    if(resp.hasFileBodySequence())
+                    {
+                        std::vector<network::SendFileSegment> segments;
+                        segments.reserve(resp.bodyFileSegments().size());
+                        for(const auto& segment : resp.bodyFileSegments()) {
+                            segments.push_back({segment.filePath, segment.fileOffset, segment.fileSize});
+                        }
+                        conn->startSendFileSequence(std::move(segments), resp.fileCompleteCallback());
+                    }
+                    else if(resp.isSendFile())
                     {
                         conn->startSendFile(resp.bodyFilePath(), resp.bodyFileOffset(),
                                             resp.bodyFileSize(),

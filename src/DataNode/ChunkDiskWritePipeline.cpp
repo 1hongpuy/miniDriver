@@ -76,6 +76,9 @@ StreamConsumeResult ChunkDiskWritePipeline::push(
         metrics_.peakQueuedBytes = metrics_.queuedBytes;
     }
     pendingBlocks_.push_back({block, size});
+    if(metrics_.queuedBytes == size && config_.stageCallback) {
+        config_.stageCallback("disk_enqueued", std::chrono::steady_clock::now());
+    }
     if(sharedBlock != nullptr) *sharedBlock = std::move(block);
     if(config_.writeMode == WriteMode::kSingleBlock ||
        metrics_.queuedBytes >= config_.targetBatchBytes) {
@@ -140,6 +143,7 @@ void ChunkDiskWritePipeline::scheduleNextAppend(bool force)
     const auto self = shared_from_this();
     if(!executor_.submitTask([self, batch = std::move(batch), batchBytes]() mutable {
         bool success = false;
+        const auto diskStartedAt = std::chrono::steady_clock::now();
         if(self->config_.writeMode == WriteMode::kSingleBlock) {
             success = self->writer_->append(batch.front().block->data(), batch.front().size);
         } else {
@@ -151,8 +155,11 @@ void ChunkDiskWritePipeline::scheduleNextAppend(bool force)
             success = self->writer_->appendBatch(slices);
         }
         const std::weak_ptr<ChunkDiskWritePipeline> weakSelf = self;
-        self->loop_->queueInLoop([weakSelf, success, batchBytes] {
+        self->loop_->queueInLoop([weakSelf, success, batchBytes, diskStartedAt] {
             if(const auto pipeline = weakSelf.lock()) {
+                if(pipeline->config_.stageCallback) {
+                    pipeline->config_.stageCallback("disk_started", diskStartedAt);
+                }
                 pipeline->onAppendComplete(success, batchBytes);
             }
         });
@@ -195,6 +202,7 @@ void ChunkDiskWritePipeline::onBatchDelay()
 void ChunkDiskWritePipeline::onAppendComplete(bool success, size_t size)
 {
     appendInFlight_ = false;
+    if(config_.stageCallback) config_.stageCallback("disk_finished", std::chrono::steady_clock::now());
     if(metrics_.queuedBytes >= size) metrics_.queuedBytes -= size;
     else metrics_.queuedBytes = 0;
     if(!success) {
@@ -223,8 +231,14 @@ void ChunkDiskWritePipeline::maybeFinish()
         if(!self) return;
         self->writer_->finishAsync([weakSelf](bool success, bool alreadyExists) {
             if(const auto pipeline = weakSelf.lock()) {
+                // finishAsync's group-commit callback runs on the serialized
+                // durability worker.  Record that handoff separately from
+                // the later EventLoop callback so queue/wakeup delay is not
+                // folded into fdatasync time.
+                pipeline->writer_->markDurabilityCallbackDispatched();
                 pipeline->loop_->queueInLoop([weakSelf, success, alreadyExists] {
                     if(const auto queuedPipeline = weakSelf.lock()) {
+                        queuedPipeline->writer_->markCompletionCallbackObserved();
                         queuedPipeline->onFinishComplete(success, alreadyExists);
                     }
                 });

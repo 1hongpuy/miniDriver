@@ -50,6 +50,26 @@ int main() {
     MINIKV_CHECK(summary.downloadP99Ms == 40.0);
     MINIKV_CHECK(miniKV::benchmark::mibPerSecond(4ULL * 1024ULL * 1024ULL, 2000.0) == 2.0);
 
+    RunRecord durationUpload = makeRecord("duration-upload", 10.0, 0.0, true, true, "");
+    durationUpload.operation = "upload";
+    durationUpload.sizeBytes = 64ULL * 1024ULL;
+    durationUpload.startOffsetMs = 0.0;
+    durationUpload.endOffsetMs = 1000.0;
+    RunRecord durationDownload = makeRecord("duration-download", 0.0, 20.0, true, true, "");
+    durationDownload.operation = "download";
+    durationDownload.sizeBytes = 64ULL * 1024ULL;
+    durationDownload.startOffsetMs = 0.0;
+    durationDownload.endOffsetMs = 1000.0;
+    const SizeSummary durationSummary = miniKV::benchmark::summarize(
+        64ULL * 1024ULL, 2, {durationUpload, durationDownload},
+        miniKV::benchmark::BenchmarkMode::kMixed);
+    MINIKV_CHECK(durationSummary.uploadOpsPerSecond == 1.0);
+    MINIKV_CHECK(durationSummary.downloadOpsPerSecond == 1.0);
+    MINIKV_CHECK(durationSummary.uploadMiBPerSecond == 0.0625);
+    MINIKV_CHECK(durationSummary.downloadMiBPerSecond == 0.0625);
+    MINIKV_CHECK(durationSummary.uploadP999Ms == 10.0);
+    MINIKV_CHECK(durationSummary.downloadStddevMs == 0.0);
+
     BenchmarkOptions options;
     options.gateway = {"127.0.0.1", 18081};
     options.workDir = std::filesystem::temp_directory_path() / "minikv-benchmark-types-test";
@@ -67,7 +87,7 @@ int main() {
     std::ifstream csv(options.workDir / "runs.csv");
     std::string line;
     std::getline(csv, line);
-    MINIKV_CHECK(line == "run_id,operation,reader_class,object_id,object_version,file_hash,input_hash,size_bytes,upload_ms,upload_mib_per_s,download_ms,download_mib_per_s,chunk_count,data_connection_opens,data_requests,data_connection_reuses,upload_ok,download_ok,error");
+    MINIKV_CHECK(line == "run_id,operation,reader_class,object_id,object_version,file_hash,upload_session_id,input_hash,size_bytes,upload_ms,upload_mib_per_s,upload_create_session_ms,upload_get_session_ms,upload_chunk_budget_wait_ms,upload_checksum_preparation_ms,upload_route_capability_ms,upload_data_node_ms,upload_chunk_total_ms,upload_object_commit_ms,download_ms,download_mib_per_s,chunk_count,data_connection_opens,data_requests,data_connection_reuses,upload_ok,download_ok,error,start_offset_ms,end_offset_ms");
     std::getline(csv, line);
     MINIKV_CHECK(!line.empty());
     std::getline(csv, line);
@@ -76,7 +96,10 @@ int main() {
     std::getline(summaryCsv, line);
     MINIKV_CHECK(line.find("upload_workers_per_round") != std::string::npos);
     std::getline(summaryCsv, line);
-    MINIKV_CHECK(line.find("end-to-end,independent,close,crc32c,1,0,0,3,1,1,0,3,0,2,2,0,4,3") == 0);
+    MINIKV_CHECK(line.find("end-to-end,independent,close,strict-final-sha256,crc32c,1,0,0,3,1,1,0,3,0,2,2,0,4,3") == 0);
+    std::ifstream perSecondCsv(options.workDir / "per-second.csv");
+    std::getline(perSecondCsv, line);
+    MINIKV_CHECK(line == "second,size_bytes,upload_ops,download_ops,upload_bytes,download_bytes,upload_mib,download_mib");
     std::ifstream json(options.workDir / "summary.json");
     const std::string report((std::istreambuf_iterator<char>(json)), {});
     MINIKV_CHECK(report.find("\"gateway\":\"127.0.0.1:18081\"") != std::string::npos);

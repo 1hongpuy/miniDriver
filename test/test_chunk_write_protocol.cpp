@@ -64,6 +64,16 @@ int main()
 {
     const std::string secret = "p5-protocol-test-secret";
 
+    // Proxies such as HAProxy normalize incoming field names to lowercase.
+    // Header lookup must remain RFC-compatible and case-insensitive at the
+    // server boundary (in particular for Content-Length).
+    miniKV::http::HttpRequest lowerCaseHeaders;
+    addHeader(lowerCaseHeaders, "content-length", "4096");
+    addHeader(lowerCaseHeaders, "x-upload-token", "token");
+    MINIKV_CHECK(lowerCaseHeaders.contentLength() == 4096);
+    MINIKV_CHECK(lowerCaseHeaders.getHeader("Content-Length") == "4096");
+    MINIKV_CHECK(lowerCaseHeaders.getHeader("X-Upload-Token") == "token");
+
     const auto legacy = capability(1);
     const std::string legacyToken = miniKV::util::issueUploadCapability(legacy, secret);
     MINIKV_CHECK(!legacyToken.empty());

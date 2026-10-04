@@ -4,10 +4,15 @@
 #include "control/ObjectReadTypes.hpp"
 #include "media/AiIndexEvent.hpp"
 #include "media/MediaJob.hpp"
+#include "metadata/MetadataClient.hpp"
 
 #include <cstdint>
+#include <cstddef>
+#include <chrono>
 #include <string>
 #include <mutex>
+#include <shared_mutex>
+#include <array>
 #include <map>
 #include <memory>
 #include <vector>
@@ -18,6 +23,105 @@ namespace leveldb {
 
 namespace miniKV {
 namespace gateway {
+
+void recordGatewayMutexSample(const char* label, uint64_t waitUs, uint64_t holdUs);
+void recordGatewayMutexInterval(std::chrono::steady_clock::time_point start,
+                                std::chrono::steady_clock::time_point end);
+void recordGatewayLevelDbSample(const char* label, uint64_t durationUs);
+// Reset/flush process-wide diagnostics so an external benchmark can delimit
+// one exact steady-state window without restarting the Gateway.
+void resetGatewayMutexDiagnostics();
+// Emits a cumulative snapshot when mutex diagnostics are enabled.  This is
+// intentionally process-wide so every GatewayState::mutex_ acquire site is
+// accounted for, including maintenance and read-plan paths.
+void flushGatewayMutexDiagnostics();
+
+enum class GatewayLockMode { kGlobal, kSharded };
+
+// The first sharding generation deliberately has only two business domains.
+// Route/lease/chunk state follows the owning upload session and catalog/cache
+// state follows the owning object/namespace shard.  Keeping this primitive in
+// the public header makes lock ownership auditable without exposing internals.
+class GatewayLockManager {
+public:
+    static constexpr size_t kShardCount = 64;
+
+    explicit GatewayLockManager(GatewayLockMode mode = GatewayLockMode::kGlobal)
+        : mode_(mode) {}
+
+    GatewayLockMode mode() const noexcept { return mode_; }
+    static GatewayLockMode modeFromEnvironment();
+    static const char* modeName(GatewayLockMode mode) noexcept;
+    size_t sessionShard(const std::string& sessionId) const noexcept;
+    size_t objectShard(const std::string& canonicalKey) const noexcept;
+    std::mutex& global() noexcept { return globalMutex_; }
+    std::mutex& lifecycle() noexcept { return lifecycleMutex_; }
+    std::mutex& session(size_t shard) noexcept { return sessionMutexes_[shard % kShardCount]; }
+    std::mutex& object(size_t shard) noexcept { return objectMutexes_[shard % kShardCount]; }
+    std::shared_mutex& nodes() noexcept { return nodeRegistryMutex_; }
+
+private:
+    GatewayLockMode mode_;
+    std::mutex globalMutex_;
+    std::mutex lifecycleMutex_;
+    std::array<std::mutex, kShardCount> sessionMutexes_{};
+    std::array<std::mutex, kShardCount> objectMutexes_{};
+    std::shared_mutex nodeRegistryMutex_;
+};
+
+class GatewayMutexGuard {
+public:
+    GatewayMutexGuard(std::mutex& mutex, const char* label)
+        : mutex_(mutex), label_(label), requestedAt_(std::chrono::steady_clock::now()) {
+        mutex_.lock();
+        lockedAt_ = std::chrono::steady_clock::now();
+    }
+    ~GatewayMutexGuard() {
+        const auto releasedAt = std::chrono::steady_clock::now();
+        recordGatewayMutexSample(label_,
+            static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(lockedAt_ - requestedAt_).count()),
+            static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(releasedAt - lockedAt_).count()));
+        recordGatewayMutexInterval(lockedAt_, releasedAt);
+        mutex_.unlock();
+    }
+    GatewayMutexGuard(const GatewayMutexGuard&) = delete;
+    GatewayMutexGuard& operator=(const GatewayMutexGuard&) = delete;
+private:
+    std::mutex& mutex_;
+    const char* label_;
+    std::chrono::steady_clock::time_point requestedAt_;
+    std::chrono::steady_clock::time_point lockedAt_;
+};
+
+// Acquires two shard mutexes in a deterministic shard-number order.  Cross
+// domain operations must use this helper instead of spelling out lock order in
+// business code; accepting the arguments in either order is the ABBA safety
+// property exercised by test_gateway_lock_manager.
+class GatewayShardMultiLock {
+public:
+    GatewayShardMultiLock(std::mutex& first, size_t firstShard,
+                          std::mutex& second, size_t secondShard)
+    {
+        if (&first == &second || firstShard == secondShard) {
+            firstLock_ = std::unique_lock<std::mutex>(first);
+            return;
+        }
+        if (firstShard < secondShard) {
+            firstLock_ = std::unique_lock<std::mutex>(first);
+            secondLock_ = std::unique_lock<std::mutex>(second);
+        } else {
+            firstLock_ = std::unique_lock<std::mutex>(second);
+            secondLock_ = std::unique_lock<std::mutex>(first);
+        }
+    }
+
+    GatewayShardMultiLock(const GatewayShardMultiLock&) = delete;
+    GatewayShardMultiLock& operator=(const GatewayShardMultiLock&) = delete;
+
+private:
+    std::unique_lock<std::mutex> firstLock_;
+    std::unique_lock<std::mutex> secondLock_;
+};
 
 enum class NodeLiveState { kRecovering, kOnline, kSuspect, kOffline, kDraining };
 //恢复或者注册， 上线， 亚健康，下线， 手动关闭
@@ -100,6 +204,10 @@ struct SessionState {
     uint64_t fileSize  = 0;
     uint32_t chunkSize = 4 * 1024 * 1024;
     uint32_t totalChunks = 0;
+    // Remote MetadataService sessions expose the aggregate completion count;
+    // the Gateway compatibility view does not materialize every completed
+    // chunk, so keep that count separately from the local completed map.
+    uint32_t completedChunks = 0;
     // New sessions bind this canonical content identity before any bytes are sent.
     // Empty means a legacy session created by the original V2 API.
     std::string manifestHash;
@@ -126,6 +234,18 @@ struct ChunkRoute { //每个chunk的真实副本管理，写入真实的数据
     int64_t  updateAt = 0;
 };
 
+// A lease is also the in-memory reservation token for the node write slots.
+// The token is deliberately runtime-only (leases are not persisted): its
+// unique id gives retries/cleanup an idempotent handle, while the terminal
+// state makes the exactly-once release rule explicit to ownership audits.
+struct ReservationToken {
+    enum class State { kReserved, kCommitted, kRolledBack };
+    std::string tokenId;
+    std::vector<std::string> nodeIds;
+    uint64_t bytes = 0;
+    State state = State::kReserved;
+};
+
 struct WriteLease {
     std::string leaseId;
     std::string requestKey;
@@ -135,6 +255,7 @@ struct WriteLease {
     uint64_t chunkSize = 0;
     int64_t expiresAt = 0;
     PlacementPlan plan;
+    ReservationToken reservation;
 };
 
 struct FileMeta {
@@ -176,6 +297,9 @@ struct ObjectMeta {
 };
 
 struct UploadPreflightRequest {
+    // Optional stable client idempotency key.  In raft mode it is used to
+    // derive the session/object ids and the CreateSession command id.
+    std::string commandId;
     std::string fileName;
     std::string dirPath;
     uint64_t fileSize = 0;
@@ -259,11 +383,27 @@ struct ThumbnailEnqueueResult {
     bool publishRequired = false;
 };
 
+// Per-request diagnostic decomposition for Gateway mutations.  It is passed
+// only by observability callers and has no effect on metadata semantics.
+struct GatewayMutationTiming {
+    uint64_t mutexWaitUs = 0;
+    uint64_t criticalSectionUs = 0;
+    uint64_t levelDbWriteUs = 0;
+};
+
 class GatewayState {
 public:
-    explicit GatewayState(const std::string& dbPath);
+    explicit GatewayState(const std::string& dbPath, uint32_t replicationFactor = 2,
+                          GatewayLockMode lockMode = GatewayLockManager::modeFromEnvironment());
     ~GatewayState();
     bool open();
+    // In raft mode Gateway does not open a local metadata LevelDB.  The
+    // adapter is deliberately opt-in so legacy deployments keep their exact
+    // behavior until the core upload/read path is migrated.
+    void configureRemoteMetadata(std::shared_ptr<metadata::MetadataClient> client);
+    bool remoteMetadataEnabled() const noexcept { return static_cast<bool>(remoteMetadata_); }
+    GatewayLockMode lockMode() const noexcept { return locks_.mode(); }
+    static constexpr size_t kLockShardCount = GatewayLockManager::kShardCount;
 
     bool registerNode(const NodeRecord& node);
     bool heartbeat(const std::string& nodeId, const NodeRuntime& runtime);
@@ -272,7 +412,8 @@ public:
     std::vector<NodeSnapshot> nodes() const;
 
     bool createSession(const std::string& fileName, const std::string& dirPath,
-        uint64_t fileSize, uint32_t chunkSize, SessionState& out);
+        uint64_t fileSize, uint32_t chunkSize, SessionState& out,
+        GatewayMutationTiming* timing = nullptr);
     // The browser calls this after hashing its fixed-size chunks. It either
     // rejects the logical path, links an existing content object, or creates a
     // resumable session containing only the chunks that still need transfer.
@@ -285,13 +426,16 @@ public:
     bool getSession(const std::string& sessionId, SessionState& out) const;
     RoutePlanStatus planRoutes(const std::string& sessionId,
                                const std::vector<ChunkRouteRequest>& requests,
-                               std::vector<PlacementPlan>& out);
+                               std::vector<PlacementPlan>& out,
+                               GatewayMutationTiming* timing = nullptr);
     CommitChunkStatus commitChunk(const std::string& sessionId, uint32_t index,
                                   const std::string& chunkHash, uint64_t size,
                                   const std::vector<std::string>& successfulNodes,
-                                  const std::string& leaseId);
+                                  const std::string& leaseId,
+                                  GatewayMutationTiming* timing = nullptr);
     bool releaseLease(const std::string& leaseId);
-    FileCommitStatus commitFile(const std::string& sessionId, FileMeta& out);
+    FileCommitStatus commitFile(const std::string& sessionId, FileMeta& out,
+                                GatewayMutationTiming* timing = nullptr);
     FileCommitStatus commitDerivedUpload(const std::string& jobId,
                                          const std::string& leaseToken,
                                          const std::string& sessionId, FileMeta& out);
@@ -342,12 +486,14 @@ public:
 
 
 private:
+    uint32_t replicationFactor_ = 2;
     PlacementPlan selectPlacementLocked(const SessionState& session, uint32_t index);
     bool reserveLeaseLocked(const SessionState& session,
                             const ChunkRouteRequest& request,
                             PlacementPlan& plan,
                             int64_t now);
-    void releaseLeaseLocked(const std::string& leaseId);
+    bool releaseLeaseLocked(const std::string& leaseId,
+                            ReservationToken::State terminalState = ReservationToken::State::kRolledBack);
     void releaseExpiredLeasesLocked(int64_t now);
     void releaseLeasesForNodeLocked(const std::string& nodeId);
     bool persistSessionLocked(const SessionState& session);
@@ -374,9 +520,20 @@ private:
                                             const FileMeta& file,
                                             ObjectMeta& out);
 
+    std::mutex& sessionMutex(const std::string& sessionId) const noexcept;
+    std::mutex& objectMutex(const std::string& canonicalKey) const noexcept;
+    size_t leaseShard(const std::string& leaseId) const noexcept;
+    bool useShardedLocks() const noexcept { return locks_.mode() == GatewayLockMode::kSharded; }
+
     std::string dbPath_;
     std::unique_ptr<leveldb::DB> db_;
-    mutable std::mutex mutex_; //可以再静态函数里面修改
+    std::shared_ptr<metadata::MetadataClient> remoteMetadata_;
+    mutable std::map<std::string, uint64_t> remoteNodeEpochs_;
+    mutable std::map<std::string, std::string> remoteBootIds_;
+    mutable GatewayLockManager locks_;
+    // Compatibility alias for the global mode and for the not-yet-migrated
+    // maintenance/media APIs. Core upload paths select Session/Object shards.
+    std::mutex& mutex_ = locks_.global();
     mutable ObjectMetaCache objectCache_;
     mutable FileMetaCache fileCache_;
     mutable ChunkRouteCache routeCache_;
@@ -387,8 +544,15 @@ private:
     std::map<std::string, NodeRuntime>  nodeRuntime_;
     std::map<std::string, SessionState> sessions_;
     std::map<std::string, DeleteTask> deleteTasks_;
+    // In sharded mode lease state follows the owning session shard. Lease IDs
+    // carry the shard prefix so release/timeout paths can find the owner
+    // without a process-wide lookup mutex. Global mode keeps the legacy maps.
     std::map<std::string, WriteLease> leases_;
     std::map<std::string, std::string> leaseByRequestKey_;
+    std::array<std::map<std::string, WriteLease>, GatewayLockManager::kShardCount>
+        shardedLeases_;
+    std::array<std::map<std::string, std::string>, GatewayLockManager::kShardCount>
+        shardedLeaseByRequestKey_;
     std::map<std::string, uint32_t> reservedWritesByNode_;
     std::map<std::string, uint64_t> reservedBytesByNode_;
 };
@@ -397,12 +561,3 @@ private:
 
 }
 }
-
-
-
-
-
-
-
-
-

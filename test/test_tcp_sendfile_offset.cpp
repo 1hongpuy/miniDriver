@@ -116,6 +116,42 @@ int main()
     CHECK(emptyResult.bytesSent == 0);
     CHECK(emptyResult.writeCalls == 0);
 
+    const std::string firstSegment = "prefix|";
+    const std::string sequenceExpected = firstSegment + expected;
+    std::atomic<bool> sequenceFailed{false};
+    std::atomic<bool> sequenceCompleted{false};
+    miniKV::network::SendFileResult sequenceResult;
+    std::string sequenceReceived;
+    std::thread sequenceReader([&] {
+        while(sequenceReceived.size() < sequenceExpected.size()) {
+            pollfd descriptor{sockets[1], POLLIN, 0};
+            if(::poll(&descriptor, 1, 2000) <= 0) { sequenceFailed = true; break; }
+            char buffer[64];
+            const ssize_t count = ::read(sockets[1], buffer, sizeof(buffer));
+            if(count <= 0) { sequenceFailed = true; break; }
+            sequenceReceived.append(buffer, static_cast<size_t>(count));
+        }
+    });
+    loop.runAfter(1, [&] {
+        std::vector<miniKV::network::SendFileSegment> segments;
+        segments.push_back({path, 0, firstSegment.size()});
+        segments.push_back({path, offset, expected.size()});
+        connection->startSendFileSequence(std::move(segments),
+            [&](const miniKV::network::SendFileResult& result) {
+                sequenceResult = result;
+                sequenceCompleted = true;
+                loop.quit();
+            });
+    });
+    loop.runAfter(2000, [&] { sequenceFailed = true; loop.quit(); });
+    loop.loop();
+    sequenceReader.join();
+    CHECK(!sequenceFailed.load());
+    CHECK(sequenceCompleted.load());
+    CHECK(sequenceResult.success);
+    CHECK(sequenceResult.bytesSent == sequenceExpected.size());
+    CHECK(sequenceReceived == sequenceExpected);
+
     connection->connectDestroyed();
     connection.reset();
     ::close(sockets[1]);

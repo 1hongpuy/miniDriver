@@ -1,0 +1,178 @@
+x-minidriver-build: &minidriver-build
+  context: ../..
+  dockerfile: deploy/v4-ha/Dockerfile
+
+services:
+
+  haproxy:
+    image: haproxy:2.9
+    command: ["-d", "-f", "/usr/local/etc/haproxy/haproxy.cfg"]
+    ports: ["18280:18280"]
+    volumes: ["./haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro"]
+    depends_on: [gw-1, gw-2, gw-3]
+
+  # This compose file intentionally keeps the metadata service separate from
+  # the Gateway image. Build an image containing minikv_metadata_raft_service
+  # and set MINIDRIVER_METADATA_IMAGE before using it in a real deployment.
+  meta-1:
+    build: *minidriver-build
+    image: ${MINIDRIVER_METADATA_IMAGE:-minidriver:4.0-ha}
+    command: ["minikv_metadata_raft_service"]
+    environment: &meta-env
+      MINIKV_METADATA_MEMBER_ID: "1"
+      MINIKV_METADATA_RAFT_PORT: "18001"
+      MINIKV_METADATA_PORT: "18101"
+      MINIKV_METADATA_RAFT_MEMBERS: "1@meta-1:18001,2@meta-2:18002,3@meta-3:18003"
+      MINIKV_METADATA_DIR: /var/lib/minidriver/metadata
+      MINIKV_METADATA_WAL_DIR: /var/lib/minidriver/metadata-wal
+      MINIKV_V2_CLUSTER_SECRET: ${MINIKV_V2_CLUSTER_SECRET:-change-me}
+    volumes: ["meta-1-data:/var/lib/minidriver/metadata", "meta-1-wal:/var/lib/minidriver/metadata-wal"]
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:18101/healthz', timeout=2).read()"]
+      interval: 3s
+      timeout: 2s
+      retries: 20
+  meta-2:
+    build: *minidriver-build
+    image: ${MINIDRIVER_METADATA_IMAGE:-minidriver:4.0-ha}
+    command: ["minikv_metadata_raft_service"]
+    environment:
+      <<: *meta-env
+      MINIKV_METADATA_MEMBER_ID: "2"
+      MINIKV_METADATA_RAFT_PORT: "18002"
+      MINIKV_METADATA_PORT: "18102"
+      MINIKV_METADATA_DIR: /var/lib/minidriver/metadata
+    volumes: ["meta-2-data:/var/lib/minidriver/metadata", "meta-2-wal:/var/lib/minidriver/metadata-wal"]
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:18102/healthz', timeout=2).read()"]
+      interval: 3s
+      timeout: 2s
+      retries: 20
+  meta-3:
+    build: *minidriver-build
+    image: ${MINIDRIVER_METADATA_IMAGE:-minidriver:4.0-ha}
+    command: ["minikv_metadata_raft_service"]
+    environment:
+      <<: *meta-env
+      MINIKV_METADATA_MEMBER_ID: "3"
+      MINIKV_METADATA_RAFT_PORT: "18003"
+      MINIKV_METADATA_PORT: "18103"
+      MINIKV_METADATA_DIR: /var/lib/minidriver/metadata
+    volumes: ["meta-3-data:/var/lib/minidriver/metadata", "meta-3-wal:/var/lib/minidriver/metadata-wal"]
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:18103/healthz', timeout=2).read()"]
+      interval: 3s
+      timeout: 2s
+      retries: 20
+
+  gw-1:
+    build: *minidriver-build
+    image: ${MINIDRIVER_GATEWAY_IMAGE:-minidriver:4.0-ha}
+    command: ["minikv_v2_gateway", "18281", "/var/lib/minidriver/gateway"]
+    environment: &gw-env
+      MINIKV_METADATA_MODE: raft
+      MINIKV_METADATA_ENDPOINTS: meta-1:18101,meta-2:18102,meta-3:18103
+      MINIKV_GATEWAY_ID: gw-1
+      MINIKV_V2_CLUSTER_SECRET: ${MINIKV_V2_CLUSTER_SECRET:-change-me}
+    depends_on:
+      meta-1: {condition: service_healthy}
+      meta-2: {condition: service_healthy}
+      meta-3: {condition: service_healthy}
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:18281/healthz', timeout=2).read()"]
+      interval: 3s
+      timeout: 2s
+      retries: 20
+  gw-2:
+    build: *minidriver-build
+    image: ${MINIDRIVER_GATEWAY_IMAGE:-minidriver:4.0-ha}
+    command: ["minikv_v2_gateway", "18281", "/var/lib/minidriver/gateway"]
+    environment:
+      <<: *gw-env
+      MINIKV_GATEWAY_ID: gw-2
+    depends_on:
+      meta-1: {condition: service_healthy}
+      meta-2: {condition: service_healthy}
+      meta-3: {condition: service_healthy}
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:18281/healthz', timeout=2).read()"]
+      interval: 3s
+      timeout: 2s
+      retries: 20
+  gw-3:
+    build: *minidriver-build
+    image: ${MINIDRIVER_GATEWAY_IMAGE:-minidriver:4.0-ha}
+    command: ["minikv_v2_gateway", "18281", "/var/lib/minidriver/gateway"]
+    environment:
+      <<: *gw-env
+      MINIKV_GATEWAY_ID: gw-3
+    depends_on:
+      meta-1: {condition: service_healthy}
+      meta-2: {condition: service_healthy}
+      meta-3: {condition: service_healthy}
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:18281/healthz', timeout=2).read()"]
+      interval: 3s
+      timeout: 2s
+      retries: 20
+
+  dn-1:
+    build: *minidriver-build
+    image: ${MINIDRIVER_GATEWAY_IMAGE:-minidriver:4.0-ha}
+    # DataNode register/heartbeat/commit control RPCs use the Metadata quorum
+    # directly.  The HAProxy argument remains a legacy compatibility fallback
+    # and is still carried in replica transport headers.
+    command: ["minikv_v2_datanode", "dn-1", "dn-1", "19201", "/var/lib/minidriver/datanode", "haproxy", "18280"]
+    environment: &dn-env
+      MINIKV_V2_CLUSTER_SECRET: ${MINIKV_V2_CLUSTER_SECRET:-change-me}
+      MINIKV_DATANODE_METADATA_ENDPOINTS: meta-1:18101,meta-2:18102,meta-3:18103
+      MINIKV_V3_IDENTITY_SCHEME: opaque-chunk-id
+      MINIKV_V3_CHECKSUM_TYPE: crc32c
+      MINIKV_V3_DURABILITY_MODE: group_commit
+    depends_on:
+      gw-1: {condition: service_healthy}
+    volumes: ["dn-1-data:/var/lib/minidriver/datanode"]
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:19201/readyz', timeout=2).read()"]
+      interval: 3s
+      timeout: 2s
+      retries: 20
+
+  dn-2:
+    build: *minidriver-build
+    image: ${MINIDRIVER_GATEWAY_IMAGE:-minidriver:4.0-ha}
+    command: ["minikv_v2_datanode", "dn-2", "dn-2", "19202", "/var/lib/minidriver/datanode", "haproxy", "18280"]
+    environment: *dn-env
+    depends_on:
+      gw-1: {condition: service_healthy}
+    volumes: ["dn-2-data:/var/lib/minidriver/datanode"]
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:19202/readyz', timeout=2).read()"]
+      interval: 3s
+      timeout: 2s
+      retries: 20
+
+  dn-3:
+    build: *minidriver-build
+    image: ${MINIDRIVER_GATEWAY_IMAGE:-minidriver:4.0-ha}
+    command: ["minikv_v2_datanode", "dn-3", "dn-3", "19203", "/var/lib/minidriver/datanode", "haproxy", "18280"]
+    environment: *dn-env
+    depends_on:
+      gw-1: {condition: service_healthy}
+    volumes: ["dn-3-data:/var/lib/minidriver/datanode"]
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:19203/readyz', timeout=2).read()"]
+      interval: 3s
+      timeout: 2s
+      retries: 20
+
+volumes:
+  meta-1-data:
+  meta-2-data:
+  meta-3-data:
+  meta-1-wal:
+  meta-2-wal:
+  meta-3-wal:
+  dn-1-data:
+  dn-2-data:
+  dn-3-data:

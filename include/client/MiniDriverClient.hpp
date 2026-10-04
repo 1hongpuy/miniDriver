@@ -24,6 +24,13 @@ struct ClientConfig {
     int dataNodeTimeoutMs = 60000;
 };
 
+struct UploadProgress {
+    uint64_t logicalBytesCompleted = 0;
+    uint64_t totalBytes = 0;
+    uint32_t completedChunks = 0;
+    uint32_t totalChunks = 0;
+};
+
 struct ReadOptions {
     bool keepAlive = true;
     bool verifyChecksum = true;
@@ -41,11 +48,23 @@ struct UploadOptions {
     // route key, not a content hash. SHA-256 remains available for legacy CAS
     // compatibility and explicit strong-content mode.
     std::string checksumType = "crc32c";
+    // Optional stable control-plane idempotency key.  When omitted the SDK
+    // creates one per upload invocation; callers retrying an HTTP preflight
+    // can provide the same value explicitly.
+    std::string commandId;
     // Optional process-wide admission hook. Benchmark supplies this so its
     // global chunk budget remains meaningful after moving upload logic into
     // the SDK; production callers can leave both empty.
     std::function<void()> acquireChunk;
     std::function<void()> releaseChunk;
+    // Optional timed variant used by the benchmark to expose client-side
+    // global chunk-budget wait separately from route/body timings.
+    // Returning milliseconds keeps the legacy acquireChunk callback intact.
+    std::function<double()> acquireChunkTimed;
+    // Optional observer only. It is called once with the resumed baseline and
+    // then after each logical Chunk completes;
+    // it does not change retry, RF2, checksum, or commit semantics.
+    std::function<void(const UploadProgress&)> onProgress;
 };
 
 // Replayable source required by the current upload retry contract.  A generic
@@ -62,12 +81,27 @@ struct PutObjectOptions {
     std::string contentType = "application/octet-stream";
 };
 
+// End-to-end upload phase timing observed by the SDK.  These values are
+// diagnostic-only: they do not change retry, checksum, capability, or commit
+// semantics.  Chunk fields are sums when one object has multiple chunks.
+struct UploadPhaseTimings {
+    double createSessionMs = 0;
+    double getSessionMs = 0;
+    double chunkBudgetWaitMs = 0;
+    double checksumPreparationMs = 0;
+    double routeCapabilityMs = 0;
+    double dataNodeUploadMs = 0;
+    double chunkUploadTotalMs = 0;
+    double objectCommitMs = 0;
+};
+
 struct UploadResult {
     ObjectRef object;
     std::string sessionId;
     std::string fileHash;  // Legacy lookup key while V2 compatibility remains.
     uint32_t chunkSize = 0;
     uint32_t chunkCount = 0;
+    UploadPhaseTimings timings;
 };
 
 struct ReplicaTarget {

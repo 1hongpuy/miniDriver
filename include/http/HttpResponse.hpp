@@ -6,6 +6,7 @@
 #include <string>
 #include <map>
 #include <utility>
+#include <vector>
 #include <sys/types.h>
 #include "sstream"
 #include "network/Buffer.hpp"
@@ -16,6 +17,7 @@
 namespace miniKV {
 namespace network {
 struct SendFileResult;
+struct SendFileSegment;
 }
 namespace http {
 class HttpResponse{
@@ -26,6 +28,7 @@ public:
     enum HttpStatusCode{
         kUnknown,
         k200Ok = 200, //成功
+        k201Created = 201,
         k206PartialContent = 206, //返回部分内容
         k302Found = 302,       //分享链接跳转到实际文件
         k304NotModified = 304, //资源未修改，使用缓存
@@ -35,6 +38,7 @@ public:
         k405MethodNotAllowed = 405, //方法不被允许，有这个资源，不是不允许这么方法操作
         k413PayloadTooLarge = 413, //请求体过大
         k416RangeNotSatisfiable = 416,
+        k409Conflict = 409,
         k500InternalServerError = 500, //网络内部错误
         k501NotImplemented = 501, //功能为实现
         k503ServiceUnavailable = 503, //暂时无可用容量，可稍后重试
@@ -75,13 +79,32 @@ public:
         addHeader("Content-Length", std::to_string(fileSize));
     }
 
-    bool isSendFile() { return !bodyFilePath_.empty(); }
+    struct FileSegment {
+        std::string filePath;
+        off_t fileOffset = 0;
+        size_t fileSize = 0;
+    };
+
+    void setFileBodies(std::vector<FileSegment> segments, size_t totalSize,
+                       FileCompleteCallback callback = {})
+    {
+        bodyFileSegments_ = std::move(segments);
+        bodyFilePath_.clear();
+        bodyFileOffset_ = 0;
+        bodyFileSize_ = totalSize;
+        fileCompleteCallback_ = std::move(callback);
+        addHeader("Content-Length", std::to_string(totalSize));
+    }
+
+    bool isSendFile() const { return !bodyFilePath_.empty() || !bodyFileSegments_.empty(); }
+    bool hasFileBodySequence() const { return !bodyFileSegments_.empty(); }
     const std::string& bodyFilePath() const { return bodyFilePath_; }
     off_t bodyFileOffset() const { return bodyFileOffset_; }
     size_t bodyFileSize() const { return bodyFileSize_; }
     const FileCompleteCallback& fileCompleteCallback() const {
         return fileCompleteCallback_;
     }
+    const std::vector<FileSegment>& bodyFileSegments() const { return bodyFileSegments_; }
 
     void addHeader(const std::string& key,  const std::string& value)
     {
@@ -122,6 +145,7 @@ private:
     std::string statusMessage() const{
         switch(statusCode_){
             case 200: return "OK";
+            case 201: return "Created";
             case 206: return "Partial Content";
             case 302: return "Found";
             case 304: return "Not MOdified";
@@ -131,6 +155,7 @@ private:
             case 405: return "Method Not Allowed";
             case 413: return "Payload Too Large";
             case 416: return "Range Not Satisfiable";
+            case 409: return "Conflict";
             case 500: return "Internal Server Error";
             case 501: return "Not Implemented";
             case 503: return "Service Unavailable";
@@ -148,6 +173,7 @@ private:
     std::string bodyFilePath_;
     off_t       bodyFileOffset_ = 0;
     size_t      bodyFileSize_ = 0;
+    std::vector<FileSegment> bodyFileSegments_;
     FileCompleteCallback fileCompleteCallback_;
 };
     

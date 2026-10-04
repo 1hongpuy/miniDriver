@@ -53,6 +53,11 @@ public:
         // leaves both callbacks empty and uses fdatasync/LevelDB directly.
         std::function<int(int)> dataSyncOverride;
         std::function<bool()> failIndexSync;
+        // Optional location for the local physical index. Empty preserves the
+        // historical dataDirectory/physical_index layout. Deployments can put
+        // the LevelDB index on a separate low-latency device while retaining
+        // both durability barriers for durable policies.
+        std::string physicalIndexDirectory;
     };
 
     struct WriteMetrics {
@@ -61,6 +66,12 @@ public:
         uint64_t shaFinalizeNanoseconds = 0;
         uint64_t dataSyncNanoseconds = 0;
         uint64_t indexNanoseconds = 0;
+        // indexNanoseconds is the complete index publication path.  These
+        // fields split it into lock acquisition, WriteBatch construction, and
+        // the LevelDB Write(sync=true) call for root-cause analysis.
+        uint64_t indexMutexWaitNanoseconds = 0;
+        uint64_t indexBatchBuildNanoseconds = 0;
+        uint64_t indexWriteNanoseconds = 0;
         uint64_t dataSyncOperations = 0;
         uint64_t indexSyncOperations = 0;
         uint64_t pwriteOperations = 0;
@@ -72,8 +83,27 @@ public:
         // Time spent waiting for the sequencer to start this request's batch.
         // This excludes fdatasync and LevelDB publication.
         uint64_t durabilityQueueWaitNanoseconds = 0;
+        // Time from the first queued request entering the coordinator until
+        // the worker starts the selected batch.  This includes the configured
+        // batch deadline and any preceding occupancy of the single worker.
+        uint64_t durabilityBatchFormationNanoseconds = 0;
+        // Lower-bound estimate of the part attributable to the worker being
+        // busy with an earlier batch (batch formation minus maxBatchDelay).
+        uint64_t durabilityWorkerBusyWaitNanoseconds = 0;
         uint64_t groupWaitNanoseconds = 0;
         uint64_t groupCommitNanoseconds = 0;
+        // Queue depth samples captured at enqueue and immediately before the
+        // worker removes this batch.  A completion snapshot alone is often
+        // zero because the worker has already drained the queue by then.
+        uint64_t durabilityPendingItemsAtEnqueue = 0;
+        uint64_t durabilityPendingBytesAtEnqueue = 0;
+        uint64_t durabilityPendingItemsAtBatchStart = 0;
+        uint64_t durabilityPendingBytesAtBatchStart = 0;
+        // The durability worker invokes the callback and the pipeline then
+        // posts back to the owning EventLoop.  Keep both pieces visible so a
+        // slow EventLoop wakeup is not mislabeled as a slow fdatasync.
+        uint64_t durabilityCallbackDispatchNanoseconds = 0;
+        uint64_t completionWakeupNanoseconds = 0;
         uint64_t durableSequence = 0;
         uint64_t groupBatchBytes = 0;
         uint64_t groupBatchItems = 0;
@@ -104,9 +134,17 @@ public:
         uint64_t lastBatchBytes = 0;
         uint64_t lastBatchItems = 0;
         uint64_t lastBatchFormationNanoseconds = 0;
+        uint64_t lastBatchPendingBytes = 0;
+        uint64_t lastBatchPendingItems = 0;
         uint64_t lastDataSyncNanoseconds = 0;
         uint64_t lastIndexSyncNanoseconds = 0;
+        uint64_t lastIndexMutexWaitNanoseconds = 0;
+        uint64_t lastIndexBatchBuildNanoseconds = 0;
+        uint64_t lastIndexWriteNanoseconds = 0;
         uint64_t lastBatchCommitNanoseconds = 0;
+        // Zero when group_commit is disabled; group_commit currently creates
+        // exactly one ordered durability worker.
+        uint64_t workerCount = 0;
     };
 
     struct WriteSlice {
@@ -124,6 +162,11 @@ public:
         bool appendBatch(const std::vector<WriteSlice>& slices);
         bool finish(bool& alreadyExists);
         bool finishAsync(FinishCallback callback);
+        // Called by the durability callback wrapper and by the owning
+        // EventLoop callback respectively.  These are diagnostics only and
+        // do not change completion semantics.
+        void markDurabilityCallbackDispatched();
+        void markCompletionCallbackObserved();
         void abort();
         uint64_t writtenBytes() const { return writtenBytes_; }
         uint64_t expectedSize() const { return expectedSize_; }
@@ -139,9 +182,19 @@ public:
         void completeGroupCommit(bool success, bool alreadyExists,
                                  uint64_t durableSequence, uint64_t batchBytes,
                                  uint64_t batchItems, uint64_t dataSyncNanoseconds,
-                                 uint64_t indexNanoseconds, uint64_t waitNanoseconds,
+                                 uint64_t indexNanoseconds,
+                                 uint64_t indexMutexWaitNanoseconds,
+                                 uint64_t indexBatchBuildNanoseconds,
+                                 uint64_t indexWriteNanoseconds,
+                                 uint64_t waitNanoseconds,
                                  uint64_t queueWaitNanoseconds,
-                                 uint64_t commitNanoseconds, bool ownsSyncOperations,
+                                 uint64_t commitNanoseconds,
+                                 uint64_t batchFormationNanoseconds,
+                                 uint64_t pendingItemsAtEnqueue,
+                                 uint64_t pendingBytesAtEnqueue,
+                                 uint64_t pendingItemsAtBatchStart,
+                                 uint64_t pendingBytesAtBatchStart,
+                                 bool ownsSyncOperations,
                                  bool dataSyncAttempted, bool indexSyncAttempted);
 
         FastDataStore* store_;
@@ -156,6 +209,8 @@ public:
         bool digestFinalized_ = false;
         bool failed_ = false;
         std::chrono::steady_clock::time_point writeReadyAt_{};
+        std::chrono::steady_clock::time_point durabilityCompletedAt_{};
+        std::chrono::steady_clock::time_point durabilityCallbackDispatchedAt_{};
         WriteMetrics metrics_;
     };
 
@@ -195,6 +250,9 @@ private:
                                uint64_t durableSequence,
                                uint64_t& dataSyncNanoseconds,
                                uint64_t& indexNanoseconds,
+                               uint64_t& indexMutexWaitNanoseconds,
+                               uint64_t& indexBatchBuildNanoseconds,
+                               uint64_t& indexWriteNanoseconds,
                                bool& dataSyncAttempted,
                                bool& indexSyncAttempted);
     bool findExtentLocked(const std::string& storageKey, ChunkIdentityScheme scheme,

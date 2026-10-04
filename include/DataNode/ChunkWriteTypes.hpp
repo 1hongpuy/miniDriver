@@ -52,6 +52,7 @@ struct ChunkWriteDescriptor {
     uint64_t objectVersion = 1;
     uint64_t generation = 0;
     std::string sessionId;
+    std::string leaseId;
     uint32_t chunkIndex = 0;
     uint64_t contentLength = 0;
     ChunkChecksum checksum;

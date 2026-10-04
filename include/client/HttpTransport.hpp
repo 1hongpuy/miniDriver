@@ -5,7 +5,21 @@
 #include <string>
 #include <string_view>
 
+#ifdef _WIN32
+#include <winsock2.h>
+#else
+#include <sys/types.h>
+#endif
+
 namespace miniKV::client {
+
+#ifdef _WIN32
+using TransportSocket = SOCKET;
+constexpr TransportSocket kInvalidTransportSocket = INVALID_SOCKET;
+#else
+using TransportSocket = int;
+constexpr TransportSocket kInvalidTransportSocket = -1;
+#endif
 
 // Deliberately small synchronous transport used by the first SDK core.  The
 // SDK owns object semantics; this type only owns a sequential HTTP/1.1 socket.
@@ -44,7 +58,7 @@ public:
     const Stats& stats() const { return stats_; }
 
 private:
-    int fd_ = -1;
+    TransportSocket fd_ = kInvalidTransportSocket;
     uint64_t expectedBytes_ = 0;
     uint64_t sentBytes_ = 0;
     int timeoutMs_ = 0;

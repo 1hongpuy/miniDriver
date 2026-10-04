@@ -2,6 +2,7 @@
 
 #include <arpa/inet.h>
 #include <chrono>
+#include <cctype>
 #include <cerrno>
 #include <cstring>
 #include <netdb.h>
@@ -69,14 +70,28 @@ bool writeAll(int fd, const char* data, size_t size, int timeoutMs, std::string&
     return true;
 }
 
+std::string lowerHeaderName(std::string name) {
+    for (char& c : name) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    return name;
+}
+
+const std::string* findHeader(const std::map<std::string, std::string>& headers,
+                              const char* wanted) {
+    const std::string normalized = lowerHeaderName(wanted);
+    for (const auto& [name, value] : headers) {
+        if (lowerHeaderName(name) == normalized) return &value;
+    }
+    return nullptr;
+}
+
 bool parseContentLength(const std::map<std::string, std::string>& headers, uint64_t& length) {
-    const auto it = headers.find("Content-Length");
-    if (it == headers.end() || it->second.empty()) return false;
+    const std::string* value = findHeader(headers, "Content-Length");
+    if (value == nullptr || value->empty()) return false;
     length = 0;
-    for (const char value : it->second) {
-        if (value < '0' || value > '9') return false;
-        if (length > (UINT64_MAX - static_cast<uint64_t>(value - '0')) / 10) return false;
-        length = length * 10 + static_cast<uint64_t>(value - '0');
+    for (const char c : *value) {
+        if (c < '0' || c > '9') return false;
+        if (length > (UINT64_MAX - static_cast<uint64_t>(c - '0')) / 10) return false;
+        length = length * 10 + static_cast<uint64_t>(c - '0');
     }
     return true;
 }
@@ -196,7 +211,8 @@ bool StreamingRequest::finish(HttpResponse& response, std::string& error,
     const bool ok = readResponse(fd_, timeoutMs_, response, error, maxReadBytesPerSecond);
     expectedBytes_ = 0;
     sentBytes_ = 0;
-    if(!ok || !keepAlive_ || response.headers["Connection"] == "close") cancel();
+    const std::string* connection = findHeader(response.headers, "Connection");
+    if(!ok || !keepAlive_ || (connection != nullptr && *connection == "close")) cancel();
     return ok;
 }
 

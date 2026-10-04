@@ -13,6 +13,7 @@
 #include <chrono>
 #include <sys/types.h>
 #include <type_traits>
+#include <vector>
 
 
 namespace miniKV{
@@ -40,6 +41,12 @@ struct SendFileResult {
     uint64_t wouldBlockCount = 0;
     uint64_t wouldBlockNanoseconds = 0;
     uint64_t firstAttemptNanoseconds = 0;
+};
+
+struct SendFileSegment {
+    std::string path;
+    off_t offset = 0;
+    size_t size = 0;
 };
 
 struct OutputBufferStats {
@@ -117,6 +124,8 @@ public:
                        SendFileCompleteCallback callback = {});
     void startSendFile(const std::string& filePath, off_t offset, size_t fileSize,
                        SendFileCompleteCallback callback = {});
+    void startSendFileSequence(std::vector<SendFileSegment> segments,
+                               SendFileCompleteCallback callback = {});
 
 private:
 
@@ -127,6 +136,9 @@ private:
     void sendInLoop(const std::string& buf);//？
     void startSendFileInLoop(const std::string& filePath, off_t offset, size_t fileSize,
                              SendFileCompleteCallback callback);
+    void startSendFileSequenceInLoop(std::vector<SendFileSegment> segments,
+                                     SendFileCompleteCallback callback);
+    bool openNextSendFileSegment();
     void finishSendFile(bool success);
     void shutdownInLoop();
     void pauseReadInLoop();
@@ -148,6 +160,7 @@ private:
         int fd = -1;                        // 文件描述符
         off_t  offset = 0;                  // 读盘的物理偏移量
         size_t remaining = 0;               // 剩下多少字节没发完
+        size_t totalRemaining = 0;          // sequence 中尚未发送的总字节
         size_t totalBytes = 0;              // 总共要发送多少字节
         size_t writeCalls = 0;              // 调用了多少次sendfile
         size_t maxBytesPerCall = 0;         // 单次调用sendfile发送的最大字节数
@@ -160,6 +173,8 @@ private:
         bool firstAttemptRecorded = false;
         bool blocked = false;
         SendFileCompleteCallback callback;  // 发完之后通知谁（业务回调函数）
+        std::vector<SendFileSegment> segments;
+        size_t segmentIndex = 0;
     };
     std::unique_ptr<SendFileCtx> sendFileCtx_;
     size_t sendFileQuantum_ = 256 * 1024;
@@ -196,9 +211,6 @@ private:
 }
 
 }
-
-
-
 
 
 

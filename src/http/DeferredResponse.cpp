@@ -49,7 +49,16 @@ void DeferredResponse::completeInLoop(HttpResponse response)
     network::Buffer output;
     response.appendToBuffer(&output);
     connection->send(output.peek(), output.readableBytes());
-    if(response.isSendFile())
+    if(response.hasFileBodySequence())
+    {
+        std::vector<network::SendFileSegment> segments;
+        segments.reserve(response.bodyFileSegments().size());
+        for(const auto& segment : response.bodyFileSegments()) {
+            segments.push_back({segment.filePath, segment.fileOffset, segment.fileSize});
+        }
+        connection->startSendFileSequence(std::move(segments), response.fileCompleteCallback());
+    }
+    else if(response.isSendFile())
     {
         connection->startSendFile(response.bodyFilePath(), response.bodyFileOffset(),
                                   response.bodyFileSize(),

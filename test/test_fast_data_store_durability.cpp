@@ -106,6 +106,28 @@ int main()
         }
     }
 
+    const std::filesystem::path splitDataDirectory =
+        std::filesystem::temp_directory_path() / "minikv_fast_store_split_data_test";
+    const std::filesystem::path splitIndexDirectory =
+        std::filesystem::temp_directory_path() / "minikv_fast_store_split_index_test";
+    std::filesystem::remove_all(splitDataDirectory, error);
+    std::filesystem::remove_all(splitIndexDirectory, error);
+    {
+        miniKV::datanode::FastDataStore::Config splitConfig;
+        splitConfig.durabilityPolicy = miniKV::datanode::DurabilityPolicy::kChunkSync;
+        splitConfig.physicalIndexDirectory = splitIndexDirectory.string();
+        miniKV::datanode::FastDataStore splitStore(splitDataDirectory.string(), splitConfig);
+        if(!splitStore.open() || !writeChunk(splitStore, "split-index", false, true)) {
+            std::cerr << "FAIL: split physical index durability failed\n";
+            return 1;
+        }
+    }
+    if(!std::filesystem::exists(splitIndexDirectory / "CURRENT") ||
+       std::filesystem::exists(splitDataDirectory / "physical_index")) {
+        std::cerr << "FAIL: physical index directory override was not applied\n";
+        return 1;
+    }
+
     const std::filesystem::path groupDirectory =
         std::filesystem::temp_directory_path() / "minikv_fast_store_group_commit_test";
     std::filesystem::remove_all(groupDirectory, error);
@@ -156,19 +178,33 @@ int main()
         const auto groupMetrics = grouped.durabilityMetrics();
         if(groupMetrics.committedBatches != 1 || groupMetrics.committedItems != 4 ||
            groupMetrics.dataSyncOperations != 1 || groupMetrics.indexSyncOperations != 1 ||
-           groupMetrics.lastDurableSequence == 0) {
+           groupMetrics.lastDurableSequence == 0 || groupMetrics.workerCount != 1 ||
+           groupMetrics.lastBatchPendingItems < 4 ||
+           groupMetrics.lastBatchPendingBytes < 1024 * 1024) {
             std::cerr << "FAIL: four chunks were not committed by one durability batch\n";
             return 1;
         }
         uint64_t operationOwners = 0;
         uint64_t timingOwners = 0;
+        uint64_t indexTimingOwners = 0;
         const uint64_t durableSequence = sessions.front()->metrics().durableSequence;
         for(size_t i = 0; i < sessions.size(); ++i) {
             const auto metrics = sessions[i]->metrics();
             operationOwners += metrics.dataSyncOperations;
             timingOwners += metrics.durabilitySyncTimingOwner ? 1 : 0;
+            if(metrics.durabilitySyncTimingOwner) {
+                ++indexTimingOwners;
+                if(metrics.indexNanoseconds == 0 || metrics.indexWriteNanoseconds == 0 ||
+                   metrics.indexBatchBuildNanoseconds == 0) {
+                    std::cerr << "FAIL: index timing breakdown is missing\n";
+                    return 1;
+                }
+            }
             if(!metrics.durable || metrics.durableSequence != durableSequence ||
-               metrics.groupBatchItems != 4 || metrics.groupBatchBytes != 1024 * 1024) {
+               metrics.groupBatchItems != 4 || metrics.groupBatchBytes != 1024 * 1024 ||
+               metrics.durabilityPendingItemsAtEnqueue == 0 ||
+               metrics.durabilityPendingItemsAtBatchStart < 4 ||
+               metrics.durabilityPendingBytesAtBatchStart < 1024 * 1024) {
                 std::cerr << "FAIL: per-chunk group fencing metrics are inconsistent\n";
                 return 1;
             }
@@ -178,7 +214,7 @@ int main()
                 return 1;
             }
         }
-        if(operationOwners != 1 || timingOwners != 1) {
+        if(operationOwners != 1 || timingOwners != 1 || indexTimingOwners != 1) {
             std::cerr << "FAIL: per-chunk metrics double counted grouped fdatasync\n";
             return 1;
         }

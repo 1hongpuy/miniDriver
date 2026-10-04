@@ -13,6 +13,7 @@ gateway_port="${MINIKV_V2_BENCH_GATEWAY_PORT:-18181}"
 node_a_port="${MINIKV_V2_BENCH_NODE_A_PORT:-19102}"
 node_c_port="${MINIKV_V2_BENCH_NODE_C_PORT:-19103}"
 node_count="${MINIKV_V2_BENCH_NODE_COUNT:-2}"
+advertise_address="${MINIKV_V2_BENCH_ADVERTISE_ADDRESS:-127.0.0.1}"
 pid_file="${root_dir}/pids"
 
 if [[ ! "${node_count}" =~ ^[1-4]$ ]]; then
@@ -46,7 +47,7 @@ for ((index = 0; index < node_count; ++index)); do
     node_id="${node_ids[index]}"
     node_port="${node_ports[index]}"
     mkdir -p "${root_dir}/node-${node_id}"
-    nohup "${bin_dir}/minikv_v2_datanode" "bench-${node_id}" "127.0.0.1" "${node_port}" \
+    nohup "${bin_dir}/minikv_v2_datanode" "bench-${node_id}" "${advertise_address}" "${node_port}" \
         "${root_dir}/node-${node_id}" "127.0.0.1" "${gateway_port}" \
         >"${root_dir}/logs/node-${node_id}.out.log" 2>"${root_dir}/logs/node-${node_id}.err.log" &
     pids+=("$!")

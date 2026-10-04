@@ -27,9 +27,9 @@ type PutOptions struct {
 
 type ReadOptions struct {
 	// DisableChecksum is opt-out. The zero value verifies every whole Chunk.
-	DisableChecksum     bool
-	AllowReplicaRetry   bool
-	MaxReplicaAttempts  int
+	DisableChecksum    bool
+	AllowReplicaRetry  bool
+	MaxReplicaAttempts int
 }
 
 type ObjectInfo struct {
@@ -54,21 +54,40 @@ type ObjectReadHints struct {
 	Candidates []NodeReadHint `json:"candidates"`
 }
 
+// ObjectLayout is static placement metadata. It contains no short-lived
+// DataNode read capability and is safe for a scheduler to persist as a hint.
+type ObjectLayout struct {
+	ObjectRef
+	Version uint64              `json:"version"`
+	Size    uint64              `json:"size"`
+	Chunks  []ObjectLayoutChunk `json:"chunks"`
+}
+
+type ObjectLayoutChunk struct {
+	Index          uint32   `json:"index"`
+	ChunkID        string   `json:"chunkId"`
+	Offset         uint64   `json:"offset"`
+	Size           uint64   `json:"size"`
+	ChecksumType   string   `json:"checksumType"`
+	ChecksumDigest string   `json:"checksumDigest"`
+	Replicas       []string `json:"replicas"`
+}
+
 type ReplicaTarget struct {
 	NodeID   string `json:"nodeId"`
 	Address  string `json:"address"`
-	HTTPPort uint16 `json:"httpPort"`
+	HTTPPort uint16 `json:"port"`
 }
 
 type ChunkReadPlan struct {
-	Index          uint32          `json:"index"`
-	ChunkID        string          `json:"chunkId"`
+	Index           uint32          `json:"index"`
+	ChunkID         string          `json:"chunkId"`
 	StorageIdentity string          `json:"storageIdentity"`
-	Size           uint64          `json:"size"`
-	ChecksumType   string          `json:"checksumType"`
-	ChecksumDigest string          `json:"checksumDigest"`
-	ReadCapability string          `json:"readCapability"`
-	Replicas       []ReplicaTarget `json:"replicas"`
+	Size            uint64          `json:"size"`
+	ChecksumType    string          `json:"checksumType"`
+	ChecksumDigest  string          `json:"checksumDigest"`
+	ReadCapability  string          `json:"readCapability"`
+	Replicas        []ReplicaTarget `json:"replicas"`
 }
 
 type ObjectReadPlan struct {

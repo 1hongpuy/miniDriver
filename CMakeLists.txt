@@ -12,12 +12,47 @@ set_property(CACHE CMAKE_BUILD_TYPE PROPERTY STRINGS
 
 option(MINIKV_ENABLE_FRAME_POINTERS
     "Keep frame pointers for perf and flame graph profiling" ON)
+option(MINIKV_ENABLE_NURAFT
+    "Build the MiniDriver 4.0 Metadata Raft adapter" OFF)
+option(MINIKV_BUILD_QT_CLIENT
+    "Build the MiniDriver Qt desktop client" OFF)
+option(MINIKV_DESKTOP_CLIENT_ONLY
+    "Build only the portable SDK and Qt desktop client (for native Windows delivery)" OFF)
+set(MINIKV_NURAFT_SOURCE_DIR "" CACHE PATH
+    "Path to a pinned NuRaft source tree (v2.1.0 is supported by CMake 3.22)")
 if (MINIKV_ENABLE_FRAME_POINTERS)
     add_compile_options(-fno-omit-frame-pointer)
 endif()
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED True)
+
+# The server side intentionally remains Linux/epoll based.  This small build
+# graph is the supported native-Windows route: it contains only the public
+# synchronous SDK, OpenSSL utilities, and the Qt client, not DataNode,
+# LevelDB, K3s, or the Linux Reactor implementation.
+if(MINIKV_DESKTOP_CLIENT_ONLY)
+    if(NOT MINIKV_BUILD_QT_CLIENT)
+        message(FATAL_ERROR "MINIKV_DESKTOP_CLIENT_ONLY requires MINIKV_BUILD_QT_CLIENT=ON")
+    endif()
+    find_package(OpenSSL REQUIRED)
+    add_library(minikv_utils STATIC src/utils/Util.cpp)
+    add_library(minikv_client_transport STATIC src/client/HttpTransport.cpp)
+    add_library(minikv_client STATIC src/client/MiniDriverClient.cpp)
+    target_include_directories(minikv_utils PUBLIC include)
+    target_include_directories(minikv_client_transport PUBLIC include)
+    target_include_directories(minikv_client PUBLIC include)
+    target_link_libraries(minikv_utils PUBLIC OpenSSL::Crypto)
+    target_link_libraries(minikv_client PUBLIC minikv_client_transport minikv_utils OpenSSL::Crypto)
+    if(WIN32)
+        target_link_libraries(minikv_client_transport PUBLIC ws2_32)
+    else()
+        target_link_libraries(minikv_client_transport PUBLIC pthread)
+        target_link_libraries(minikv_client PUBLIC pthread)
+    endif()
+    add_subdirectory(QTClient)
+    return()
+endif()
 
 #统一输出路径
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
@@ -41,6 +76,10 @@ list(REMOVE_ITEM DATANODE_SRC "${CMAKE_CURRENT_SOURCE_DIR}/src/DataNode/datanode
 file(GLOB_RECURSE AGENT_SRC src/agent/*.cpp)
 list(REMOVE_ITEM AGENT_SRC "${CMAKE_CURRENT_SOURCE_DIR}/src/agent/node_agent_main.cpp") # 排除 gateway_main.cpp
 file(GLOB_RECURSE METADATA_SRC src/metadata/*.cpp)
+list(REMOVE_ITEM METADATA_SRC "${CMAKE_CURRENT_SOURCE_DIR}/src/metadata/metadata_service_main.cpp")
+list(REMOVE_ITEM METADATA_SRC "${CMAKE_CURRENT_SOURCE_DIR}/src/metadata/metadata_command_tool.cpp")
+list(REMOVE_ITEM METADATA_SRC "${CMAKE_CURRENT_SOURCE_DIR}/src/metadata/raft/NuRaftAdapters.cpp")
+file(GLOB_RECURSE SEARCH_SRC src/search/*.cpp)
 
 add_library(minikv_net STATIC ${NET_SRC})
 add_library(minikv_storage STATIC ${STORAGE_SRC})
@@ -51,8 +90,13 @@ add_library(minikv_http STATIC ${HTTP_SRC})
 add_library(minikv_agent STATIC ${AGENT_SRC})
 add_library(minikv_datanode STATIC ${DATANODE_SRC})
 add_library(minikv_metadata STATIC ${METADATA_SRC})
+add_library(minikv_search STATIC ${SEARCH_SRC})
 add_library(minikv_client_transport STATIC src/client/HttpTransport.cpp)
 add_library(minikv_client STATIC src/client/MiniDriverClient.cpp)
+
+add_executable(minidriver_edge_cache
+    src/edge/edge_cache_main.cpp
+    src/edge/EdgeCacheStore.cpp)
 
 target_include_directories(minikv_net PUBLIC include)
 target_include_directories(minikv_storage PUBLIC include)
@@ -63,6 +107,7 @@ target_include_directories(minikv_http PUBLIC include)
 target_include_directories(minikv_agent PUBLIC include)
 target_include_directories(minikv_datanode PUBLIC include)
 target_include_directories(minikv_metadata PUBLIC include)
+target_include_directories(minikv_search PUBLIC include)
 target_include_directories(minikv_client_transport PUBLIC include)
 target_include_directories(minikv_client PUBLIC include)
 
@@ -79,11 +124,42 @@ find_library(LIBRAW_LIB raw REQUIRED)
 target_link_libraries(minikv_utils PUBLIC spdlog::spdlog OpenSSL::Crypto)
 target_include_directories(minikv_media PUBLIC ${HIREDIS_INC} ${LIBRAW_INC})
 target_link_libraries(minikv_media PUBLIC minikv_utils ${HIREDIS_LIB} ${LIBRAW_LIB})
-target_link_libraries(minikv_gateway PUBLIC minikv_media)
+target_link_libraries(minikv_gateway PUBLIC minikv_media minikv_metadata)
 target_link_libraries(minikv_http PUBLIC minikv_utils)
 target_link_libraries(minikv_agent PUBLIC minikv_utils)
 target_link_libraries(minikv_client_transport PUBLIC pthread)
 target_link_libraries(minikv_client PUBLIC minikv_client_transport minikv_utils OpenSSL::Crypto pthread)
+target_link_libraries(minidriver_edge_cache PRIVATE minikv_client minikv_http minikv_net minikv_utils pthread)
+target_link_libraries(minikv_search PUBLIC pthread)
+target_link_libraries(minikv_metadata PUBLIC OpenSSL::Crypto minikv_client_transport)
+
+if(MINIKV_ENABLE_NURAFT)
+    if(NOT MINIKV_NURAFT_SOURCE_DIR OR
+       NOT EXISTS "${MINIKV_NURAFT_SOURCE_DIR}/CMakeLists.txt")
+        message(FATAL_ERROR
+            "MINIKV_ENABLE_NURAFT requires -DMINIKV_NURAFT_SOURCE_DIR=<pinned NuRaft source>")
+    endif()
+    set(BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
+    add_subdirectory("${MINIKV_NURAFT_SOURCE_DIR}"
+                     "${CMAKE_BINARY_DIR}/third_party/nuraft" EXCLUDE_FROM_ALL)
+    if(TARGET NuRaft::static_lib)
+        set(MINIKV_NURAFT_TARGET NuRaft::static_lib)
+    elseif(TARGET static_lib)
+        set(MINIKV_NURAFT_TARGET static_lib)
+    else()
+        message(FATAL_ERROR "NuRaft static library target was not created")
+    endif()
+    add_library(minikv_metadata_raft STATIC
+        src/metadata/raft/NuRaftAdapters.cpp)
+    target_include_directories(minikv_metadata_raft PUBLIC
+        include ${LEVELDB_INC}
+        "${MINIKV_NURAFT_SOURCE_DIR}/include")
+    target_compile_definitions(minikv_metadata_raft PUBLIC
+        MINIKV_ENABLE_NURAFT=1)
+    target_link_libraries(minikv_metadata_raft PUBLIC
+        minikv_metadata minikv_utils ${MINIKV_NURAFT_TARGET} ${LEVELDB_LIB}
+        OpenSSL::SSL OpenSSL::Crypto pthread)
+endif()
 
 add_library(minikv_benchmark STATIC
     src/benchmark/BenchmarkCli.cpp
@@ -111,6 +187,7 @@ add_executable(minikv_v2_datanode src/DataNode/datanode_main.cpp)
 target_include_directories(minikv_v2_datanode PRIVATE ${LEVELDB_INC})
 target_link_libraries(minikv_v2_datanode PRIVATE
     minikv_datanode
+    minikv_metadata
     minikv_http
     minikv_net
     minikv_utils
@@ -230,6 +307,36 @@ target_include_directories(test_http_file_response PRIVATE include)
 add_executable(test_gateway_write_lease test/test_gateway_write_lease.cpp)
 target_include_directories(test_gateway_write_lease PRIVATE ${LEVELDB_INC})
 target_link_libraries(test_gateway_write_lease PRIVATE
+    minikv_gateway
+    minikv_utils
+    ${LEVELDB_LIB}
+    pthread
+    OpenSSL::Crypto
+)
+
+add_executable(test_gateway_lock_manager test/test_gateway_lock_manager.cpp)
+target_include_directories(test_gateway_lock_manager PRIVATE ${LEVELDB_INC})
+target_link_libraries(test_gateway_lock_manager PRIVATE
+    minikv_gateway
+    minikv_utils
+    ${LEVELDB_LIB}
+    pthread
+    OpenSSL::Crypto
+)
+
+add_executable(test_gateway_reservation_concurrency test/test_gateway_reservation_concurrency.cpp)
+target_include_directories(test_gateway_reservation_concurrency PRIVATE ${LEVELDB_INC})
+target_link_libraries(test_gateway_reservation_concurrency PRIVATE
+    minikv_gateway
+    minikv_utils
+    ${LEVELDB_LIB}
+    pthread
+    OpenSSL::Crypto
+)
+
+add_executable(test_gateway_reservation_recovery test/test_gateway_reservation_recovery.cpp)
+target_include_directories(test_gateway_reservation_recovery PRIVATE ${LEVELDB_INC})
+target_link_libraries(test_gateway_reservation_recovery PRIVATE
     minikv_gateway
     minikv_utils
     ${LEVELDB_LIB}
@@ -390,6 +497,11 @@ target_link_libraries(test_read_capability PRIVATE minikv_utils OpenSSL::Crypto)
 add_executable(test_http_range test/test_http_range.cpp)
 target_link_libraries(test_http_range PRIVATE minikv_http minikv_utils)
 
+add_executable(test_edge_cache_store
+    test/test_edge_cache_store.cpp
+    src/edge/EdgeCacheStore.cpp)
+target_link_libraries(test_edge_cache_store PRIVATE minikv_client minikv_utils OpenSSL::Crypto pthread)
+
 add_executable(test_checksum_and_opaque_store test/test_checksum_and_opaque_store.cpp)
 target_include_directories(test_checksum_and_opaque_store PRIVATE ${LEVELDB_INC} test)
 target_link_libraries(test_checksum_and_opaque_store PRIVATE
@@ -493,13 +605,71 @@ add_executable(test_metadata_snapshot test/test_metadata_snapshot.cpp)
 target_include_directories(test_metadata_snapshot PRIVATE include test)
 target_link_libraries(test_metadata_snapshot PRIVATE minikv_metadata)
 
+add_executable(test_metadata_snapshot_store test/test_metadata_snapshot_store.cpp)
+target_include_directories(test_metadata_snapshot_store PRIVATE include test)
+target_link_libraries(test_metadata_snapshot_store PRIVATE minikv_metadata)
+
+add_executable(test_metadata_soft_state test/test_metadata_soft_state.cpp)
+target_include_directories(test_metadata_soft_state PRIVATE include test)
+target_link_libraries(test_metadata_soft_state PRIVATE minikv_metadata)
+
+add_executable(test_metadata_service test/test_metadata_service.cpp)
+target_include_directories(test_metadata_service PRIVATE include test)
+target_link_libraries(test_metadata_service PRIVATE minikv_metadata)
+
+if(MINIKV_ENABLE_NURAFT)
+    add_executable(test_metadata_nuraft_adapter
+        test/test_metadata_nuraft_adapter.cpp)
+    target_include_directories(test_metadata_nuraft_adapter PRIVATE include test)
+    target_link_libraries(test_metadata_nuraft_adapter PRIVATE
+        minikv_metadata_raft)
+endif()
+
+add_executable(test_search_index test/test_search_index.cpp)
+target_include_directories(test_search_index PRIVATE include)
+target_link_libraries(test_search_index PRIVATE minikv_search pthread)
+
+add_executable(minikv_search_node src/search_node_main.cpp)
+target_include_directories(minikv_search_node PRIVATE include)
+target_link_libraries(minikv_search_node PRIVATE minikv_search minikv_http minikv_net minikv_utils pthread)
+
+add_executable(minikv_metadata_service src/metadata/metadata_service_main.cpp)
+target_include_directories(minikv_metadata_service PRIVATE include)
+target_link_libraries(minikv_metadata_service PRIVATE
+    minikv_metadata minikv_http minikv_net minikv_utils OpenSSL::Crypto pthread)
+
+add_executable(minikv_metadata_command_tool
+    src/metadata/metadata_command_tool.cpp)
+target_include_directories(minikv_metadata_command_tool PRIVATE include)
+target_link_libraries(minikv_metadata_command_tool PRIVATE minikv_metadata)
+
+if(MINIKV_ENABLE_NURAFT)
+    add_executable(minikv_metadata_raft_service
+        src/metadata/metadata_service_main.cpp)
+    target_include_directories(minikv_metadata_raft_service PRIVATE include)
+    target_compile_definitions(minikv_metadata_raft_service PRIVATE
+        MINIKV_METADATA_RAFT_BINARY=1)
+    target_link_libraries(minikv_metadata_raft_service PRIVATE
+        minikv_metadata_raft minikv_http minikv_net minikv_utils
+        ${MINIKV_NURAFT_TARGET} OpenSSL::SSL OpenSSL::Crypto pthread)
+endif()
+
 add_executable(minikv_v2_bench src/benchmark/benchmark_main.cpp)
 target_link_libraries(minikv_v2_bench PRIVATE minikv_benchmark)
+
+# A standalone diagnostic utility. It writes only a private scratch file under
+# the directory supplied at runtime and is intentionally independent of the
+# DataNode/LevelDB/Raft implementations.
+add_executable(minikv_storage_sync_probe src/diagnostics/storage_sync_probe.cpp)
 
 # Minimal native Worker entry point. It is intentionally a consumer of the
 # public SDK rather than another DataNode/extent reader.
 add_executable(minidriver_client_worker src/client/minidriver_client_worker_main.cpp)
 target_link_libraries(minidriver_client_worker PRIVATE minikv_client)
+
+if(MINIKV_BUILD_QT_CLIENT)
+    add_subdirectory(QTClient)
+endif()
 
 if(BUILD_TESTING)
     add_test(NAME async_http_timeout COMMAND test_async_http_timeout)
@@ -517,6 +687,9 @@ if(BUILD_TESTING)
     add_test(NAME tcp_sendfile_offset COMMAND test_tcp_sendfile_offset)
     add_test(NAME http_file_response COMMAND test_http_file_response)
     add_test(NAME gateway_write_lease COMMAND test_gateway_write_lease)
+    add_test(NAME gateway_lock_manager COMMAND test_gateway_lock_manager)
+    add_test(NAME gateway_reservation_concurrency COMMAND test_gateway_reservation_concurrency)
+    add_test(NAME gateway_reservation_recovery COMMAND test_gateway_reservation_recovery)
     add_test(NAME gateway_manifest_snapshot COMMAND test_gateway_manifest_snapshot)
     add_test(NAME gateway_route_retry_identity COMMAND test_gateway_route_retry_identity)
     add_test(NAME gateway_catalog COMMAND test_gateway_catalog)
@@ -547,6 +720,7 @@ if(BUILD_TESTING)
     add_test(NAME chunk_write_protocol COMMAND test_chunk_write_protocol)
     add_test(NAME read_capability COMMAND test_read_capability)
     add_test(NAME http_range COMMAND test_http_range)
+    add_test(NAME edge_cache_store COMMAND test_edge_cache_store)
     add_test(NAME checksum_and_opaque_store COMMAND test_checksum_and_opaque_store)
     add_test(NAME media_job COMMAND test_media_job)
     add_test(NAME gateway_media_jobs COMMAND test_gateway_media_jobs)
@@ -571,6 +745,19 @@ if(BUILD_TESTING)
     add_test(NAME minidriver_client COMMAND test_minidriver_client)
     add_test(NAME metadata_state_machine COMMAND test_metadata_state_machine)
     add_test(NAME metadata_snapshot COMMAND test_metadata_snapshot)
+    add_test(NAME metadata_snapshot_store COMMAND test_metadata_snapshot_store)
+    add_test(NAME metadata_soft_state COMMAND test_metadata_soft_state)
+    add_test(NAME metadata_service COMMAND test_metadata_service)
+    if(MINIKV_ENABLE_NURAFT)
+        add_test(NAME metadata_nuraft_adapter COMMAND test_metadata_nuraft_adapter)
+    endif()
+    add_test(NAME search_index COMMAND test_search_index)
+    add_test(NAME search_node_http
+             COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/test/test_search_node_http.sh
+                          ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/minikv_search_node)
+    add_test(NAME search_document_replay
+             COMMAND python3 ${CMAKE_CURRENT_SOURCE_DIR}/test/test_search_document_replay.py
+                             ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/minikv_search_node)
 endif()
 
 # 链接上面打包好的网络静态库

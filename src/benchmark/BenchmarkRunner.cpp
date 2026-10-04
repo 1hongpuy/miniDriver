@@ -14,11 +14,13 @@
 #include <fstream>
 #include <iomanip>
 #include <iostream>
+#include <iterator>
 #include <mutex>
 #include <openssl/evp.h>
 #include <set>
 #include <sstream>
 #include <thread>
+#include <unordered_set>
 #include <utility>
 
 namespace miniKV::benchmark {
@@ -37,10 +39,16 @@ struct DownloadTransportStats {
 class ChunkBudget {
 public:
     explicit ChunkBudget(uint32_t limit) : limit_(limit) {}
-    void acquire() {
+    double acquireTimed() {
+        const auto started = std::chrono::steady_clock::now();
         std::unique_lock<std::mutex> lock(mutex_);
         cv_.wait(lock, [&] { return active_ < limit_; });
         ++active_;
+        return std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - started).count();
+    }
+    void acquire() {
+        (void)acquireTimed();
     }
     void release() {
         {
@@ -401,14 +409,17 @@ RunRecord runOne(const BenchmarkOptions& options, uint64_t size, uint32_t runInd
     uploadOptions.chunkWindow = options.chunkWindow;
     uploadOptions.checksumType = options.uploadChecksumType;
     if (chunkBudget != nullptr) {
-        uploadOptions.acquireChunk = [chunkBudget] { chunkBudget->acquire(); };
+        uploadOptions.acquireChunkTimed = [chunkBudget] { return chunkBudget->acquireTimed(); };
         uploadOptions.releaseChunk = [chunkBudget] { chunkBudget->release(); };
     }
     miniKV::client::UploadResult uploaded;
     if (!client.uploadFile(inputPath, record.runId + ".bin", options.remoteDir, uploadOptions, uploaded, error)) {
+        record.uploadTimings = uploaded.timings;
         record.error = error; return record;
     }
     record.chunkCount = uploaded.chunkCount;
+    record.uploadTimings = uploaded.timings;
+    record.uploadSessionId = uploaded.sessionId;
     record.fileHash = uploaded.fileHash;
     record.objectId = uploaded.object.objectId;
     record.objectVersion = uploaded.object.objectVersion;
@@ -456,6 +467,260 @@ RunRecord runOne(const BenchmarkOptions& options, uint64_t size, uint32_t runInd
     return record;
 }
 
+uint32_t durationDownloadWorkers(const BenchmarkOptions& options)
+{
+    if (options.mode == BenchmarkMode::kDownloadOnly) return options.concurrency;
+    if (options.mode != BenchmarkMode::kMixed || options.readSharePercent == 0) return 0;
+    const uint32_t workers = (options.concurrency * options.readSharePercent) / 100;
+    return std::max<uint32_t>(1, workers);
+}
+
+void stampRecord(RunRecord& record, std::chrono::steady_clock::time_point steadyStart,
+                 std::chrono::steady_clock::time_point operationStart,
+                 std::chrono::steady_clock::time_point operationEnd)
+{
+    record.startOffsetMs = std::chrono::duration<double, std::milli>(operationStart - steadyStart).count();
+    record.endOffsetMs = std::chrono::duration<double, std::milli>(operationEnd - steadyStart).count();
+}
+
+std::vector<std::string> splitCsvRow(const std::string& row)
+{
+    std::vector<std::string> cells;
+    std::string cell;
+    bool quoted = false;
+    for (size_t index = 0; index < row.size(); ++index) {
+        const char character = row[index];
+        if (character == '"') {
+            if (quoted && index + 1 < row.size() && row[index + 1] == '"') {
+                cell += character;
+                ++index;
+            } else {
+                quoted = !quoted;
+            }
+        } else if (character == ',' && !quoted) {
+            cells.push_back(std::move(cell));
+            cell.clear();
+        } else {
+            cell += character;
+        }
+    }
+    cells.push_back(std::move(cell));
+    return cells;
+}
+
+bool loadDurationFixtures(const BenchmarkOptions& options, uint32_t wanted,
+                          std::vector<RunRecord>& fixtures, std::string& error)
+{
+    std::ifstream input(options.downloadFixtureManifest);
+    if (!input) {
+        error = "cannot open --download-fixture-manifest: " + options.downloadFixtureManifest.string();
+        return false;
+    }
+    std::string line;
+    if (!std::getline(input, line)) {
+        error = "download fixture manifest is empty";
+        return false;
+    }
+    const std::vector<std::string> header = splitCsvRow(line);
+    const auto column = [&header](const std::string& name) -> size_t {
+        const auto found = std::find(header.begin(), header.end(), name);
+        return found == header.end() ? header.size() : static_cast<size_t>(found - header.begin());
+    };
+    const size_t operation = column("operation");
+    const size_t objectId = column("object_id");
+    const size_t objectVersion = column("object_version");
+    const size_t fileHash = column("file_hash");
+    const size_t inputHash = column("input_hash");
+    const size_t sizeBytes = column("size_bytes");
+    const size_t chunkCount = column("chunk_count");
+    if (operation == header.size() || objectId == header.size() || objectVersion == header.size() ||
+        fileHash == header.size() || inputHash == header.size() || sizeBytes == header.size() ||
+        chunkCount == header.size()) {
+        error = "download fixture manifest lacks required runs.csv columns";
+        return false;
+    }
+    std::unordered_set<std::string> seen;
+    while (std::getline(input, line) && (wanted == 0 || fixtures.size() < wanted)) {
+        const std::vector<std::string> row = splitCsvRow(line);
+        const size_t required = std::max({operation, objectId, objectVersion, fileHash, inputHash, sizeBytes, chunkCount});
+        if (row.size() <= required || row[operation] != "download" || row[objectId].empty()) continue;
+        try {
+            RunRecord fixture;
+            fixture.objectId = row[objectId];
+            fixture.objectVersion = std::stoull(row[objectVersion]);
+            fixture.fileHash = row[fileHash];
+            fixture.inputHash = row[inputHash];
+            fixture.sizeBytes = std::stoull(row[sizeBytes]);
+            fixture.chunkCount = static_cast<uint32_t>(std::stoul(row[chunkCount]));
+            if (fixture.sizeBytes != options.sizes.front() || fixture.objectVersion == 0 ||
+                fixture.chunkCount == 0 || fixture.fileHash.empty() || fixture.inputHash.empty()) continue;
+            const std::string key = fixture.objectId + ":" + std::to_string(fixture.objectVersion);
+            if (seen.insert(key).second) {
+                fixture.runId = "external-fixture-" + std::to_string(fixtures.size());
+                fixture.uploadOk = true;
+                fixture.downloadOk = true;
+                fixture.operation = "download";
+                fixtures.push_back(std::move(fixture));
+            }
+        } catch (const std::exception&) {
+            continue;
+        }
+    }
+    if (fixtures.empty()) {
+        error = "download fixture manifest contains no valid matching ObjectRef entries";
+        return false;
+    }
+    if (wanted > 0 && fixtures.size() < wanted) {
+        error = "download fixture manifest has fewer distinct ObjectRefs than --download-fixtures";
+        return false;
+    }
+    return true;
+}
+
+int runDurationBenchmark(const BenchmarkOptions& options, std::ostream& console)
+{
+    std::error_code error;
+    const uint32_t downloadWorkers = durationDownloadWorkers(options);
+    const uint32_t uploadWorkers = options.concurrency - downloadWorkers;
+    const uint32_t fixtureCount = downloadWorkers == 0 ? 0 :
+        (options.downloadFixtureCount == 0 ? downloadWorkers : options.downloadFixtureCount);
+    std::vector<RunRecord> fixtures;
+    if (downloadWorkers > 0) {
+        if (!options.downloadFixtureManifest.empty()) {
+            std::string fixtureError;
+            if (!loadDurationFixtures(options, fixtureCount, fixtures, fixtureError)) {
+                console << "duration fixture manifest FAILED: " << fixtureError << '\n';
+                return 1;
+            }
+            console << "reusing " << fixtures.size() << " duration fixtures from "
+                    << options.downloadFixtureManifest << '\n';
+        } else {
+            fixtures.resize(fixtureCount);
+            BenchmarkOptions fixtureOptions = options;
+            fixtureOptions.mode = BenchmarkMode::kUploadOnly;
+            fixtureOptions.durationSeconds = 0;
+            fixtureOptions.warmupSeconds = 0;
+            for (uint32_t index = 0; index < fixtureCount; ++index) {
+                std::ostringstream fixtureLog;
+                fixtures[index] = runOne(fixtureOptions, options.sizes.front(),
+                    4000000U + index, fixtureLog);
+                fixtures[index].operation = "download";
+                std::filesystem::remove(options.workDir / (fixtures[index].runId + ".input"), error);
+                if (!fixtures[index].error.empty()) {
+                    console << "duration fixture FAILED: " << fixtures[index].error << '\n';
+                    return 1;
+                }
+            }
+        }
+        if (options.fixtureSettleMs > 0) {
+            console << "waiting " << options.fixtureSettleMs
+                    << " ms for duration fixture load reporting to settle\n";
+            std::this_thread::sleep_for(std::chrono::milliseconds(options.fixtureSettleMs));
+        }
+    }
+
+    const auto runPhase = [&](uint32_t seconds, bool collect,
+                              std::chrono::steady_clock::time_point steadyStart,
+                              std::vector<RunRecord>& output) {
+        if (seconds == 0) return;
+        const auto phaseStart = std::chrono::steady_clock::now();
+        const auto deadline = phaseStart + std::chrono::seconds(seconds);
+        ChunkBudget chunkBudget(options.globalChunkBudget);
+        std::vector<std::vector<RunRecord>> workerRecords(options.concurrency);
+        std::vector<std::thread> workers;
+        std::atomic<uint64_t> fixtureCursor{0};
+        // Warmup uploads are real committed objects.  Their catalog names
+        // must never be reused by steady-state uploads, and a per-worker
+        // counter can also overlap at high IOPS.  Allocate every upload
+        // index atomically from a phase-specific range instead.
+        std::atomic<uint32_t> uploadRunIndex{collect ? 1000000000U : 500000000U};
+        workers.reserve(options.concurrency);
+        for (uint32_t worker = 0; worker < options.concurrency; ++worker) {
+            workers.emplace_back([&, worker] {
+                miniKV::client::ClientConfig persistentConfig;
+                persistentConfig.gateway = options.gateway;
+                persistentConfig.clusterInternalToken = options.clusterInternalToken;
+                persistentConfig.servicePrincipal = options.servicePrincipal;
+                miniKV::client::MiniDriverClient persistentClient(std::move(persistentConfig));
+                uint64_t sequence = 0;
+                while (std::chrono::steady_clock::now() < deadline) {
+                    const auto operationStart = std::chrono::steady_clock::now();
+                    RunRecord record;
+                    if (worker < downloadWorkers) {
+                        const RunRecord& fixture = fixtures[
+                            static_cast<size_t>(fixtureCursor.fetch_add(1)) % fixtures.size()];
+                        record = fixture;
+                        record.runId += "-duration-reader-" + std::to_string(worker + 1) +
+                            "-op-" + std::to_string(++sequence);
+                        std::ostringstream operationLog;
+                        record = runDownloadOne(options, record, operationLog,
+                            options.keepAlive ? &persistentClient : nullptr);
+                        std::error_code removeError;
+                        std::filesystem::remove(options.workDir / (record.runId + ".download"), removeError);
+                    } else {
+                        BenchmarkOptions uploadOptions = options;
+                        uploadOptions.mode = BenchmarkMode::kUploadOnly;
+                        std::ostringstream operationLog;
+                        record = runOne(uploadOptions, options.sizes.front(),
+                            uploadRunIndex.fetch_add(1), operationLog, &chunkBudget);
+                        std::error_code removeError;
+                        std::filesystem::remove(options.workDir / (record.runId + ".input"), removeError);
+                    }
+                    const auto operationEnd = std::chrono::steady_clock::now();
+                    const bool failed = !record.error.empty();
+                    if (collect) {
+                        stampRecord(record, steadyStart, operationStart, operationEnd);
+                        workerRecords[worker].push_back(std::move(record));
+                    }
+                    // A duration run must not turn an unavailable Gateway or
+                    // a saturated admission queue into a tight error loop.
+                    // Keep failures observable, but yield briefly before the
+                    // next attempt so the test does not become its own DoS.
+                    if (failed) {
+                        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                    }
+                }
+            });
+        }
+        for (std::thread& worker : workers) worker.join();
+        if (collect) {
+            for (auto& records : workerRecords) {
+                output.insert(output.end(),
+                    std::make_move_iterator(records.begin()),
+                    std::make_move_iterator(records.end()));
+            }
+        }
+    };
+
+    console << "duration workload warmup=" << options.warmupSeconds
+            << "s steady=" << options.durationSeconds << "s concurrency="
+            << options.concurrency << " upload_workers=" << uploadWorkers
+            << " download_workers=" << downloadWorkers << '\n';
+    runPhase(options.warmupSeconds, false, {}, fixtures /* unused output */);
+    const auto steadyStart = std::chrono::steady_clock::now();
+    std::vector<RunRecord> records;
+    runPhase(options.durationSeconds, true, steadyStart, records);
+
+    std::vector<SizeSummary> summaries;
+    for (const uint64_t size : options.sizes) {
+        const uint32_t requested = static_cast<uint32_t>(std::count_if(
+            records.begin(), records.end(), [size](const RunRecord& record) {
+                return record.sizeBytes == size;
+            }));
+        summaries.push_back(summarize(size, requested, records, options.mode));
+    }
+    if (!writeReports(options, records, summaries, error)) {
+        console << "cannot write benchmark reports: " << error.message() << '\n';
+        return 2;
+    }
+    const bool allSucceeded = !records.empty() && std::all_of(records.begin(), records.end(),
+        [](const RunRecord& record) {
+            return record.uploadOk && record.downloadOk && record.error.empty();
+        });
+    console << "duration records=" << records.size() << " reports: " << options.workDir << "\n";
+    return allSucceeded ? 0 : 1;
+}
+
 }
 
 BenchmarkRunner::BenchmarkRunner(BenchmarkOptions options) : options_(std::move(options)) {}
@@ -466,6 +731,9 @@ int BenchmarkRunner::run(std::ostream& console) {
     if (filesystemError) {
         console << "cannot create work directory: " << filesystemError.message() << '\n';
         return 2;
+    }
+    if (options_.durationSeconds > 0) {
+        return runDurationBenchmark(options_, console);
     }
     if (options_.readProfile == BenchmarkReadProfile::kMixedSize) {
         // Prepare one immutable fixture per size, then run readers for every
@@ -651,9 +919,7 @@ int BenchmarkRunner::run(std::ostream& console) {
                     << " concurrency=" << options_.concurrency << '\n';
             std::vector<RunRecord> roundRecords(options_.concurrency);
             std::vector<std::string> workerLogs(options_.concurrency);
-            const uint32_t downloadWorkers = options_.mode == BenchmarkMode::kDownloadOnly
-                ? options_.concurrency
-                : options_.mode == BenchmarkMode::kMixed ? options_.concurrency / 2 : 0;
+            const uint32_t downloadWorkers = durationDownloadWorkers(options_);
             ChunkBudget chunkBudget(options_.globalChunkBudget);
             std::vector<RunRecord> downloadFixtures(downloadWorkers);
             if (downloadWorkers > 0) {

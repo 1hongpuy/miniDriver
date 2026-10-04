@@ -2,6 +2,7 @@
 #include "gateway/GatewayState.hpp"
 
 #include <filesystem>
+#include <cstdlib>
 #include <vector>
 
 namespace {
@@ -27,6 +28,7 @@ std::vector<std::string> nodeIds(const miniKV::gateway::PlacementPlan& plan)
 
 int main()
 {
+    setenv("MINIKV_GATEWAY_AI_OUTBOX_ENABLED", "1", 1);
     const auto directory = std::filesystem::temp_directory_path() / "minikv_gateway_ai_index_outbox_test";
     std::error_code error;
     std::filesystem::remove_all(directory, error);

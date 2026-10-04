@@ -4,6 +4,8 @@
 #include "network/TcpConnection.hpp"
 #include "network/channel.hpp"
 #include <cassert>
+#include <cstring>
+#include <netdb.h>
 #include <memory>
 #include <unistd.h>
 #include <utility>
@@ -58,10 +60,26 @@ void TcpClient::connectInLoop(std::string addr, int port)
     servaddr.sin_port = htons(port);
     if(::inet_pton(AF_INET, addr.c_str(), &servaddr.sin_addr) <= 0)
     {
-        ::close(sockfd);
-        if(connectionCallback_) connectionCallback_(nullptr);
-        releaseLifetimeInLoop();
-        return ;
+        // Compose and service-discovery deployments pass names such as
+        // "gw-1". Resolve those names before using the existing AF_INET
+        // non-blocking connect path; literal addresses keep the fast path.
+        struct addrinfo hints = {};
+        hints.ai_family = AF_INET;
+        hints.ai_socktype = SOCK_STREAM;
+        hints.ai_protocol = IPPROTO_TCP;
+        struct addrinfo* resolved = nullptr;
+        const std::string service = std::to_string(port);
+        const int status = ::getaddrinfo(addr.c_str(), service.c_str(), &hints, &resolved);
+        if(status != 0 || resolved == nullptr || resolved->ai_addrlen < sizeof(sockaddr_in))
+        {
+            if(resolved) ::freeaddrinfo(resolved);
+            ::close(sockfd);
+            if(connectionCallback_) connectionCallback_(nullptr);
+            releaseLifetimeInLoop();
+            return ;
+        }
+        std::memcpy(&servaddr, resolved->ai_addr, sizeof(servaddr));
+        ::freeaddrinfo(resolved);
     }
 
     int ret = ::connect(sockfd, (struct sockaddr*)&servaddr, sizeof(servaddr));
@@ -324,8 +342,6 @@ void TcpClient::removeConnectingChannel(bool closeSocket, StopCallback callback)
 }
 
 }
-
-
 
 
 

@@ -10,12 +10,19 @@ from datetime import datetime
 from pathlib import Path
 
 FIELD_RE = re.compile(r"(?:^|\s)([A-Za-z_]+)=([^\s]+)")
-CONTROL_EVENTS = {"upload_session_create", "upload_session_get", "route_plan",
+CONTROL_EVENTS = {"upload_session_create", "upload_preflight", "upload_session_get", "route_plan",
                   "chunk_commit", "file_commit", "object_manifest", "file_manifest"}
 CHUNK_FIELDS = ("total_ms", "body_receive_ms", "replica_ms", "gateway_commit_ms",
+                "body_to_completion_us", "gateway_commit_us",
                 "checksum_update_us", "checksum_finalize_us", "sha_update_us",
                 "sha_finalize_us", "pwrite_us", "data_sync_us", "index_us",
-                "write_ready_wait_us", "durability_queue_wait_us", "group_wait_us",
+                "index_mutex_wait_us", "index_batch_build_us", "index_write_us",
+                "write_ready_wait_us", "durability_batch_formation_us",
+                "durability_worker_busy_wait_us",
+                "durability_callback_dispatch_us", "completion_wakeup_us",
+                "durability_pending_items_enqueue", "durability_pending_bytes_enqueue",
+                "durability_pending_items_batch_start", "durability_pending_bytes_batch_start",
+                "durability_queue_wait_us", "group_wait_us",
                 "group_queue_wait_us", "group_commit_us", "group_batch_bytes",
                 "group_batch_items", "disk_batches", "disk_batch_bytes")
 MAX_FIELDS = ("max_pending_bytes", "disk_queue_peak_bytes", "disk_pause_count",
@@ -73,13 +80,16 @@ def main():
     control = {}
     chunk_values = {key: [] for key in CHUNK_FIELDS}
     batch_values = {key: [] for key in (
-        "batch_bytes", "batch_items", "batch_formation_us", "data_sync_us",
-        "index_sync_us", "batch_commit_us")}
+        "batch_bytes", "batch_items", "pending_bytes_at_batch_start",
+        "pending_items_at_batch_start", "batch_formation_us", "data_sync_us",
+        "index_sync_us", "index_mutex_wait_us", "index_batch_build_us",
+        "index_write_us", "batch_commit_us")}
     batch_outcomes = {}
     maxima = {key: 0.0 for key in MAX_FIELDS}
     snapshots = []
     event_loop_snapshots = {}
     chunk_timestamps, chunk_count, failed_chunks = [], 0, 0
+    failure_stages = {}
     for path in paths:
         for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
             fields, timestamp = parse(line)
@@ -95,7 +105,10 @@ def main():
                     "output_buffer_current_bytes", "output_buffer_peak_bytes", "output_buffer_high_water_events",
                     "durable_pending_bytes", "durable_peak_pending_bytes", "durable_pending_items",
                     "durable_peak_pending_items", "durable_active_sync_operations",
-                    "durable_pwrite_ops_while_sync", "durable_pwrite_bytes_while_sync")}
+                    "durable_pwrite_ops_while_sync", "durable_pwrite_bytes_while_sync",
+                    "durable_worker_count", "durable_last_batch_pending_bytes",
+                    "durable_last_batch_pending_items", "durable_last_index_mutex_wait_us",
+                    "durable_last_index_batch_build_us", "durable_last_index_write_us")}
                 snapshots.append({key: value for key, value in snapshot.items() if value is not None})
             if event == "durability_batch_complete":
                 for key in batch_values:
@@ -130,6 +143,9 @@ def main():
                 continue
             chunk_count += 1
             failed_chunks += event == "chunk_failed"
+            if event == "chunk_failed":
+                stage = fields.get("failure_stage", "unknown")
+                failure_stages[stage] = failure_stages.get(stage, 0) + 1
             if timestamp is not None:
                 chunk_timestamps.append(timestamp)
             for key in CHUNK_FIELDS:
@@ -160,6 +176,7 @@ def main():
                           for event, item in control.items()},
         "chunks": {"count": chunk_count, "failed": failed_chunks,
                    "qps_observed_window": qps(chunk_timestamps),
+                   "failure_stages": failure_stages,
                    "latency": {key: summary(values) for key, values in chunk_values.items()},
                    "maxima": maxima},
         "durability_batches": {

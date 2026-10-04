@@ -16,6 +16,8 @@
 #include "DataNode/DiskWriteExecutor.hpp"
 #include "DataNode/HttpChunkUploadAdapter.hpp"
 #include "DataNode/HttpGatewayControlClient.hpp"
+#include "DataNode/MetadataControlClient.hpp"
+#include "metadata/MetadataClient.hpp"
 #include "DataNode/NodeResourceGovernor.hpp"
 #include "DataNode/ReplicaUploadPipe.hpp"
 #include "DataNode/ReplicaTransport.hpp"
@@ -33,6 +35,7 @@
 #include <set>
 #include <sstream>
 #include <stdexcept>
+#include <sys/stat.h>
 #include <sys/statvfs.h>
 #include <vector>
 
@@ -109,6 +112,27 @@ std::string configuredNodeId(const std::string& fallback)
 {
     if(const char* value = std::getenv("MINIKV_V2_NODE_ID")) return value;
     return fallback;
+}
+
+std::string configuredPhysicalIndexDirectory(const std::string& nodeId)
+{
+    const char* value = std::getenv("MINIKV_V3_PHYSICAL_INDEX_DIR");
+    if(value == nullptr || *value == '\0') return {};
+    std::string directory = value;
+    const std::string marker = "%NODE_ID%";
+    size_t offset = 0;
+    while((offset = directory.find(marker, offset)) != std::string::npos) {
+        directory.replace(offset, marker.size(), nodeId);
+        offset += nodeId.size();
+    }
+    return directory;
+}
+
+std::string deviceNumberForPath(const std::string& path)
+{
+    struct stat status{};
+    if(::stat(path.c_str(), &status) != 0) return "-";
+    return std::to_string(static_cast<unsigned long long>(status.st_dev));
 }
 
 uint32_t configuredLimit(const char* name, uint32_t fallback)
@@ -307,7 +331,8 @@ public:
                       std::shared_ptr<ReplicaTransport> replicaTransport,
                       std::string nodeId,
                       std::string gatewayAddress, uint16_t gatewayPort,
-                      std::string clusterSecret, ChunkWriteDescriptor descriptor)
+                      std::string clusterSecret, ChunkWriteDescriptor descriptor,
+                      std::shared_ptr<ChunkCommitReporter> controlClient = {})
         : loop_(loop), store_(store), resourceGovernor_(resourceGovernor),
             diskExecutor_(diskExecutor),
             diskPipelineConfig_(diskPipelineConfig),
@@ -315,8 +340,9 @@ public:
             nodeId_(std::move(nodeId)),
             gatewayAddress_(std::move(gatewayAddress)), gatewayPort_(gatewayPort),
             clusterSecret_(std::move(clusterSecret)),
-            gatewayControl_(std::make_unique<HttpGatewayControlClient>(
-                loop_, gatewayAddress_, gatewayPort_, clusterSecret_)),
+            gatewayControl_(controlClient ? std::move(controlClient) :
+                std::make_shared<HttpGatewayControlClient>(
+                    loop_, gatewayAddress_, gatewayPort_, clusterSecret_)),
             chunkHash_(descriptor.storageKey()), descriptor_(std::move(descriptor)),
             acceptedAt_(Clock::now())
     {
@@ -334,6 +360,10 @@ public:
         requireLoopThread();
         if(!error_.empty() || writer_ == nullptr) return;
 
+        std::weak_ptr<ChunkWriteCoordinator> weakSelf(shared_from_this());
+        diskPipelineConfig_.stageCallback = [weakSelf](const char* stage, Clock::time_point at) {
+            if(auto self = weakSelf.lock()) self->onDiskStage(stage, at);
+        };
         diskPipeline_ = ChunkDiskWritePipeline::create(
             loop_, diskExecutor_, writer_, resumeUpstream, diskPipelineConfig_);
         if(diskPipeline_ == nullptr) {
@@ -343,17 +373,18 @@ public:
         if(position_ + 1 >= chain_.size()) return;
 
         const ReplicaTarget& target = chain_[position_ + 1];
+        replicaStartedAt_ = Clock::now();
         ReplicaWriteRequest request;
         request.descriptor = descriptor_;
         request.target = target;
         request.commitOwnerNodeId = chain_.front().nodeId;
         request.gatewayAddress = gatewayAddress_;
         request.gatewayPort = gatewayPort_;
-        std::weak_ptr<ChunkWriteCoordinator> weakSelf(shared_from_this());
+        std::weak_ptr<ChunkWriteCoordinator> weakReplicaSelf(shared_from_this());
         replicaPipe_ = replicaTransport_->open(
             std::move(request), std::move(resumeUpstream),
-            [weakSelf](ReplicaTransportResult result) {
-                if(auto self = weakSelf.lock()) self->onReplicaComplete(std::move(result));
+            [weakReplicaSelf](ReplicaTransportResult result) {
+                if(auto self = weakReplicaSelf.lock()) self->onReplicaComplete(std::move(result));
             });
     }
 
@@ -361,6 +392,7 @@ public:
     {
         requireLoopThread();
         if(firstBodyAt_ == Clock::time_point{}) firstBodyAt_ = Clock::now();
+        stage_ = "body_receive";
         if(admissionRejected_) return StreamConsumeResult::kContinue;
         if(!error_.empty() || writer_ == nullptr || diskPipeline_ == nullptr) {
             logBodyRejected(error_.empty() ? "stream is not writable" : error_, size);
@@ -372,6 +404,7 @@ public:
                                                      replicaPipe_ == nullptr ? nullptr : &sharedBlock);
         if(diskResult == StreamConsumeResult::kAbort) {
             error_ = "local disk write queue rejected body bytes";
+            stage_ = "disk_queue";
             logBodyRejected(error_, size);
             return StreamConsumeResult::kAbort;
         }
@@ -383,6 +416,7 @@ public:
         const auto replicaResult = replicaPipe_->pushShared(std::move(sharedBlock), size);
         if(replicaResult == StreamConsumeResult::kAbort) {
             error_ = "replica stream rejected body bytes";
+            stage_ = "replica_stream";
             diskPipeline_->cancel();
             logBodyRejected(error_, size);
             return StreamConsumeResult::kAbort;
@@ -411,12 +445,15 @@ public:
         if(completion_) return;
         completion_ = std::move(completion);
         selfHold_ = shared_from_this();
+        bodyFinishedAt_ = Clock::now();
 
         if(admissionRejected_) {
+            stage_ = "admission";
             completeClient(503, "DataNode write capacity reached");
             return;
         }
         if(!error_.empty() || writer_ == nullptr || diskPipeline_ == nullptr) {
+            if(stage_ == "accepted" || stage_ == "body_receive") stage_ = "local_allocate";
             completeClient(400, error_.empty() ? "invalid stream" : error_);
             return;
         }
@@ -437,14 +474,17 @@ private:
         clientId_ = descriptor_.clientId;
         position_ = descriptor_.replicaPosition;
         chain_ = descriptor_.replicaChain;
-        uploadLease_ = resourceGovernor_.tryAcquireUpload(clientId_);
+        admissionRequestedAt_ = Clock::now();
+        uploadLease_ = resourceGovernor_.tryAcquireUpload(clientId_, &admissionRejectReason_);
         if(!uploadLease_.has_value()) {
             admissionRejected_ = true;
             return;
         }
+        admissionAcquiredAt_ = Clock::now();
         if(!store_.canAccept(descriptor_.contentLength)) {
             releaseActiveWrite();
             admissionRejected_ = true;
+            stage_ = "local_admission";
             return;
         }
         FastDataStore::PutOptions putOptions;
@@ -455,9 +495,11 @@ private:
         if(writer == nullptr) {
             releaseActiveWrite();
             error_ = "cannot allocate local chunk extent";
+            stage_ = "local_allocate";
             return;
         }
         writer_ = std::move(writer);
+        stage_ = "body_receive";
     }
 
     void onLocalFinish(bool success, bool alreadyExists)
@@ -465,6 +507,7 @@ private:
         requireLoopThread();
         if(!completion_) return;
         if(!success) {
+            stage_ = "local_write";
             miniKV::utils::logError("event=chunk_local_finish_failed chunk=" + chunkHash_ +
                                     " bytes=" + std::to_string(writer_->writtenBytes()));
             completeClient(400, "chunk length or checksum verification failed");
@@ -472,6 +515,7 @@ private:
         }
         localFinished_ = true;
         localFinishedAt_ = Clock::now();
+        stage_ = replicaPipe_ == nullptr ? "metadata_commit" : "replica_wait";
         alreadyExists_ = alreadyExists;
         successfulNodes_.push_back(nodeId_);
         miniKV::utils::logDebug("event=chunk_local_finish chunk=" + chunkHash_ +
@@ -502,6 +546,7 @@ private:
             }
         }
         replicaCompleted_ = true;
+        stage_ = "metadata_commit";
         maybeAfterLocalAndReplica();
     }
 
@@ -514,6 +559,7 @@ private:
     void afterReplica()
     {
         if(position_ != 0) {
+            stage_ = "client_response";
             miniKV::utils::logDebug("event=replica_chunk_reply chunk=" + chunkHash_);
             completeClient(200, "");
             return;
@@ -521,24 +567,35 @@ private:
         miniKV::utils::logDebug("event=chunk_gateway_commit_start chunk=" + chunkHash_ +
                                 " successful_nodes=" + std::to_string(successfulNodes_.size()));
         gatewayCommitStartedAt_ = Clock::now();
+        stage_ = "metadata_commit";
         std::weak_ptr<ChunkWriteCoordinator> weakSelf(shared_from_this());
+        // The control client is process-scoped and may deliver its callback on
+        // the acceptor/metadata I/O loop rather than the DataNode connection's
+        // owning loop.  All coordinator state is owned by the upload loop, so
+        // hop back before touching it.  Without this hop the old HTTP client
+        // happened to work only when the connection was assigned to the base
+        // loop; Multi-Reactor uploads could abort at commit completion.
         gatewayControl_->commitChunk({descriptor_.sessionId, descriptor_.chunkIndex,
                                     descriptor_.contentHash,
-                                    descriptor_.contentLength, successfulNodes_, uploadToken_,
-                                    descriptor_.requestId},
-            [weakSelf](RpcResult result) {
-            if(auto self = weakSelf.lock()) {
-                self->requireLoopThread();
-                self->gatewayCommitFinishedAt_ = Clock::now();
-                miniKV::utils::logInfo("event=chunk_gateway_commit_result chunk=" + self->chunkHash_ +
-                                       " http_status=" + std::to_string(result.httpStatus) +
-                                       " error=" + (result.error.empty() ? "-" : result.error));
-                if(!result.ok) {
-                    self->completeClient(500, result.error.empty() ? "Gateway commit failed" : std::move(result.error));
-                    return;
+                                    descriptor_.contentLength, successfulNodes_,
+                                    descriptor_.leaseId, uploadToken_, descriptor_.requestId},
+            [weakSelf, ownerLoop = loop_](RpcResult result) mutable {
+            ownerLoop->queueInLoop([weakSelf, result = std::move(result)]() mutable {
+                if(auto self = weakSelf.lock()) {
+                    self->requireLoopThread();
+                    self->gatewayCommitFinishedAt_ = Clock::now();
+                    miniKV::utils::logInfo("event=chunk_gateway_commit_result chunk=" + self->chunkHash_ +
+                                           " http_status=" + std::to_string(result.httpStatus) +
+                                           " error=" + (result.error.empty() ? "-" : result.error));
+                    if(!result.ok) {
+                        self->stage_ = "metadata_commit";
+                        self->completeClient(500, result.error.empty() ? "Gateway commit failed" : std::move(result.error));
+                        return;
+                    }
+                    self->stage_ = "client_response";
+                    self->completeClient(200, "");
                 }
-                self->completeClient(200, "");
-            }
+            });
         });
     }
 
@@ -566,6 +623,18 @@ private:
             " role=" + std::string(position_ == 0 ? "primary" : "replica") +
             " replicas=" + std::to_string(successfulNodes_.size()) +
             " total_ms=" + std::to_string(elapsedMilliseconds(acceptedAt_, completedAt)) +
+            " slot_lifetime_us=" + std::to_string(elapsedMicroseconds(acceptedAt_, completedAt)) +
+            " body_to_completion_us=" + std::to_string(elapsedMicroseconds(bodyFinishedAt_, completedAt)) +
+            " gateway_commit_us=" + std::to_string(elapsedMicroseconds(gatewayCommitStartedAt_, gatewayCommitFinishedAt_)) +
+            " slot_release_count=" + std::to_string(uploadLease_.has_value() ? 1U : slotReleaseCount_) +
+            " admission_wait_us=" + std::to_string(elapsedMicroseconds(admissionRequestedAt_, admissionAcquiredAt_)) +
+            " body_receive_us=" + std::to_string(elapsedMicroseconds(firstBodyAt_, bodyFinishedAt_)) +
+            " disk_queue_wait_us=" + std::to_string(elapsedMicroseconds(diskEnqueuedAt_, diskStartedAt_)) +
+            " disk_write_wall_us=" + std::to_string(elapsedMicroseconds(diskStartedAt_, diskFinishedAt_)) +
+            " replica_wait_us=" + std::to_string(elapsedMicroseconds(replicaStartedAt_, replicaFinishedAt_)) +
+            " post_commit_us=" + std::to_string(elapsedMicroseconds(gatewayCommitFinishedAt_, completedAt)) +
+            " slot_stage_model=sequential:admission_wait,body_receive,disk_queue;overlapped:disk_write,replica_wait;gateway_commit_after_local_replica" +
+            " admission_reject_reason=" + (admissionRejectReason_.empty() ? "-" : admissionRejectReason_) +
             " body_receive_ms=" + std::to_string(elapsedMilliseconds(firstBodyAt_, localFinishedAt_)) +
             " checksum_update_us=" + std::to_string(
                 writeMetrics.checksumUpdateNanoseconds / 1000ULL) +
@@ -575,12 +644,34 @@ private:
             " pwritev_ops=" + std::to_string(writeMetrics.pwritevOperations) +
             " write_ready_wait_us=" + std::to_string(
                 writeMetrics.writeReadyWaitNanoseconds / 1000ULL) +
+            " durability_batch_formation_us=" + std::to_string(
+                writeMetrics.durabilityBatchFormationNanoseconds / 1000ULL) +
+            " durability_worker_busy_wait_us=" + std::to_string(
+                writeMetrics.durabilityWorkerBusyWaitNanoseconds / 1000ULL) +
+            " durability_callback_dispatch_us=" + std::to_string(
+                writeMetrics.durabilityCallbackDispatchNanoseconds / 1000ULL) +
+            " completion_wakeup_us=" + std::to_string(
+                writeMetrics.completionWakeupNanoseconds / 1000ULL) +
+            " durability_pending_items_enqueue=" + std::to_string(
+                writeMetrics.durabilityPendingItemsAtEnqueue) +
+            " durability_pending_bytes_enqueue=" + std::to_string(
+                writeMetrics.durabilityPendingBytesAtEnqueue) +
+            " durability_pending_items_batch_start=" + std::to_string(
+                writeMetrics.durabilityPendingItemsAtBatchStart) +
+            " durability_pending_bytes_batch_start=" + std::to_string(
+                writeMetrics.durabilityPendingBytesAtBatchStart) +
             " checksum_finalize_us=" + std::to_string(
                 writeMetrics.checksumFinalizeNanoseconds / 1000ULL) +
             " sha_finalize_us=" + std::to_string(writeMetrics.shaFinalizeNanoseconds / 1000ULL) +
             " data_sync_us=" + std::to_string(writeMetrics.dataSyncNanoseconds / 1000ULL) +
             " data_sync_ops=" + std::to_string(writeMetrics.dataSyncOperations) +
             " index_us=" + std::to_string(writeMetrics.indexNanoseconds / 1000ULL) +
+            " index_mutex_wait_us=" + std::to_string(
+                writeMetrics.indexMutexWaitNanoseconds / 1000ULL) +
+            " index_batch_build_us=" + std::to_string(
+                writeMetrics.indexBatchBuildNanoseconds / 1000ULL) +
+            " index_write_us=" + std::to_string(
+                writeMetrics.indexWriteNanoseconds / 1000ULL) +
             " index_sync_ops=" + std::to_string(writeMetrics.indexSyncOperations) +
             " sync_timing_owner=" + std::string(
                 writeMetrics.durabilitySyncTimingOwner ? "true" : "false") +
@@ -594,10 +685,12 @@ private:
             " group_batch_items=" + std::to_string(writeMetrics.groupBatchItems) +
             " durable_pending_bytes=" + std::to_string(durabilityMetrics.pendingBytes) +
             " durable_pending_items=" + std::to_string(durabilityMetrics.pendingItems) +
+            " durable_worker_count=" + std::to_string(durabilityMetrics.workerCount) +
             " durable_batches=" + std::to_string(durabilityMetrics.committedBatches) +
             " replica_ms=" + std::to_string(elapsedMilliseconds(localFinishedAt_, replicaFinishedAt_)) +
             " gateway_commit_ms=" + std::to_string(elapsedMilliseconds(
                 gatewayCommitStartedAt_, gatewayCommitFinishedAt_)) +
+            " failure_stage=" + (status == 200 ? "none" : stage_) +
             " pauses=" + std::to_string(replicaMetrics_.pauseCount) +
             " pause_ms=" + std::to_string(replicaMetrics_.pauseNanoseconds / 1000000ULL) +
             " max_pending_bytes=" + std::to_string(replicaMetrics_.maxPendingBytes) +
@@ -611,7 +704,7 @@ private:
         if(status == 200) miniKV::utils::logInfo(line);
         else miniKV::utils::logError(line);
         if(status != 200 && position_ == 0 && !uploadToken_.empty()) {
-            gatewayControl_->releaseLease({uploadToken_, descriptor_.requestId}, [](RpcResult) {});
+            gatewayControl_->releaseLease({descriptor_.leaseId, uploadToken_, descriptor_.requestId}, [](RpcResult) {});
         }
         releaseActiveWrite();
         ChunkWriteResult result;
@@ -631,7 +724,25 @@ private:
 
     void releaseActiveWrite()
     {
+        if(uploadLease_.has_value()) {
+            slotReleasedAt_ = Clock::now();
+            ++slotReleaseCount_;
+        }
         uploadLease_.reset();
+    }
+
+    void onDiskStage(const char* stage, Clock::time_point at)
+    {
+        if(stage == nullptr) return;
+        const auto now = at == Clock::time_point{} ? Clock::now() : at;
+        const std::string name(stage);
+        if(name == "disk_enqueued" && diskEnqueuedAt_ == Clock::time_point{}) {
+            diskEnqueuedAt_ = now;
+        } else if(name == "disk_started" && diskStartedAt_ == Clock::time_point{}) {
+            diskStartedAt_ = now;
+        } else if(name == "disk_finished") {
+            diskFinishedAt_ = now;
+        }
     }
 
     void requireLoopThread() const
@@ -646,6 +757,13 @@ private:
             finished - started).count());
     }
 
+    static uint64_t elapsedMicroseconds(Clock::time_point started, Clock::time_point finished)
+    {
+        if(started == Clock::time_point{} || finished == Clock::time_point{} || finished < started) return 0;
+        return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
+            finished - started).count());
+    }
+
     EventLoop* loop_;
     ChunkStore& store_;
     NodeResourceGovernor& resourceGovernor_;
@@ -656,7 +774,7 @@ private:
     std::string gatewayAddress_;
     uint16_t gatewayPort_ = 0;
     std::string clusterSecret_;
-    std::unique_ptr<ChunkCommitReporter> gatewayControl_;
+    std::shared_ptr<ChunkCommitReporter> gatewayControl_;
     std::string chunkHash_;
     std::string clientId_;
     std::string uploadToken_;
@@ -677,11 +795,25 @@ private:
     bool localFinished_ = false;
     bool replicaCompleted_ = false;
     Clock::time_point acceptedAt_{};
+    Clock::time_point admissionRequestedAt_{};
+    Clock::time_point admissionAcquiredAt_{};
     Clock::time_point firstBodyAt_{};
+    Clock::time_point bodyFinishedAt_{};
+    Clock::time_point diskEnqueuedAt_{};
+    Clock::time_point diskStartedAt_{};
+    Clock::time_point diskFinishedAt_{};
+    Clock::time_point replicaStartedAt_{};
     Clock::time_point localFinishedAt_{};
     Clock::time_point replicaFinishedAt_{};
     Clock::time_point gatewayCommitStartedAt_{};
     Clock::time_point gatewayCommitFinishedAt_{};
+    Clock::time_point slotReleasedAt_{};
+    std::string admissionRejectReason_;
+    // Last externally meaningful stage; emitted only on failure so a short
+    // benchmark can separate admission, body, disk, replica, and metadata
+    // failures without inferring them from a free-form error string.
+    std::string stage_ = "accepted";
+    uint32_t slotReleaseCount_ = 0;
     ReplicaTransportMetrics replicaMetrics_;
     std::shared_ptr<ChunkWriteCoordinator> selfHold_;
 };
@@ -695,14 +827,25 @@ public:
                           ReplicaConnectionPool::Ptr replicaConnectionPool,
                           std::string nodeId, std::string gatewayAddress,
                           uint16_t gatewayPort, std::string clusterSecret,
+                          std::shared_ptr<ChunkCommitReporter> controlClient,
                           CorsPolicy corsPolicy, std::string requestOrigin,
                           const HttpRequest& request, std::string storageIdentity)
         : corsPolicy_(std::move(corsPolicy)), requestOrigin_(std::move(requestOrigin))
     {
+        miniKV::utils::logDebug("event=chunk_stream_setup node=" + nodeId +
+                                " route=" + storageIdentity +
+                                " session=" + request.getHeader("X-Session-Id") +
+                                " index=" + request.getHeader("X-Chunk-Index"));
         auto decoded = HttpChunkUploadAdapter::decode(
             request, storageIdentity, nodeId, clusterSecret);
         if(!decoded.ok) {
             decodeError_ = std::move(decoded.error);
+            miniKV::utils::logWarn("event=chunk_upload_decode_failed node=" + nodeId +
+                                   " route=" + storageIdentity +
+                                   " reason=" + decodeError_ +
+                                   " session=" + request.getHeader("X-Session-Id") +
+                                   " chunk_index=" + request.getHeader("X-Chunk-Index") +
+                                   " content_length=" + std::to_string(request.contentLength()));
             return;
         }
         requestId_ = decoded.descriptor.requestId;
@@ -712,7 +855,7 @@ public:
             loop, store, resourceGovernor, diskExecutor, diskPipelineConfig,
             std::move(replicaTransport), std::move(nodeId),
             std::move(gatewayAddress), gatewayPort, std::move(clusterSecret),
-            std::move(decoded.descriptor));
+            std::move(decoded.descriptor), std::move(controlClient));
     }
 
     void start(const TcpConnectionPtr& upstream)
@@ -803,6 +946,10 @@ int main(int argc, char** argv)
     const std::string gatewayAddress = argv[5];
     const uint16_t gatewayPort = static_cast<uint16_t>(std::stoul(argv[6]));
     const std::string clusterSecret = configuredSecret(argc, argv);
+    const std::string bootId = [] {
+        if(const char* value = std::getenv("MINIKV_V2_BOOT_ID")) return std::string(value);
+        return miniKV::util::randomId();
+    }();
     const std::vector<std::string> capabilities = configuredCapabilities();
     const CorsPolicy corsPolicy(configuredAllowedOrigin());
     if(clusterSecret.empty()) {
@@ -827,12 +974,22 @@ int main(int argc, char** argv)
         std::cerr << "invalid MINIKV_V3_GROUP_COMMIT_* configuration\n";
         return 2;
     }
+    storeConfig.physicalIndexDirectory = configuredPhysicalIndexDirectory(nodeId);
+    const std::string physicalIndexDirectory = storeConfig.physicalIndexDirectory.empty()
+        ? dataDir + "/physical_index" : storeConfig.physicalIndexDirectory;
     FastDataStore store(dataDir, storeConfig);
     if(!store.open()) {
         miniKV::utils::logError("event=datanode_store_open_failed data_dir=" + dataDir);
         std::cerr << "cannot open DataNode store\n";
         return 1;
     }
+    miniKV::utils::logInfo(
+        "event=datanode_durability_config mode=" + durabilityMode +
+        " data_dir=" + dataDir +
+        " physical_index_dir=" +
+        physicalIndexDirectory +
+        " data_device=" + deviceNumberForPath(dataDir + "/disk0.data") +
+        " index_device=" + deviceNumberForPath(physicalIndexDirectory));
     FastDataStoreChunkStore chunkStore(store);
     const uint32_t maxConcurrentWrites = configuredLimit(
         "MINIKV_V4_MAX_ACTIVE_UPLOADS", kDefaultMaxConcurrentWrites);
@@ -882,8 +1039,24 @@ int main(int argc, char** argv)
             std::to_string(storeConfig.groupCommit.maxPendingBytes) +
         " group_commit_max_pending_items=" +
             std::to_string(storeConfig.groupCommit.maxPendingItems) +
+        " durability_workers=" + std::to_string(
+            storeConfig.durabilityPolicy == DurabilityPolicy::kGroupCommit ? 1U : 0U) +
         " sendfile_quantum_bytes=" + std::to_string(sendFileQuantumBytes));
-    HttpGatewayControlClient gatewayControl(&loop, gatewayAddress, gatewayPort, clusterSecret);
+    std::shared_ptr<ChunkCommitReporter> controlClient;
+    if(const char* endpoints = std::getenv("MINIKV_DATANODE_METADATA_ENDPOINTS");
+       endpoints != nullptr && *endpoints != '\0') {
+        auto metadataClient = std::make_shared<miniKV::metadata::MetadataClient>(
+            miniKV::metadata::MetadataClient::parseEndpoints(endpoints), clusterSecret, 1000);
+        controlClient = std::make_shared<MetadataControlClient>(
+            &loop, std::move(metadataClient), nodeId, bootId);
+        miniKV::utils::logInfo("event=datanode_control_transport mode=metadata-direct endpoints=" +
+                               std::string(endpoints));
+    } else {
+        controlClient = std::make_shared<HttpGatewayControlClient>(
+            &loop, gatewayAddress, gatewayPort, clusterSecret);
+        miniKV::utils::logInfo("event=datanode_control_transport mode=gateway-compat endpoint=" +
+                               gatewayAddress + ":" + std::to_string(gatewayPort));
+    }
 
     std::function<void()> registerNode;
     std::function<void()> heartbeat;
@@ -892,7 +1065,8 @@ int main(int argc, char** argv)
     registerNode = [&] {
         if(registered || registrationInFlight) return;
         registrationInFlight = true;
-        gatewayControl.registerStorageNode({nodeId, advertiseAddress, port, availableBytes(dataDir), 0,
+        controlClient->registerStorageNode({nodeId, bootId, advertiseAddress, port,
+                                            availableBytes(dataDir), 0,
                                             maxConcurrentWrites, capabilities},
             [&](RpcResult result) {
                 registrationInFlight = false;
@@ -909,7 +1083,7 @@ int main(int argc, char** argv)
             });
     };
     heartbeat = [&] {
-        gatewayControl.sendHeartbeat({nodeId, logicalUsedBytes(store), effectiveFreeBytes(store, dataDir),
+        controlClient->sendHeartbeat({nodeId, logicalUsedBytes(store), effectiveFreeBytes(store, dataDir),
                                       0, 0, 0, 0,
                                       resourceGovernor.snapshot().activeUploads},
             [&](RpcResult result) {
@@ -948,7 +1122,8 @@ int main(int argc, char** argv)
         }
         auto stream = std::make_shared<HttpChunkUploadStream>(upstream->ownerLoop(), chunkStore,
         resourceGovernor, diskExecutor, diskPipelineConfig, std::move(replicaPool), nodeId,
-        gatewayAddress, gatewayPort, clusterSecret, corsPolicy, request.getHeader("Origin"), request, hash);
+        gatewayAddress, gatewayPort, clusterSecret, controlClient, corsPolicy,
+        request.getHeader("Origin"), request, hash);
         stream->start(upstream);
         context->setUserData(stream);
         context->setBodyCallback(request.contentLength(), [stream](const char* bytes, size_t size) {
@@ -1133,7 +1308,10 @@ int main(int argc, char** argv)
         json(response, 404, jsonError("route not found"));
     });
     loop.runAfter(0, [&] { registerNode(); heartbeat(); });
-    loop.runEvery(8000, heartbeat);
+    // Metadata Raft placement treats a heartbeat as fresh for 6 seconds.
+    // Keep the data-node heartbeat comfortably below that window so a
+    // healthy node is not temporarily filtered out between two heartbeats.
+    loop.runEvery(2000, heartbeat);
     loop.runEvery(1000, [&] {
         const NodeResourceGovernor::Snapshot resources = resourceGovernor.snapshot();
         const DiskWriteExecutor::Metrics disk = diskExecutor.metrics();
@@ -1142,6 +1320,12 @@ int main(int argc, char** argv)
         miniKV::utils::logInfo("event=resource_snapshot"
             " active_uploads=" + std::to_string(resources.activeUploads) +
             " active_downloads=" + std::to_string(resources.activeDownloads) +
+            " upload_acquire_attempts=" + std::to_string(resources.uploadAcquireAttempts) +
+            " upload_acquire_successes=" + std::to_string(resources.uploadAcquireSuccesses) +
+            " upload_rejects=" + std::to_string(resources.uploadRejects) +
+            " upload_rejects_global=" + std::to_string(resources.uploadRejectsGlobal) +
+            " upload_rejects_per_client=" + std::to_string(resources.uploadRejectsPerClient) +
+            " upload_releases=" + std::to_string(resources.uploadReleases) +
             " disk_queued_tasks=" + std::to_string(disk.queuedTasks) +
             " disk_queue_peak_tasks=" + std::to_string(disk.peakQueuedTasks) +
             " block_available=" + std::to_string(disk.availableBlocks) +
@@ -1173,12 +1357,22 @@ int main(int argc, char** argv)
                 durability.pwriteBytesWhileSync) +
             " durable_last_batch_bytes=" + std::to_string(durability.lastBatchBytes) +
             " durable_last_batch_items=" + std::to_string(durability.lastBatchItems) +
+            " durable_last_batch_pending_bytes=" + std::to_string(
+                durability.lastBatchPendingBytes) +
+            " durable_last_batch_pending_items=" + std::to_string(
+                durability.lastBatchPendingItems) +
             " durable_last_batch_formation_us=" + std::to_string(
                 durability.lastBatchFormationNanoseconds / 1000ULL) +
             " durable_last_data_sync_us=" + std::to_string(
                 durability.lastDataSyncNanoseconds / 1000ULL) +
             " durable_last_index_sync_us=" + std::to_string(
                 durability.lastIndexSyncNanoseconds / 1000ULL) +
+            " durable_last_index_mutex_wait_us=" + std::to_string(
+                durability.lastIndexMutexWaitNanoseconds / 1000ULL) +
+            " durable_last_index_batch_build_us=" + std::to_string(
+                durability.lastIndexBatchBuildNanoseconds / 1000ULL) +
+            " durable_last_index_write_us=" + std::to_string(
+                durability.lastIndexWriteNanoseconds / 1000ULL) +
             " durable_last_batch_commit_us=" + std::to_string(
                 durability.lastBatchCommitNanoseconds / 1000ULL) +
             " output_buffer_current_bytes=" + std::to_string(output.currentBytes) +

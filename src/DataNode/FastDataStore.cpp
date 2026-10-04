@@ -44,13 +44,23 @@ struct FastDataStore::PendingDurability {
     WriteSession::FinishCallback callback;
     Clock::time_point queuedAt;
     uint64_t writeSequence = 0;
+    uint64_t pendingItemsAtEnqueue = 0;
+    uint64_t pendingBytesAtEnqueue = 0;
+    uint64_t pendingItemsAtBatchStart = 0;
+    uint64_t pendingBytesAtBatchStart = 0;
     bool alreadyExists = false;
 };
 
 class FastDataStore::DurabilityCoordinator {
 public:
     DurabilityCoordinator(FastDataStore& store, GroupCommitConfig config)
-        : store_(store), config_(config), worker_([this] { workerMain(); }) {}
+        : store_(store), config_(config), worker_([this] { workerMain(); })
+    {
+        // Group-commit sequencing is intentionally serialized.  DiskWriteExecutor
+        // has its own configurable workers, but data/index durability barriers
+        // are issued by this single ordered worker.
+        metrics_.workerCount = 1;
+    }
 
     ~DurabilityCoordinator() { stop(); }
 
@@ -68,6 +78,8 @@ public:
         pending_.push_back(std::move(request));
         metrics_.pendingBytes += bytes;
         ++metrics_.pendingItems;
+        pending_.back().pendingBytesAtEnqueue = metrics_.pendingBytes;
+        pending_.back().pendingItemsAtEnqueue = metrics_.pendingItems;
         metrics_.peakPendingBytes = std::max(metrics_.peakPendingBytes,
                                              metrics_.pendingBytes);
         metrics_.peakPendingItems = std::max(metrics_.peakPendingItems,
@@ -125,6 +137,8 @@ private:
             uint64_t batchBytes = 0;
             uint64_t durableSequence = 0;
             std::string flushReason = "deadline";
+            uint64_t pendingBytesAtBatchStart = 0;
+            uint64_t pendingItemsAtBatchStart = 0;
             {
                 std::unique_lock<std::mutex> lock(mutex_);
                 cv_.wait(lock, [this] { return stopping_ || !pending_.empty(); });
@@ -145,6 +159,12 @@ private:
                     flushReason = "items";
                 }
 
+                // Capture depth before removing this batch.  The depth at
+                // completion is not useful for diagnosing backlog because
+                // the worker has already decremented it by then.
+                pendingBytesAtBatchStart = metrics_.pendingBytes;
+                pendingItemsAtBatchStart = metrics_.pendingItems;
+
                 while(!pending_.empty() && batch.size() < config_.maxBatchItems) {
                     const uint64_t itemBytes = pending_.front().session->expectedSize();
                     if(!batch.empty() && batchBytes + itemBytes > config_.maxBatchBytes) break;
@@ -154,13 +174,24 @@ private:
                     pending_.pop_front();
                 }
                 if(batch.empty()) continue;
+                for(PendingDurability& request : batch) {
+                    request.pendingBytesAtBatchStart = pendingBytesAtBatchStart;
+                    request.pendingItemsAtBatchStart = pendingItemsAtBatchStart;
+                }
             }
 
             const auto commitStarted = Clock::now();
             const uint64_t batchFormationNanoseconds = elapsedNanoseconds(
                 batch.front().queuedAt, commitStarted);
+            const uint64_t batchDeadlineNanoseconds = config_.maxBatchDelayUs * 1000ULL;
+            const uint64_t workerBusyWaitNanoseconds =
+                batchFormationNanoseconds > batchDeadlineNanoseconds
+                    ? batchFormationNanoseconds - batchDeadlineNanoseconds : 0;
             uint64_t dataSyncNanoseconds = 0;
             uint64_t indexNanoseconds = 0;
+            uint64_t indexMutexWaitNanoseconds = 0;
+            uint64_t indexBatchBuildNanoseconds = 0;
+            uint64_t indexWriteNanoseconds = 0;
             bool dataSyncAttempted = false;
             bool indexSyncAttempted = false;
             activeSyncOperations_.fetch_add(1, std::memory_order_release);
@@ -171,7 +202,8 @@ private:
             }
             const bool success = store_.commitDurabilityBatch(
                 batch, durableSequence, dataSyncNanoseconds, indexNanoseconds,
-                dataSyncAttempted, indexSyncAttempted);
+                indexMutexWaitNanoseconds, indexBatchBuildNanoseconds,
+                indexWriteNanoseconds, dataSyncAttempted, indexSyncAttempted);
             activeSyncOperations_.fetch_sub(1, std::memory_order_release);
             const auto committedAt = Clock::now();
             const uint64_t commitNanoseconds = elapsedNanoseconds(commitStarted, committedAt);
@@ -187,8 +219,13 @@ private:
                 metrics_.lastBatchBytes = batchBytes;
                 metrics_.lastBatchItems = batch.size();
                 metrics_.lastBatchFormationNanoseconds = batchFormationNanoseconds;
+                metrics_.lastBatchPendingBytes = pendingBytesAtBatchStart;
+                metrics_.lastBatchPendingItems = pendingItemsAtBatchStart;
                 metrics_.lastDataSyncNanoseconds = dataSyncNanoseconds;
                 metrics_.lastIndexSyncNanoseconds = indexNanoseconds;
+                metrics_.lastIndexMutexWaitNanoseconds = indexMutexWaitNanoseconds;
+                metrics_.lastIndexBatchBuildNanoseconds = indexBatchBuildNanoseconds;
+                metrics_.lastIndexWriteNanoseconds = indexWriteNanoseconds;
                 metrics_.lastBatchCommitNanoseconds = commitNanoseconds;
                 if(success) {
                     ++metrics_.committedBatches;
@@ -206,9 +243,16 @@ private:
                 " success=" + std::string(success ? "true" : "false") +
                 " batch_bytes=" + std::to_string(batchBytes) +
                 " batch_items=" + std::to_string(batch.size()) +
+                " worker_count=1" +
+                " pending_bytes_at_batch_start=" + std::to_string(pendingBytesAtBatchStart) +
+                " pending_items_at_batch_start=" + std::to_string(pendingItemsAtBatchStart) +
                 " batch_formation_us=" + std::to_string(batchFormationNanoseconds / 1000ULL) +
+                " worker_busy_wait_us=" + std::to_string(workerBusyWaitNanoseconds / 1000ULL) +
                 " data_sync_us=" + std::to_string(dataSyncNanoseconds / 1000ULL) +
                 " index_sync_us=" + std::to_string(indexNanoseconds / 1000ULL) +
+                " index_mutex_wait_us=" + std::to_string(indexMutexWaitNanoseconds / 1000ULL) +
+                " index_batch_build_us=" + std::to_string(indexBatchBuildNanoseconds / 1000ULL) +
+                " index_write_us=" + std::to_string(indexWriteNanoseconds / 1000ULL) +
                 " batch_commit_us=" + std::to_string(commitNanoseconds / 1000ULL));
 
             for(size_t i = 0; i < batch.size(); ++i) {
@@ -220,7 +264,13 @@ private:
                 request.session->completeGroupCommit(
                     success, request.alreadyExists, durableSequence, batchBytes,
                     batch.size(), dataSyncNanoseconds, indexNanoseconds,
-                    waitNanoseconds, queueWaitNanoseconds, commitNanoseconds, i == 0,
+                    indexMutexWaitNanoseconds, indexBatchBuildNanoseconds,
+                    indexWriteNanoseconds,
+                    waitNanoseconds, queueWaitNanoseconds, commitNanoseconds,
+                    batchFormationNanoseconds,
+                    request.pendingItemsAtEnqueue, request.pendingBytesAtEnqueue,
+                    request.pendingItemsAtBatchStart, request.pendingBytesAtBatchStart,
+                    i == 0,
                     dataSyncAttempted, indexSyncAttempted);
                 if(request.callback) request.callback(success, request.alreadyExists);
             }
@@ -558,15 +608,39 @@ bool FastDataStore::WriteSession::finishAsync(FinishCallback callback) {
 void FastDataStore::WriteSession::completeGroupCommit(
     bool success, bool alreadyExists, uint64_t durableSequence,
     uint64_t batchBytes, uint64_t batchItems, uint64_t dataSyncNanoseconds,
-    uint64_t indexNanoseconds, uint64_t waitNanoseconds,
+    uint64_t indexNanoseconds, uint64_t indexMutexWaitNanoseconds,
+    uint64_t indexBatchBuildNanoseconds, uint64_t indexWriteNanoseconds,
+    uint64_t waitNanoseconds,
     uint64_t queueWaitNanoseconds, uint64_t commitNanoseconds,
+    uint64_t batchFormationNanoseconds,
+    uint64_t pendingItemsAtEnqueue, uint64_t pendingBytesAtEnqueue,
+    uint64_t pendingItemsAtBatchStart, uint64_t pendingBytesAtBatchStart,
     bool ownsSyncOperations,
     bool dataSyncAttempted, bool indexSyncAttempted) {
     (void)alreadyExists;
     finishInFlight_ = false;
     metrics_.durabilityQueueWaitNanoseconds = queueWaitNanoseconds;
+    metrics_.durabilityBatchFormationNanoseconds = batchFormationNanoseconds;
+    const uint64_t batchDeadlineNanoseconds =
+        store_->config_.groupCommit.maxBatchDelayUs * 1000ULL;
+    metrics_.durabilityWorkerBusyWaitNanoseconds =
+        batchFormationNanoseconds > batchDeadlineNanoseconds
+            ? batchFormationNanoseconds - batchDeadlineNanoseconds : 0;
     metrics_.groupWaitNanoseconds = waitNanoseconds;
     metrics_.groupCommitNanoseconds = commitNanoseconds;
+    if(ownsSyncOperations) {
+        metrics_.indexMutexWaitNanoseconds = indexMutexWaitNanoseconds;
+        metrics_.indexBatchBuildNanoseconds = indexBatchBuildNanoseconds;
+        metrics_.indexWriteNanoseconds = indexWriteNanoseconds;
+    }
+    metrics_.durabilityPendingItemsAtEnqueue = pendingItemsAtEnqueue;
+    metrics_.durabilityPendingBytesAtEnqueue = pendingBytesAtEnqueue;
+    metrics_.durabilityPendingItemsAtBatchStart = pendingItemsAtBatchStart;
+    metrics_.durabilityPendingBytesAtBatchStart = pendingBytesAtBatchStart;
+    durabilityCompletedAt_ = Clock::now();
+    durabilityCallbackDispatchedAt_ = Clock::time_point{};
+    metrics_.durabilityCallbackDispatchNanoseconds = 0;
+    metrics_.completionWakeupNanoseconds = 0;
     metrics_.durableSequence = durableSequence;
     metrics_.groupBatchBytes = batchBytes;
     metrics_.groupBatchItems = batchItems;
@@ -583,6 +657,22 @@ void FastDataStore::WriteSession::completeGroupCommit(
     } else {
         failed_ = true;
     }
+}
+
+void FastDataStore::WriteSession::markDurabilityCallbackDispatched()
+{
+    if(durabilityCompletedAt_ == Clock::time_point{}) return;
+    durabilityCallbackDispatchedAt_ = Clock::now();
+    metrics_.durabilityCallbackDispatchNanoseconds = elapsedNanoseconds(
+        durabilityCompletedAt_, durabilityCallbackDispatchedAt_);
+}
+
+void FastDataStore::WriteSession::markCompletionCallbackObserved()
+{
+    if(durabilityCallbackDispatchedAt_ == Clock::time_point{}) return;
+    const auto observedAt = Clock::now();
+    metrics_.completionWakeupNanoseconds = elapsedNanoseconds(
+        durabilityCallbackDispatchedAt_, observedAt);
 }
 
 void FastDataStore::WriteSession::abort() {
@@ -603,9 +693,17 @@ bool FastDataStore::open() {
     leveldb::Options options;
     options.create_if_missing = true;
     options.paranoid_checks = true;
+    const std::string indexDirectory = config_.physicalIndexDirectory.empty()
+        ? dataDirectory_ + "/physical_index" : config_.physicalIndexDirectory;
+    std::filesystem::create_directories(indexDirectory, ec);
+    if (ec) {
+        ::close(dataFd_);
+        dataFd_ = -1;
+        return false;
+    }
     leveldb::DB* rawDb = nullptr;
     const leveldb::Status status = leveldb::DB::Open(
-        options, dataDirectory_ + "/physical_index", &rawDb);
+        options, indexDirectory, &rawDb);
     if (!status.ok()) {
         ::close(dataFd_);
         dataFd_ = -1;
@@ -695,9 +793,16 @@ void FastDataStore::recordPwriteCompletion(uint64_t bytes)
 bool FastDataStore::commitDurabilityBatch(
     std::vector<PendingDurability>& batch, uint64_t durableSequence,
     uint64_t& dataSyncNanoseconds, uint64_t& indexNanoseconds,
+    uint64_t& indexMutexWaitNanoseconds,
+    uint64_t& indexBatchBuildNanoseconds,
+    uint64_t& indexWriteNanoseconds,
     bool& dataSyncAttempted, bool& indexSyncAttempted) {
     (void)durableSequence;
     if(batch.empty() || dataFd_ < 0 || indexDb_ == nullptr) return false;
+
+    indexMutexWaitNanoseconds = 0;
+    indexBatchBuildNanoseconds = 0;
+    indexWriteNanoseconds = 0;
 
     const auto syncStarted = Clock::now();
     dataSyncAttempted = true;
@@ -709,7 +814,11 @@ bool FastDataStore::commitDurabilityBatch(
     const auto indexStarted = Clock::now();
     bool indexSuccess = false;
     {
-        std::lock_guard<std::mutex> lock(mutex_);
+        const auto indexMutexWaitStarted = Clock::now();
+        std::unique_lock<std::mutex> lock(mutex_);
+        indexMutexWaitNanoseconds = elapsedNanoseconds(
+            indexMutexWaitStarted, Clock::now());
+        const auto indexBatchBuildStarted = Clock::now();
         leveldb::WriteBatch writeBatch;
         std::unordered_set<std::string> publishedInBatch;
         for(PendingDurability& request : batch) {
@@ -724,6 +833,8 @@ bool FastDataStore::commitDurabilityBatch(
             PhysicalExtent extent;
             if(session.discard_) {
                 if(!existed) {
+                    indexBatchBuildNanoseconds = elapsedNanoseconds(
+                        indexBatchBuildStarted, Clock::now());
                     indexNanoseconds = elapsedNanoseconds(indexStarted, Clock::now());
                     return false;
                 }
@@ -732,6 +843,8 @@ bool FastDataStore::commitDurabilityBatch(
                 extent = {session.offset_, session.expectedSize_};
             }
             if(extent.length == 0) {
+                indexBatchBuildNanoseconds = elapsedNanoseconds(
+                    indexBatchBuildStarted, Clock::now());
                 indexNanoseconds = elapsedNanoseconds(indexStarted, Clock::now());
                 return false;
             }
@@ -742,11 +855,15 @@ bool FastDataStore::commitDurabilityBatch(
         }
 
         indexSyncAttempted = true;
+        const auto indexWriteStarted = Clock::now();
+        indexBatchBuildNanoseconds = elapsedNanoseconds(
+            indexBatchBuildStarted, indexWriteStarted);
         if(!(config_.failIndexSync && config_.failIndexSync())) {
             leveldb::WriteOptions options;
             options.sync = true;
             indexSuccess = indexDb_->Write(options, &writeBatch).ok();
         }
+        indexWriteNanoseconds = elapsedNanoseconds(indexWriteStarted, Clock::now());
     }
     indexNanoseconds = elapsedNanoseconds(indexStarted, Clock::now());
     return indexSuccess;

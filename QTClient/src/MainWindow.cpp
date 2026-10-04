@@ -135,7 +135,9 @@ void MainWindow::buildUi() {
         QStringLiteral("Select a catalog object to use its original name"));
     auto* upload = new QPushButton(QStringLiteral("Upload file..."), actions);
     auto* download = new QPushButton(QStringLiteral("Download ObjectRef..."), actions);
-    auto* openPlayer = new QPushButton(QStringLiteral("Open video player..."), actions);
+    // This opens the local-file diagnostic player. Storage-backed VOD starts
+    // from a Virtual directory entry through "Play via Edge (lab)" below.
+    auto* openPlayer = new QPushButton(QStringLiteral("Open local video player..."), actions);
     verifyRoundTrip_ = new QCheckBox(QStringLiteral("Upload then download + SHA-256 verify"), actions);
     actionLayout->addWidget(new QLabel(QStringLiteral("Object ID"), actions), 0, 0);
     actionLayout->addWidget(objectId_, 0, 1);

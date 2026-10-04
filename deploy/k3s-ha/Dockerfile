@@ -16,6 +16,7 @@ RUN apt-get update \
 COPY build-ha/bin/minikv_metadata_raft_service /usr/local/bin/
 COPY build-ha/bin/minikv_v2_gateway /usr/local/bin/
 COPY build-ha/bin/minikv_v2_datanode /usr/local/bin/
+COPY build-ha/bin/minidriver_edge_cache /usr/local/bin/
 COPY build-ha/bin/minikv_v2_bench /usr/local/bin/
 COPY build-ha/bin/minikv_storage_sync_probe /usr/local/bin/
 

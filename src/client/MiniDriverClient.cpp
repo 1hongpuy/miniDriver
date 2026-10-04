@@ -302,80 +302,105 @@ bool putChunk(const ClientConfig& config, const std::filesystem::path& inputPath
         ",\"hash\":\"" + routeKey + "\",\"size\":" + std::to_string(size) +
         ",\"checksumType\":\"" + miniKV::util::jsonEscape(checksumType) +
         "\",\"checksumDigest\":\"" + checksum + "\"}]}";
-    HttpResponse routes;
     const std::string routePath = "/api/v2/upload/sessions/" + pathEscape(sessionId) + "/routes";
-    bool routed = false;
-    const auto routeStartedAt = std::chrono::steady_clock::now();
-    for (uint32_t attempt = 0; attempt < 6; ++attempt) {
-        std::string routeError;
-        if (!httpRequest(config.gateway, "POST", routePath, {{"Content-Type", "application/json"}}, routeBody,
-                         config.gatewayTimeoutMs, routes, routeError)) {
-            error = routeError;
-        } else if (routes.status >= 200 && routes.status < 300) {
-            routed = true;
-            break;
-        } else if (routes.status != 503) {
-            error = "POST " + routePath + " HTTP " + std::to_string(routes.status) + ": " + routes.body;
-            return false;
-        } else {
-            error = "route admission stayed full";
+    // A route/capability is intentionally reacquired for every transient
+    // DataNode retry. The first PUT may have reached the node even when its
+    // response was lost; the same session + chunk index makes that retry
+    // idempotent while a fresh capability avoids reusing a stale token.
+    std::string lastDataError;
+    for (uint32_t dataAttempt = 0; dataAttempt < 3; ++dataAttempt) {
+        HttpResponse routes;
+        bool routed = false;
+        const auto routeStartedAt = std::chrono::steady_clock::now();
+        for (uint32_t routeAttempt = 0; routeAttempt < 6; ++routeAttempt) {
+            std::string routeError;
+            if (!httpRequest(config.gateway, "POST", routePath,
+                             {{"Content-Type", "application/json"}}, routeBody,
+                             config.gatewayTimeoutMs, routes, routeError)) {
+                error = routeError;
+            } else if (routes.status >= 200 && routes.status < 300) {
+                routed = true;
+                break;
+            } else if (routes.status != 503) {
+                error = "POST " + routePath + " HTTP " + std::to_string(routes.status) + ": " + routes.body;
+                return false;
+            } else {
+                error = "route admission stayed full";
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(25U * (routeAttempt + 1U)));
         }
-        std::this_thread::sleep_for(std::chrono::milliseconds(25U * (attempt + 1U)));
-    }
-    if (!routed) return false;
-    timings.routeCapabilityMs += std::chrono::duration<double, std::milli>(
-        std::chrono::steady_clock::now() - routeStartedAt).count();
-    const std::vector<std::string> values = miniKV::util::jsonObjectArray(routes.body, "routes");
-    if (values.size() != 1) { error = "invalid route response"; return false; }
-    const std::string& route = values.front();
-    Endpoint primary{miniKV::util::jsonString(route, "primaryAddress"),
-                     static_cast<uint16_t>(miniKV::util::jsonUint(route, "primaryPort"))};
-    const std::string primaryId = miniKV::util::jsonString(route, "primaryNodeId");
-    const std::string token = miniKV::util::jsonString(route, "uploadToken");
-    std::string identity = miniKV::util::jsonString(route, "storageIdentity");
-    if (identity.empty()) identity = routeKey;
-    std::string chain;
-    if (primary.host.empty() || primary.port == 0 || primaryId.empty() || token.empty() ||
-        !replicaChain(route, chain, error)) {
-        if (error.empty()) error = "invalid upload route";
-        return false;
-    }
-    std::ifstream input(inputPath, std::ios::binary);
-    if (!input) { error = "cannot reopen upload input"; return false; }
-    input.seekg(static_cast<std::streamoff>(offset));
-    if (!input) { error = "cannot seek upload input"; return false; }
-    const std::map<std::string, std::string> headers{
-        {"Content-Type", "application/octet-stream"}, {"X-Session-Id", sessionId},
-        {"X-Chunk-Index", std::to_string(chunkIndex)}, {"X-Commit-Owner", primaryId},
-        {"X-Gateway-Address", config.gateway.host}, {"X-Gateway-Port", std::to_string(config.gateway.port)},
-        {"X-Replica-Chain", chain}, {"X-Replica-Position", "0"}, {"X-Upload-Token", token},
-    };
-    const auto dataNodeStartedAt = std::chrono::steady_clock::now();
-    StreamingRequest request;
-    if (!request.open(primary, "PUT", "/v2/chunks/" + pathEscape(identity), headers, size,
-                      config.dataNodeTimeoutMs, error)) return false;
-    std::array<char, 64 * 1024> buffer{};
-    uint64_t remaining = size;
-    while (remaining > 0) {
-        const size_t wanted = static_cast<size_t>(std::min<uint64_t>(remaining, buffer.size()));
-        input.read(buffer.data(), static_cast<std::streamsize>(wanted));
-        if (static_cast<size_t>(input.gcount()) != wanted || !request.write(buffer.data(), wanted, error)) {
-            if (error.empty()) error = "cannot read upload input";
+        if (!routed) return false;
+        timings.routeCapabilityMs += std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - routeStartedAt).count();
+
+        const std::vector<std::string> values = miniKV::util::jsonObjectArray(routes.body, "routes");
+        if (values.size() != 1) { error = "invalid route response"; return false; }
+        const std::string& route = values.front();
+        Endpoint primary{miniKV::util::jsonString(route, "primaryAddress"),
+                         static_cast<uint16_t>(miniKV::util::jsonUint(route, "primaryPort"))};
+        const std::string primaryId = miniKV::util::jsonString(route, "primaryNodeId");
+        const std::string token = miniKV::util::jsonString(route, "uploadToken");
+        std::string identity = miniKV::util::jsonString(route, "storageIdentity");
+        if (identity.empty()) identity = routeKey;
+        std::string chain;
+        if (primary.host.empty() || primary.port == 0 || primaryId.empty() || token.empty() ||
+            !replicaChain(route, chain, error)) {
+            if (error.empty()) error = "invalid upload route";
             return false;
         }
-        remaining -= wanted;
+        std::ifstream input(inputPath, std::ios::binary);
+        if (!input) { error = "cannot reopen upload input"; return false; }
+        input.seekg(static_cast<std::streamoff>(offset));
+        if (!input) { error = "cannot seek upload input"; return false; }
+        const std::map<std::string, std::string> headers{
+            {"Content-Type", "application/octet-stream"}, {"X-Session-Id", sessionId},
+            {"X-Chunk-Index", std::to_string(chunkIndex)}, {"X-Commit-Owner", primaryId},
+            {"X-Gateway-Address", config.gateway.host}, {"X-Gateway-Port", std::to_string(config.gateway.port)},
+            {"X-Replica-Chain", chain}, {"X-Replica-Position", "0"}, {"X-Upload-Token", token},
+        };
+        const auto dataNodeStartedAt = std::chrono::steady_clock::now();
+        StreamingRequest request;
+        std::string attemptError;
+        bool bodySent = request.open(primary, "PUT", "/v2/chunks/" + pathEscape(identity), headers, size,
+                                     config.dataNodeTimeoutMs, attemptError);
+        if (bodySent) {
+            std::array<char, 64 * 1024> buffer{};
+            uint64_t remaining = size;
+            while (remaining > 0) {
+                const size_t wanted = static_cast<size_t>(std::min<uint64_t>(remaining, buffer.size()));
+                input.read(buffer.data(), static_cast<std::streamsize>(wanted));
+                if (static_cast<size_t>(input.gcount()) != wanted || !request.write(buffer.data(), wanted, attemptError)) {
+                    if (attemptError.empty()) attemptError = "cannot read upload input";
+                    bodySent = false;
+                    break;
+                }
+                remaining -= wanted;
+            }
+        }
+        HttpResponse response;
+        if (bodySent && request.finish(response, attemptError) && response.status == 200) {
+            timings.dataNodeUploadMs += std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - dataNodeStartedAt).count();
+            timings.chunkUploadTotalMs += std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - chunkStartedAt).count();
+            return true;
+        }
+        if (attemptError.empty()) {
+            attemptError = "DataNode PUT HTTP " + std::to_string(response.status) + ": " + response.body;
+        }
+        lastDataError = attemptError;
+        // Client-side transport errors and 5xx are transient.  4xx responses
+        // describe an invalid route/token/request and must be surfaced instead.
+        if (response.status >= 400 && response.status < 500) {
+            error = lastDataError;
+            return false;
+        }
+        if (dataAttempt + 1 < 3) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(75U * (dataAttempt + 1U)));
+        }
     }
-    HttpResponse response;
-    if (!request.finish(response, error)) return false;
-    if (response.status != 200) {
-        error = "DataNode PUT HTTP " + std::to_string(response.status) + ": " + response.body;
-        return false;
-    }
-    timings.dataNodeUploadMs += std::chrono::duration<double, std::milli>(
-        std::chrono::steady_clock::now() - dataNodeStartedAt).count();
-    timings.chunkUploadTotalMs += std::chrono::duration<double, std::milli>(
-        std::chrono::steady_clock::now() - chunkStartedAt).count();
-    return true;
+    error = lastDataError.empty() ? "DataNode chunk upload failed after retries" : lastDataError;
+    return false;
 }
 
 }  // namespace

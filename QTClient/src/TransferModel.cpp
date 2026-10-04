@@ -66,6 +66,7 @@ QVariant TransferModel::data(const QModelIndex& index, int role) const {
     case EtaColumn:
         if (row.etaSeconds < 0 || row.state == TransferState::Completed) return QStringLiteral("-");
         return QStringLiteral("%1s").arg(row.etaSeconds);
+    case AttemptColumn: return row.attempt;
     case StateColumn: return stateText(row.state);
     case ResultColumn: return row.state == TransferState::Failed ? row.error : row.result;
     default: return {};
@@ -75,7 +76,7 @@ QVariant TransferModel::data(const QModelIndex& index, int role) const {
 QVariant TransferModel::headerData(int section, Qt::Orientation orientation, int role) const {
     if (orientation != Qt::Horizontal || role != Qt::DisplayRole) return {};
     static const QStringList headers = {
-        "Task", "Direction", "Name/Object", "Progress", "Speed", "Elapsed", "ETA", "State", "Result"
+        "Task", "Direction", "Name/Object", "Progress", "Speed", "Elapsed", "ETA", "Attempt", "State", "Result"
     };
     return section >= 0 && section < headers.size() ? headers[section] : QVariant{};
 }

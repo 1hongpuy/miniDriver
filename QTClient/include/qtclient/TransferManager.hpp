@@ -23,6 +23,10 @@ public:
     QString enqueueDownload(const QString& objectId, quint64 objectVersion,
                             const QString& outputPath,
                             const miniKV::client::ClientConfig& config);
+    // Retries the same logical transfer. Upload retries retain commandId, so
+    // Raft preflight returns the original session and skips committed chunks.
+    bool retry(const QString& taskId, const miniKV::client::ClientConfig& config,
+               QString& error);
     bool hasActiveTasks() const noexcept { return !active_.isEmpty(); }
 
 signals:
@@ -47,7 +51,10 @@ private:
     static constexpr int kMaxActiveTasks = 2;
     QQueue<TransferSpec> pending_;
     QHash<QString, ActiveTask> active_;
+    QHash<QString, TransferSpec> taskSpecs_;
     QSet<QString> finishedTasks_;
+    QSet<QString> failedTasks_;
+    QSet<QString> retryPending_;
 };
 
 }  // namespace miniKV::qtclient

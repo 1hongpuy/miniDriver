@@ -73,6 +73,26 @@ void applyRates(TransferSnapshot& snapshot, const RateValues& values) {
     snapshot.etaSeconds = values.etaSeconds;
 }
 
+class UiProgressThrottle {
+public:
+    bool shouldEmit(uint64_t completed, uint64_t total) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        const auto now = std::chrono::steady_clock::now();
+        const bool terminal = total != 0 && completed >= total;
+        if (terminal || !haveLast_ || now - lastAt_ >= std::chrono::milliseconds(125)) {
+            haveLast_ = true;
+            lastAt_ = now;
+            return true;
+        }
+        return false;
+    }
+
+private:
+    std::mutex mutex_;
+    bool haveLast_ = false;
+    std::chrono::steady_clock::time_point lastAt_{};
+};
+
 }  // namespace
 
 TransferWorker::TransferWorker(TransferSpec spec, QObject* parent)
@@ -106,17 +126,18 @@ void TransferWorker::runUpload() {
     std::string error;
     const uint64_t total = static_cast<uint64_t>(QFileInfo(spec_.localPath).size());
     RateMeter meter;
+    UiProgressThrottle uiThrottle;
     TransferSnapshot initial = baseSnapshot(TransferState::Running, QStringLiteral("upload"));
     initial.totalBytes = total;
     emit progress(initial);
     const bool ok = adapter.upload(
         std::filesystem::path(spec_.localPath.toStdWString()),
-        [this, total, &meter](uint64_t completed, uint64_t) {
+        [this, total, &meter, &uiThrottle](uint64_t completed, uint64_t) {
             TransferSnapshot snapshot = baseSnapshot(TransferState::Running, QStringLiteral("upload"));
             snapshot.completedBytes = completed;
             snapshot.totalBytes = total;
             applyRates(snapshot, meter.sample(completed, total));
-            emit progress(snapshot);
+            if (uiThrottle.shouldEmit(completed, total)) emit progress(snapshot);
         }, object, error, spec_.commandId.toStdString());
     if (!ok) {
         emitFailure(QStringLiteral("upload"), error);
@@ -184,16 +205,17 @@ void TransferWorker::runDownload() {
     uint64_t total = 0;
     uint64_t lastCompleted = 0;
     RateMeter meter;
+    UiProgressThrottle uiThrottle;
     const bool ok = adapter.download(
         object, std::filesystem::path(spec_.localPath.toStdWString()),
-        [this, &total, &lastCompleted, &meter](uint64_t completed, uint64_t reportedTotal) {
+        [this, &total, &lastCompleted, &meter, &uiThrottle](uint64_t completed, uint64_t reportedTotal) {
             lastCompleted = completed;
             total = reportedTotal;
             TransferSnapshot snapshot = baseSnapshot(TransferState::Running, QStringLiteral("download"));
             snapshot.completedBytes = completed;
             snapshot.totalBytes = total;
             applyRates(snapshot, meter.sample(completed, total));
-            emit progress(snapshot);
+            if (uiThrottle.shouldEmit(completed, total)) emit progress(snapshot);
         }, error);
     if (!ok) {
         emitFailure(QStringLiteral("download"), error);

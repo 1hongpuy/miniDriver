@@ -19,6 +19,7 @@ public:
         SpeedColumn,
         ElapsedColumn,
         EtaColumn,
+        AttemptColumn,
         StateColumn,
         ResultColumn,
         ColumnCount,

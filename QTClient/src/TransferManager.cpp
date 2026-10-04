@@ -28,6 +28,7 @@ TransferSnapshot TransferManager::initialSnapshot(const TransferSpec& spec) cons
     snapshot.objectVersion = spec.objectVersion;
     snapshot.localPath = spec.localPath;
     snapshot.stage = QStringLiteral("queued");
+    snapshot.attempt = spec.attempt;
     return snapshot;
 }
 
@@ -41,6 +42,7 @@ QString TransferManager::enqueueUpload(const QString& localPath,
     spec.verifyRoundTrip = verifyRoundTrip;
     spec.commandId = QStringLiteral("qt-upload-") + spec.taskId;
     spec.clientConfig = config;
+    taskSpecs_.insert(spec.taskId, spec);
     pending_.enqueue(spec);
     emit taskAdded(initialSnapshot(spec));
     emit log({spec.taskId, QStringLiteral("manager"), QStringLiteral("upload queued")});
@@ -58,6 +60,7 @@ QString TransferManager::enqueueDownload(const QString& objectId, quint64 object
     spec.objectId = objectId;
     spec.objectVersion = objectVersion;
     spec.clientConfig = config;
+    taskSpecs_.insert(spec.taskId, spec);
     pending_.enqueue(spec);
     emit taskAdded(initialSnapshot(spec));
     emit log({spec.taskId, QStringLiteral("manager"), QStringLiteral("download queued")});
@@ -65,13 +68,57 @@ QString TransferManager::enqueueDownload(const QString& objectId, quint64 object
     return spec.taskId;
 }
 
+bool TransferManager::retry(const QString& taskId,
+                            const miniKV::client::ClientConfig& config,
+                            QString& error) {
+    const auto found = taskSpecs_.constFind(taskId);
+    if (found == taskSpecs_.cend()) {
+        error = QStringLiteral("Unknown transfer task");
+        return false;
+    }
+    if (!failedTasks_.contains(taskId)) {
+        error = QStringLiteral("Only a failed transfer can be retried");
+        return false;
+    }
+    if (retryPending_.contains(taskId)) {
+        error = QStringLiteral("Retry is already queued");
+        return false;
+    }
+
+    TransferSpec spec = found.value();
+    spec.clientConfig = config;
+    ++spec.attempt;
+    taskSpecs_.insert(taskId, spec);
+    retryPending_.insert(taskId);
+    failedTasks_.remove(taskId);
+    finishedTasks_.remove(taskId);
+    pending_.enqueue(spec);
+    emit taskUpdated(initialSnapshot(spec));
+    emit log({taskId, QStringLiteral("manager"),
+              QStringLiteral("retry queued; attempt %1; upload keeps its original command ID")
+                  .arg(spec.attempt)});
+    startNext();
+    return true;
+}
+
 void TransferManager::startNext() {
-    while (active_.size() < kMaxActiveTasks && !pending_.isEmpty()) {
-        startTask(pending_.dequeue());
+    // A Retry can be queued while its failed worker is still unwinding. Never
+    // overlap attempts of the same logical task/session; defer that entry
+    // until QThread::finished removes the old ActiveTask.
+    const int queuedAtEntry = pending_.size();
+    for (int index = 0; index < queuedAtEntry && active_.size() < kMaxActiveTasks &&
+                        !pending_.isEmpty(); ++index) {
+        TransferSpec next = pending_.dequeue();
+        if (active_.contains(next.taskId)) {
+            pending_.enqueue(std::move(next));
+            continue;
+        }
+        startTask(next);
     }
 }
 
 void TransferManager::startTask(const TransferSpec& spec) {
+    retryPending_.remove(spec.taskId);
     auto* thread = new QThread(this);
     auto* worker = new TransferWorker(spec);
     worker->moveToThread(thread);
@@ -102,6 +149,8 @@ void TransferManager::onProgress(const TransferSnapshot& snapshot) {
 
 void TransferManager::onFinished(const TransferSnapshot& snapshot) {
     finishedTasks_.insert(snapshot.taskId);
+    if (snapshot.state == TransferState::Failed) failedTasks_.insert(snapshot.taskId);
+    else failedTasks_.remove(snapshot.taskId);
     emit taskUpdated(snapshot);
 }
 

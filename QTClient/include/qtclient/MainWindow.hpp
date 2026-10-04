@@ -24,6 +24,7 @@
 #include <QUrl>
 
 class QDialog;
+class QPushButton;
 
 namespace miniKV::qtclient {
 
@@ -39,6 +40,7 @@ protected:
 private slots:
     void chooseUpload();
     void chooseDownload();
+    void retrySelectedTransfer();
     void showTask(const miniKV::qtclient::TransferSnapshot& snapshot);
     void appendLog(const miniKV::qtclient::LogEvent& event);
     void updateHeartbeat();
@@ -81,6 +83,7 @@ private:
     LogModel* logModel_ = nullptr;
     TransferManager* transferManager_ = nullptr;
     QTableView* transferView_ = nullptr;
+    QPushButton* retryTransferButton_ = nullptr;
     QTabWidget* contentTabs_ = nullptr;
     QTreeWidget* catalogView_ = nullptr;
     QPushButton* catalogRefreshButton_ = nullptr;

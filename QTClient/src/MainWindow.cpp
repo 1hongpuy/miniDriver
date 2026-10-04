@@ -148,15 +148,19 @@ void MainWindow::buildUi() {
     actionLayout->addWidget(upload, 2, 0, 1, 2);
     actionLayout->addWidget(download, 2, 2, 1, 2);
     actionLayout->addWidget(openPlayer, 3, 0, 1, 4);
-    actionLayout->addWidget(verifyRoundTrip_, 4, 0, 1, 4);
+    actionLayout->addWidget(verifyRoundTrip_, 4, 0, 1, 3);
+    retryTransferButton_ = new QPushButton(QStringLiteral("Retry selected failed transfer"), actions);
+    actionLayout->addWidget(retryTransferButton_, 4, 3);
     root->addWidget(actions);
     connect(upload, &QPushButton::clicked, this, &MainWindow::chooseUpload);
     connect(download, &QPushButton::clicked, this, &MainWindow::chooseDownload);
     connect(openPlayer, &QPushButton::clicked, this, &MainWindow::showVideoPlayerWindow);
+    connect(retryTransferButton_, &QPushButton::clicked, this, &MainWindow::retrySelectedTransfer);
 
     transferView_ = new QTableView(central);
     transferView_->setModel(transferModel_);
-    transferView_->setSelectionMode(QAbstractItemView::NoSelection);
+    transferView_->setSelectionBehavior(QAbstractItemView::SelectRows);
+    transferView_->setSelectionMode(QAbstractItemView::SingleSelection);
     transferView_->horizontalHeader()->setStretchLastSection(true);
     transferView_->horizontalHeader()->setSectionResizeMode(QHeaderView::ResizeToContents);
 
@@ -392,6 +396,24 @@ void MainWindow::chooseDownload() {
     const QString taskId = transferManager_->enqueueDownload(
         objectId_->text().trimmed(), version, output, clientConfig());
     statusBar()->showMessage(QStringLiteral("Download queued: %1").arg(taskId));
+}
+
+void MainWindow::retrySelectedTransfer() {
+    if (transferView_ == nullptr || transferView_->selectionModel() == nullptr) return;
+    const QModelIndex index = transferView_->selectionModel()->currentIndex();
+    if (!index.isValid()) {
+        QMessageBox::information(this, QStringLiteral("Retry transfer"),
+                                 QStringLiteral("Select a failed row in Transfers first."));
+        return;
+    }
+    const QString taskId = transferModel_->data(transferModel_->index(index.row(),
+        TransferModel::TaskColumn), Qt::DisplayRole).toString();
+    QString failure;
+    if (!transferManager_->retry(taskId, clientConfig(), failure)) {
+        QMessageBox::information(this, QStringLiteral("Retry transfer"), failure);
+        return;
+    }
+    statusBar()->showMessage(QStringLiteral("Retry queued for %1").arg(taskId), 5000);
 }
 
 void MainWindow::showTask(const TransferSnapshot& snapshot) {

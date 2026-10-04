@@ -7,6 +7,7 @@
 #include <array>
 #include <cerrno>
 #include <cstring>
+#include <condition_variable>
 #include <fstream>
 #include <iomanip>
 #include <list>
@@ -128,6 +129,7 @@ struct CacheLease::State {
 
     EdgeCacheStore::Config config;
     mutable std::mutex mutex;
+    std::condition_variable ready;
     std::unordered_map<std::string, Entry> entries;
     std::unordered_set<std::string> filling;
     uint64_t readyBytes = 0;
@@ -144,9 +146,12 @@ struct CacheLease::State {
         if (found != entries.end() && found->second.pins > 0) --found->second.pins;
     }
     void releaseReservation(const std::string& id, uint64_t bytes) noexcept {
-        std::lock_guard<std::mutex> lock(mutex);
-        reservedBytes = bytes > reservedBytes ? 0 : reservedBytes - bytes;
-        filling.erase(id);
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            reservedBytes = bytes > reservedBytes ? 0 : reservedBytes - bytes;
+            filling.erase(id);
+        }
+        ready.notify_all();
     }
 };
 
@@ -304,6 +309,26 @@ bool EdgeCacheStore::acquire(const EdgeCacheKey& key, CacheLease& out, std::stri
     return true;
 }
 
+bool EdgeCacheStore::waitForReady(const EdgeCacheKey& key, CacheLease& out,
+                                  std::chrono::milliseconds timeout, std::string& error) {
+    out.reset();
+    std::unique_lock<std::mutex> lock(state_->mutex);
+    const auto readyNow = [&] {
+        return state_->entries.find(key.id) != state_->entries.end() ||
+               state_->filling.find(key.id) == state_->filling.end();
+    };
+    if (!state_->ready.wait_for(lock, timeout, readyNow)) {
+        error = "timed out waiting for concurrent edge cache fill";
+        return false;
+    }
+    if (state_->entries.find(key.id) == state_->entries.end()) {
+        error = "concurrent edge cache fill did not publish a ready Chunk";
+        return false;
+    }
+    lock.unlock();
+    return acquire(key, out, error);
+}
+
 bool EdgeCacheStore::reserve(const EdgeCacheKey& key, CacheReservation& out, std::string& error) {
     out.reset();
     std::lock_guard<std::mutex> lock(state_->mutex);
@@ -378,6 +403,7 @@ bool EdgeCacheStore::publish(const EdgeCacheKey& key, const std::string& bytes,
             state_->readyBytes += key.size;
             found->second.pins = 1;
             out = CacheLease(state_, key.id, body, key.size);
+            state_->ready.notify_all();
             return true;
         }
     }

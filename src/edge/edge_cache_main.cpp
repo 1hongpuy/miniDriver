@@ -291,6 +291,10 @@ public:
           virtualPath_(std::move(virtualPath)) {}
 
     void start() {
+        std::cerr << "event=edge_stream_begin virtual_path=" << virtualPath_
+                  << " range_start=" << start_
+                  << " range_length=" << length_
+                  << " parts=" << parts_.size() << '\n';
         connection_->pauseRead();
         enqueueNextChunk();
     }
@@ -315,33 +319,53 @@ private:
         const EdgeCacheKey key = EdgeCacheKey::fromChunk(info_.object, part.chunk);
         CacheLease lease;
         std::string cacheError;
-        if (!config_.cache->acquire(key, lease, cacheError)) {
+        bool cacheHit = config_.cache->acquire(key, lease, cacheError);
+        if (!cacheHit) {
             CacheReservation reservation;
             if (!config_.cache->reserve(key, reservation, cacheError)) {
-                finish(false, "edge cache fill unavailable: " + cacheError);
-                return;
+                if (cacheError == "edge cache fill already active") {
+                    std::cerr << "event=edge_stream_wait_fill virtual_path=" << virtualPath_
+                              << " part=" << index << '\n';
+                    if (!config_.cache->waitForReady(key, lease, std::chrono::seconds(90), cacheError)) {
+                        finish(false, "edge cache concurrent fill unavailable: " + cacheError);
+                        return;
+                    }
+                    cacheHit = true;
+                } else {
+                    finish(false, "edge cache fill unavailable: " + cacheError);
+                    return;
+                }
             }
-            MiniDriverClient client(config_.client);
-            ReadOptions options;
-            options.keepAlive = true;
-            options.verifyChecksum = true;
-            TransferStats stats;
-            std::string body;
-            std::string failure;
-            if (!client.readWholeChunk(part.chunk, body, options, stats, failure)) {
-                finish(false, "origin chunk read failed: " + failure);
-                return;
+            if (!cacheHit) {
+                MiniDriverClient client(config_.client);
+                ReadOptions options;
+                options.keepAlive = true;
+                options.verifyChecksum = true;
+                TransferStats stats;
+                std::string body;
+                std::string failure;
+                if (!client.readWholeChunk(part.chunk, body, options, stats, failure)) {
+                    finish(false, "origin chunk read failed: " + failure);
+                    return;
+                }
+                originBytes_.fetch_add(body.size(), std::memory_order_relaxed);
+                originRequests_.fetch_add(stats.dataRequests, std::memory_order_relaxed);
+                replicaFallbacks_.fetch_add(stats.replicaFallbacks, std::memory_order_relaxed);
+                if (!config_.cache->publish(key, body, reservation, lease, cacheError)) {
+                    finish(false, "edge cache publish failed: " + cacheError);
+                    return;
+                }
             }
-            originBytes_.fetch_add(body.size(), std::memory_order_relaxed);
-            originRequests_.fetch_add(stats.dataRequests, std::memory_order_relaxed);
-            replicaFallbacks_.fetch_add(stats.replicaFallbacks, std::memory_order_relaxed);
-            if (!config_.cache->publish(key, body, reservation, lease, cacheError)) {
-                finish(false, "edge cache publish failed: " + cacheError);
-                return;
-            }
-        } else {
+        }
+        if (cacheHit) {
             cacheHits_.fetch_add(1, std::memory_order_relaxed);
         }
+
+        std::cerr << "event=edge_stream_part_ready virtual_path=" << virtualPath_
+                  << " part=" << index
+                  << " source=" << (cacheHit ? "cache" : "origin")
+                  << " segment_offset=" << part.cacheOffset
+                  << " segment_length=" << part.length << '\n';
 
         const bool sendHeaders = !headersScheduled_.exchange(true, std::memory_order_relaxed);
         const std::string path = lease.path().string();
@@ -375,6 +399,8 @@ private:
                                 std::to_string(sent.bytesSent) + " bytes");
                             return;
                         }
+                        std::cerr << "event=edge_stream_part_sent virtual_path=" << self->virtualPath_
+                                  << " bytes=" << bytes << '\n';
                         self->enqueueNextChunk();
                     });
             });

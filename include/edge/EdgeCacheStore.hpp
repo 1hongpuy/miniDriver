@@ -2,6 +2,7 @@
 
 #include "client/MiniDriverClient.hpp"
 
+#include <chrono>
 #include <cstdint>
 #include <filesystem>
 #include <memory>
@@ -92,6 +93,10 @@ public:
     bool initialize(std::string& error);
 
     bool acquire(const EdgeCacheKey& key, CacheLease& out, std::string& error);
+    // Wait for a concurrent immutable fill of this exact key to publish. This
+    // coalesces independent HTTP ranges that require the same cold Chunk.
+    bool waitForReady(const EdgeCacheKey& key, CacheLease& out,
+                      std::chrono::milliseconds timeout, std::string& error);
     bool reserve(const EdgeCacheKey& key, CacheReservation& out, std::string& error);
     bool publish(const EdgeCacheKey& key, const std::string& bytes,
                  CacheReservation& reservation, CacheLease& out, std::string& error);

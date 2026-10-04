@@ -72,6 +72,9 @@ private:
     QLineEdit* metadataMode_ = nullptr;
     QLineEdit* objectId_ = nullptr;
     QLineEdit* objectVersion_ = nullptr;
+    // UI-only suggested output name. A catalog selection supplies the
+    // original upload name here; it is never sent as part of ObjectRef.
+    QLineEdit* downloadName_ = nullptr;
     QLineEdit* catalogPath_ = nullptr;
     QCheckBox* verifyRoundTrip_ = nullptr;
     TransferModel* transferModel_ = nullptr;

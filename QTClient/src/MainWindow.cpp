@@ -130,6 +130,9 @@ void MainWindow::buildUi() {
     auto* actionLayout = new QGridLayout(actions);
     objectId_ = new QLineEdit(actions);
     objectVersion_ = new QLineEdit(QStringLiteral("1"), actions);
+    downloadName_ = new QLineEdit(actions);
+    downloadName_->setPlaceholderText(
+        QStringLiteral("Select a catalog object to use its original name"));
     auto* upload = new QPushButton(QStringLiteral("Upload file..."), actions);
     auto* download = new QPushButton(QStringLiteral("Download ObjectRef..."), actions);
     auto* openPlayer = new QPushButton(QStringLiteral("Open video player..."), actions);
@@ -138,10 +141,12 @@ void MainWindow::buildUi() {
     actionLayout->addWidget(objectId_, 0, 1);
     actionLayout->addWidget(new QLabel(QStringLiteral("Version"), actions), 0, 2);
     actionLayout->addWidget(objectVersion_, 0, 3);
-    actionLayout->addWidget(upload, 1, 0, 1, 2);
-    actionLayout->addWidget(download, 1, 2, 1, 2);
-    actionLayout->addWidget(openPlayer, 2, 0, 1, 4);
-    actionLayout->addWidget(verifyRoundTrip_, 3, 0, 1, 4);
+    actionLayout->addWidget(new QLabel(QStringLiteral("Download file name"), actions), 1, 0);
+    actionLayout->addWidget(downloadName_, 1, 1, 1, 3);
+    actionLayout->addWidget(upload, 2, 0, 1, 2);
+    actionLayout->addWidget(download, 2, 2, 1, 2);
+    actionLayout->addWidget(openPlayer, 3, 0, 1, 4);
+    actionLayout->addWidget(verifyRoundTrip_, 4, 0, 1, 4);
     root->addWidget(actions);
     connect(upload, &QPushButton::clicked, this, &MainWindow::chooseUpload);
     connect(download, &QPushButton::clicked, this, &MainWindow::chooseDownload);
@@ -205,6 +210,22 @@ void MainWindow::buildUi() {
     connect(catalogPlayButton, &QPushButton::clicked,
             this, &MainWindow::playSelectedCatalogObject);
     connect(catalogView_, &QTreeWidget::itemActivated, this, &MainWindow::activateCatalogItem);
+    connect(catalogView_, &QTreeWidget::currentItemChanged, this,
+            [this](QTreeWidgetItem* current, QTreeWidgetItem*) {
+                if (current == nullptr ||
+                    current->data(0, kCatalogKindRole).toString() != QStringLiteral("file")) {
+                    return;
+                }
+                const QString objectId = current->data(0, kCatalogObjectIdRole).toString();
+                const quint64 version = current->data(0, kCatalogObjectVersionRole).toULongLong();
+                if (!objectId.isEmpty() && version > 0) {
+                    objectId_->setText(objectId);
+                    objectVersion_->setText(QString::number(version));
+                }
+                // Catalog names are virtual names. Keep only the leaf before
+                // proposing one as a local output path.
+                downloadName_->setText(QFileInfo(current->text(0)).fileName());
+            });
 
     auto* logView = new QListView(central);
     logView->setModel(logModel_);
@@ -344,6 +365,7 @@ miniKV::client::ClientConfig MainWindow::clientConfig() const {
 void MainWindow::chooseUpload() {
     const QString path = QFileDialog::getOpenFileName(this, QStringLiteral("Select file to upload"));
     if (path.isEmpty()) return;
+    downloadName_->setText(QFileInfo(path).fileName());
     const QString taskId = transferManager_->enqueueUpload(path, clientConfig(),
                                                             verifyRoundTrip_->isChecked());
     statusBar()->showMessage(QStringLiteral("Upload queued: %1").arg(taskId));
@@ -357,7 +379,13 @@ void MainWindow::chooseDownload() {
                              QStringLiteral("Enter a non-empty object ID and positive version."));
         return;
     }
-    const QString output = QFileDialog::getSaveFileName(this, QStringLiteral("Download object to"));
+    QString suggestedName = QFileInfo(downloadName_->text().trimmed()).fileName();
+    if (suggestedName.isEmpty()) {
+        suggestedName = QStringLiteral("%1-v%2.bin")
+            .arg(objectId_->text().trimmed()).arg(version);
+    }
+    const QString output = QFileDialog::getSaveFileName(
+        this, QStringLiteral("Download object to"), suggestedName);
     if (output.isEmpty()) return;
     const QString taskId = transferManager_->enqueueDownload(
         objectId_->text().trimmed(), version, output, clientConfig());
@@ -383,6 +411,7 @@ void MainWindow::showTask(const TransferSnapshot& snapshot) {
             }
         }
         if (snapshot.direction == TransferDirection::Upload) {
+            downloadName_->setText(QFileInfo(snapshot.localPath).fileName());
             if (contentTabs_ != nullptr) contentTabs_->setCurrentIndex(1);
             refreshCatalog();
         }
@@ -459,6 +488,7 @@ void MainWindow::activateCatalogItem(QTreeWidgetItem* item, int) {
     if (!selectedCatalogObject(objectId, version, name)) return;
     objectId_->setText(objectId);
     objectVersion_->setText(QString::number(version));
+    downloadName_->setText(QFileInfo(name).fileName());
     statusBar()->showMessage(QStringLiteral("Selected ObjectRef(%1, v%2)").arg(objectId).arg(version));
 }
 
@@ -480,7 +510,10 @@ void MainWindow::downloadSelectedCatalogObject() {
     quint64 version = 0;
     QString name;
     if (!selectedCatalogObject(objectId, version, name)) return;
-    const QString output = QFileDialog::getSaveFileName(this, QStringLiteral("Download object to"), name);
+    const QString suggestedName = QFileInfo(name).fileName();
+    downloadName_->setText(suggestedName);
+    const QString output = QFileDialog::getSaveFileName(
+        this, QStringLiteral("Download object to"), suggestedName);
     if (output.isEmpty()) return;
     const QString taskId = transferManager_->enqueueDownload(objectId, version, output, clientConfig());
     statusBar()->showMessage(QStringLiteral("Download queued: %1").arg(taskId));

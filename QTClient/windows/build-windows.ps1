@@ -38,7 +38,8 @@ if ($null -eq $Exe) { throw "Built executable was not found below $BuildPath" }
 $Distribution = Join-Path $RepositoryRoot 'dist\MiniDriverQtClient'
 New-Item -ItemType Directory -Force -Path $Distribution | Out-Null
 Copy-Item -Force $Exe $Distribution
-& $DeployQt --$Configuration --compiler-runtime --no-translations (Join-Path $Distribution 'minidriver_qt_client.exe')
+$DeployMode = if ($Configuration -eq 'Debug') { '--debug' } else { '--release' }
+& $DeployQt $DeployMode --compiler-runtime --no-translations (Join-Path $Distribution 'minidriver_qt_client.exe')
 if ($LASTEXITCODE -ne 0) { throw 'windeployqt failed.' }
 
 # Qt's deployer does not own the OpenSSL runtime used by the SDK.

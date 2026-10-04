@@ -163,6 +163,12 @@ private:
 
                         httpCallback_(req, resp.get(), conn, deferred);
 
+                        // A deferred handler owns the response lifetime and will
+                        // schedule its own socket writes later. Without this
+                        // guard, the threaded path emitted an additional empty
+                        // response immediately after a handler called defer().
+                        if(deferred->deferred()) return;
+
                         const auto responseQueuedAt = std::chrono::steady_clock::now();
                         conn->ownerLoop()->queueInLoop([conn, resp, context, diagnostics, responseQueuedAt,
                                                         requestPath](){

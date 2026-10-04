@@ -5,7 +5,9 @@
 #include "http/HttpRequest.hpp"
 #include "http/HttpResponse.hpp"
 #include "http/HttpServer.hpp"
+#include "network/Buffer.hpp"
 #include "network/EventLoop.hpp"
+#include "network/TcpConnection.hpp"
 #include "utils/AsyncLogger.hpp"
 #include "utils/ThreadPool.hpp"
 #include "utils/Util.hpp"
@@ -20,6 +22,7 @@
 #include <iostream>
 #include <limits>
 #include <map>
+#include <memory>
 #include <string>
 #include <string_view>
 #include <unistd.h>
@@ -29,6 +32,7 @@
 namespace {
 
 using miniKV::client::ClientConfig;
+using miniKV::client::ChunkReadPlan;
 using miniKV::client::MiniDriverClient;
 using miniKV::client::ObjectInfo;
 using miniKV::client::ObjectReadPlan;
@@ -41,6 +45,7 @@ using miniKV::edge::EdgeCacheKey;
 using miniKV::edge::EdgeCacheStore;
 using miniKV::http::HttpRequest;
 using miniKV::http::HttpResponse;
+using miniKV::network::TcpConnectionPtr;
 
 std::atomic<bool> gStop{false};
 
@@ -215,6 +220,274 @@ void addObjectHeaders(HttpResponse* response, const ObjectInfo& info,
     }
 }
 
+
+bool requestClosesConnection(const HttpRequest& request) {
+    std::string connection = request.getHeader("Connection");
+    for (char& value : connection) {
+        value = static_cast<char>(std::tolower(static_cast<unsigned char>(value)));
+    }
+    if (connection == "close") return true;
+    if (connection == "keep-alive") return false;
+    return request.version() != "HTTP/1.1";
+}
+
+struct PlaybackStreamPart {
+    ChunkReadPlan chunk;
+    uint64_t cacheOffset = 0;
+    uint64_t length = 0;
+};
+
+bool buildPlaybackStreamParts(const ObjectReadPlan& plan, uint64_t start, uint64_t length,
+                              std::vector<PlaybackStreamPart>& out, std::string& errorMessage) {
+    out.clear();
+    const uint64_t end = start + length;
+    uint64_t objectOffset = 0;
+    for (const ChunkReadPlan& chunk : plan.chunks) {
+        if (chunk.size == 0 || objectOffset > plan.fileSize - chunk.size) {
+            errorMessage = "invalid object chunk layout";
+            return false;
+        }
+        const uint64_t chunkEnd = objectOffset + chunk.size;
+        if (chunkEnd > start && objectOffset < end) {
+            const uint64_t segmentStart = std::max(start, objectOffset);
+            const uint64_t segmentEnd = std::min(end, chunkEnd);
+            const uint64_t segmentLength = segmentEnd - segmentStart;
+            if (segmentLength == 0 ||
+                segmentLength > static_cast<uint64_t>(std::numeric_limits<size_t>::max()) ||
+                segmentStart - objectOffset >
+                    static_cast<uint64_t>(std::numeric_limits<off_t>::max())) {
+                errorMessage = "object range exceeds local file API limits";
+                return false;
+            }
+            out.push_back({chunk, segmentStart - objectOffset, segmentLength});
+        }
+        objectOffset = chunkEnd;
+    }
+    if (objectOffset != plan.fileSize || out.empty()) {
+        errorMessage = "object range does not map to storage chunks";
+        return false;
+    }
+    return true;
+}
+
+// Sends one immutable cached Chunk segment at a time.  This is deliberately
+// different from HttpResponse::setFileBodies(): an open-ended media Range may
+// span a whole multi-hundred-MiB object, and waiting for every Chunk to enter
+// the cache before sending headers makes FFmpeg time out during open().
+class EdgePlaybackStream final : public std::enable_shared_from_this<EdgePlaybackStream> {
+public:
+    EdgePlaybackStream(const EdgeConfig& config, miniKV::utils::ThreadPool* workers,
+                       TcpConnectionPtr connection, ObjectInfo info,
+                       std::vector<PlaybackStreamPart> parts, uint64_t start,
+                       uint64_t length, bool closeAfterResponse, std::string virtualPath)
+        : config_(config),
+          workers_(workers),
+          connection_(std::move(connection)),
+          info_(std::move(info)),
+          parts_(std::move(parts)),
+          start_(start),
+          length_(length),
+          closeAfterResponse_(closeAfterResponse),
+          virtualPath_(std::move(virtualPath)) {}
+
+    void start() {
+        connection_->pauseRead();
+        enqueueNextChunk();
+    }
+
+private:
+    void enqueueNextChunk() {
+        try {
+            auto self = shared_from_this();
+            workers_->enqueue([self] { self->fetchAndSendNextChunk(); });
+        } catch (const std::exception& exception) {
+            finish(false, "cannot schedule Edge Chunk fetch: " + std::string(exception.what()));
+        }
+    }
+
+    void fetchAndSendNextChunk() {
+        const size_t index = nextPart_.fetch_add(1, std::memory_order_relaxed);
+        if (index >= parts_.size()) {
+            finish(true, {});
+            return;
+        }
+        const PlaybackStreamPart& part = parts_[index];
+        const EdgeCacheKey key = EdgeCacheKey::fromChunk(info_.object, part.chunk);
+        CacheLease lease;
+        std::string cacheError;
+        if (!config_.cache->acquire(key, lease, cacheError)) {
+            CacheReservation reservation;
+            if (!config_.cache->reserve(key, reservation, cacheError)) {
+                finish(false, "edge cache fill unavailable: " + cacheError);
+                return;
+            }
+            MiniDriverClient client(config_.client);
+            ReadOptions options;
+            options.keepAlive = true;
+            options.verifyChecksum = true;
+            TransferStats stats;
+            std::string body;
+            std::string failure;
+            if (!client.readWholeChunk(part.chunk, body, options, stats, failure)) {
+                finish(false, "origin chunk read failed: " + failure);
+                return;
+            }
+            originBytes_.fetch_add(body.size(), std::memory_order_relaxed);
+            originRequests_.fetch_add(stats.dataRequests, std::memory_order_relaxed);
+            replicaFallbacks_.fetch_add(stats.replicaFallbacks, std::memory_order_relaxed);
+            if (!config_.cache->publish(key, body, reservation, lease, cacheError)) {
+                finish(false, "edge cache publish failed: " + cacheError);
+                return;
+            }
+        } else {
+            cacheHits_.fetch_add(1, std::memory_order_relaxed);
+        }
+
+        const bool sendHeaders = !headersScheduled_.exchange(true, std::memory_order_relaxed);
+        const std::string path = lease.path().string();
+        const auto heldLease = std::make_shared<CacheLease>(std::move(lease));
+        const off_t offset = static_cast<off_t>(part.cacheOffset);
+        const size_t bytes = static_cast<size_t>(part.length);
+        auto self = shared_from_this();
+        connection_->ownerLoop()->queueInLoop(
+            [self, heldLease, path, offset, bytes, sendHeaders] {
+                if (!self->connection_->connected()) {
+                    self->finishInLoop(false, "client disconnected before Chunk send");
+                    return;
+                }
+                if (sendHeaders) {
+                    HttpResponse response;
+                    response.setCloseConnection(false);
+                    addObjectHeaders(&response, self->info_, self->info_.size,
+                                     self->start_, self->length_, true);
+                    miniKV::network::Buffer output;
+                    response.appendToBuffer(&output);
+                    self->connection_->send(std::string(output.peek(), output.readableBytes()));
+                }
+                self->connection_->startSendFile(path, offset, bytes,
+                    [self, heldLease, bytes](const miniKV::network::SendFileResult& sent) {
+                        // Keep the immutable cache file pinned until the kernel has
+                        // consumed this segment.  The next fetch is scheduled only
+                        // after backpressure has drained this segment.
+                        (void)heldLease;
+                        if (!sent.success || sent.bytesSent != bytes) {
+                            self->finish(false, "sendfile failed after " +
+                                std::to_string(sent.bytesSent) + " bytes");
+                            return;
+                        }
+                        self->enqueueNextChunk();
+                    });
+            });
+    }
+
+    void finish(bool success, std::string reason) {
+        if (finished_.exchange(true, std::memory_order_relaxed)) return;
+        auto self = shared_from_this();
+        connection_->ownerLoop()->queueInLoop(
+            [self, success, reason = std::move(reason)]() mutable {
+                self->finishInLoop(success, std::move(reason));
+            });
+    }
+
+    void finishInLoop(bool success, std::string reason) {
+        if (!success && !headersScheduled_.load(std::memory_order_relaxed) &&
+            connection_->connected()) {
+            HttpResponse response;
+            response.setCloseConnection(false);
+            error(&response, HttpResponse::k503ServiceUnavailable, reason);
+            miniKV::network::Buffer output;
+            response.appendToBuffer(&output);
+            connection_->send(std::string(output.peek(), output.readableBytes()));
+        }
+        if (connection_->connected()) {
+            connection_->resumeRead();
+            if (!success || closeAfterResponse_) connection_->shutdown();
+        }
+        std::cerr << "event=edge_stream_complete virtual_path=" << virtualPath_
+                  << " range_start=" << start_
+                  << " range_length=" << length_
+                  << " origin_bytes=" << originBytes_.load(std::memory_order_relaxed)
+                  << " cache_hits=" << cacheHits_.load(std::memory_order_relaxed)
+                  << " origin_requests=" << originRequests_.load(std::memory_order_relaxed)
+                  << " replica_fallbacks=" << replicaFallbacks_.load(std::memory_order_relaxed)
+                  << " success=" << (success ? "true" : "false")
+                  << (reason.empty() ? "" : " reason=" + reason) << '\n';
+    }
+
+    const EdgeConfig& config_;
+    miniKV::utils::ThreadPool* workers_;
+    TcpConnectionPtr connection_;
+    ObjectInfo info_;
+    std::vector<PlaybackStreamPart> parts_;
+    uint64_t start_ = 0;
+    uint64_t length_ = 0;
+    bool closeAfterResponse_ = false;
+    std::string virtualPath_;
+    std::atomic<size_t> nextPart_{0};
+    std::atomic<bool> headersScheduled_{false};
+    std::atomic<bool> finished_{false};
+    std::atomic<uint64_t> originBytes_{0};
+    std::atomic<uint64_t> originRequests_{0};
+    std::atomic<uint64_t> replicaFallbacks_{0};
+    std::atomic<uint64_t> cacheHits_{0};
+};
+
+bool startStreamingPlayback(const HttpRequest& request, HttpResponse* response,
+                            const EdgeConfig& config, miniKV::utils::ThreadPool* workers,
+                            const TcpConnectionPtr& connection,
+                            const miniKV::http::DeferredResponse::Ptr& deferred) {
+    ObjectRef object;
+    std::string virtualPath;
+    std::string failure;
+    if (!resolveVirtualObject(request, config, object, virtualPath, failure)) {
+        error(response, HttpResponse::k404NotFound, failure);
+        return false;
+    }
+    MiniDriverClient client(config.client);
+    ObjectInfo info;
+    if (!client.headObject(object, info, failure)) {
+        error(response, HttpResponse::k404NotFound, "cannot resolve committed object: " + failure);
+        return false;
+    }
+    miniKV::http::ByteRange parsedRange;
+    const miniKV::http::RangeParseStatus rangeStatus =
+        miniKV::http::parseSingleByteRange(request.getHeader("Range"), info.size, parsedRange);
+    if (rangeStatus == miniKV::http::RangeParseStatus::kInvalid ||
+        rangeStatus == miniKV::http::RangeParseStatus::kUnsatisfiable) {
+        response->setStatusCode(HttpResponse::k416RangeNotSatisfiable);
+        response->addHeader("Accept-Ranges", "bytes");
+        response->addHeader("Content-Range", "bytes */" + std::to_string(info.size));
+        response->setBody("");
+        return false;
+    }
+    const bool partial = rangeStatus == miniKV::http::RangeParseStatus::kSatisfiable;
+    const uint64_t start = partial ? parsedRange.start : 0;
+    const uint64_t length = partial ? parsedRange.length : info.size;
+    if (length == 0 || length > static_cast<uint64_t>(std::numeric_limits<size_t>::max())) {
+        error(response, HttpResponse::k416RangeNotSatisfiable, "empty or oversized object response");
+        return false;
+    }
+
+    ObjectReadPlan plan;
+    if (!client.getReadPlan(object, plan, failure) || plan.fileSize != info.size) {
+        error(response, HttpResponse::k503ServiceUnavailable,
+              "cannot obtain object read plan: " + failure);
+        return false;
+    }
+    std::vector<PlaybackStreamPart> parts;
+    if (!buildPlaybackStreamParts(plan, start, length, parts, failure)) {
+        error(response, HttpResponse::k500InternalServerError, failure);
+        return false;
+    }
+
+    deferred->defer();
+    auto stream = std::make_shared<EdgePlaybackStream>(
+        config, workers, connection, std::move(info), std::move(parts), start, length,
+        requestClosesConnection(request), std::move(virtualPath));
+    stream->start();
+    return true;
+}
+
 void handlePlayback(const HttpRequest& request, HttpResponse* response, const EdgeConfig& config) {
     ObjectRef object;
     std::string virtualPath;
@@ -386,9 +659,9 @@ int main(int, char**) {
     miniKV::utils::ThreadPool workers(static_cast<size_t>(handlerThreads));
     miniKV::http::HttpServer server(&loop, &workers, static_cast<int>(configuredPort));
     server.setThreadNum(static_cast<size_t>(ioThreads));
-    server.setHttpCallback([&config](const HttpRequest& request, HttpResponse* response,
-                                      const miniKV::network::TcpConnectionPtr&,
-                                      const miniKV::http::DeferredResponse::Ptr&) {
+    server.setHttpCallback([&config, &workers](const HttpRequest& request, HttpResponse* response,
+                                                const TcpConnectionPtr& connection,
+                                                const miniKV::http::DeferredResponse::Ptr& deferred) {
         if (request.path() != "/healthz") {
             // EdgeCache intentionally has no file logger initialization. Write the
             // bounded request trace to stderr so `kubectl logs` can observe the
@@ -407,6 +680,10 @@ int main(int, char**) {
                               "\"mode\":\"whole-chunk-cache\",\"readyBytes\":" +
                               std::to_string(stats.readyBytes) + ",\"reservedBytes\":" +
                               std::to_string(stats.reservedBytes) + "}");
+            return;
+        }
+        if (request.method() == HttpRequest::kGet) {
+            startStreamingPlayback(request, response, config, &workers, connection, deferred);
             return;
         }
         handlePlayback(request, response, config);

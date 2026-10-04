@@ -114,7 +114,7 @@ bool MiniDriverStorageAdapter::upload(const std::filesystem::path& input,
         progress((std::max)(observed, value.logicalBytesCompleted), value.totalBytes);
     };
     miniKV::client::UploadResult result;
-    const std::string name = input.filename().string();
+    const std::string name = input.filename().u8string();
     if (!client_.uploadFile(input, name, "/", options, result, error)) return false;
     object = result.object;
     if (progress) progress(total, total);
@@ -130,7 +130,8 @@ bool MiniDriverStorageAdapter::download(const miniKV::client::ObjectRef& object,
 
     if (progress) progress(0, plan.fileSize);
 
-    const std::filesystem::path partial = output.string() + ".part";
+    std::filesystem::path partial = output;
+    partial += ".part";
     std::ofstream stream(partial, std::ios::binary | std::ios::trunc);
     if (!stream) {
         error = "cannot open download temporary file";

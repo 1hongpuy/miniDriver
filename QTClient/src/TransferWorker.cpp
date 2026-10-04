@@ -110,7 +110,7 @@ void TransferWorker::runUpload() {
     initial.totalBytes = total;
     emit progress(initial);
     const bool ok = adapter.upload(
-        std::filesystem::path(spec_.localPath.toStdString()),
+        std::filesystem::path(spec_.localPath.toStdWString()),
         [this, total, &meter](uint64_t completed, uint64_t) {
             TransferSnapshot snapshot = baseSnapshot(TransferState::Running, QStringLiteral("upload"));
             snapshot.completedBytes = completed;
@@ -150,7 +150,7 @@ void TransferWorker::runUpload() {
         std::string sourceDigest;
         std::string downloadedDigest;
         const bool sourceHashed = MiniDriverStorageAdapter::sha256File(
-            std::filesystem::path(spec_.localPath.toStdString()), sourceDigest, error);
+            std::filesystem::path(spec_.localPath.toStdWString()), sourceDigest, error);
         const bool downloadedHashed = sourceHashed && MiniDriverStorageAdapter::sha256File(
             verifyPath, downloadedDigest, error);
         std::error_code ignored;
@@ -185,7 +185,7 @@ void TransferWorker::runDownload() {
     uint64_t lastCompleted = 0;
     RateMeter meter;
     const bool ok = adapter.download(
-        object, std::filesystem::path(spec_.localPath.toStdString()),
+        object, std::filesystem::path(spec_.localPath.toStdWString()),
         [this, &total, &lastCompleted, &meter](uint64_t completed, uint64_t reportedTotal) {
             lastCompleted = completed;
             total = reportedTotal;

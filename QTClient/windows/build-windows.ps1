@@ -27,9 +27,14 @@ if ($LASTEXITCODE -ne 0) { throw 'CMake configure failed.' }
 cmake --build $BuildPath --config $Configuration --target minidriver_qt_client
 if ($LASTEXITCODE -ne 0) { throw 'Qt client build failed.' }
 
-$Exe = Join-Path $BuildPath "bin\$Configuration\minidriver_qt_client.exe"
-if (-not (Test-Path $Exe)) { $Exe = Join-Path $BuildPath 'bin\minidriver_qt_client.exe' }
-if (-not (Test-Path $Exe)) { throw "Built executable was not found below $BuildPath\bin" }
+$ExeCandidates = @(
+    (Join-Path $BuildPath "QTClient\$Configuration\minidriver_qt_client.exe"),
+    (Join-Path $BuildPath "bin\$Configuration\minidriver_qt_client.exe"),
+    (Join-Path $BuildPath "QTClient\minidriver_qt_client.exe"),
+    (Join-Path $BuildPath "bin\minidriver_qt_client.exe")
+)
+$Exe = $ExeCandidates | Where-Object { Test-Path $_ } | Select-Object -First 1
+if ($null -eq $Exe) { throw "Built executable was not found below $BuildPath" }
 $Distribution = Join-Path $RepositoryRoot 'dist\MiniDriverQtClient'
 New-Item -ItemType Directory -Force -Path $Distribution | Out-Null
 Copy-Item -Force $Exe $Distribution

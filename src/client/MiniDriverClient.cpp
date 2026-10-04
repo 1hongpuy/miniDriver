@@ -711,8 +711,8 @@ bool MiniDriverClient::getRange(const ObjectRef& object, uint64_t offset, uint64
     bool allWholeChunks = true;
     for (const ChunkReadPlan& chunk : plan.chunks) {
         const uint64_t chunkEnd = chunkStart + chunk.size;
-        const uint64_t begin = std::max(offset, chunkStart);
-        const uint64_t finish = std::min(end, chunkEnd);
+        const uint64_t begin = (std::max)(offset, chunkStart);
+        const uint64_t finish = (std::min)(end, chunkEnd);
         if (begin < finish) {
             const uint64_t localOffset = begin - chunkStart;
             const uint64_t wanted = finish - begin;
@@ -965,8 +965,8 @@ bool MiniDriverClient::downloadRangeToFile(const ObjectReadPlan& plan, uint64_t 
         }
         const uint64_t chunkEnd = chunkObjectOffset + chunk.size;
         if (chunkEnd > offset && chunkObjectOffset < end) {
-            const uint64_t start = std::max(offset, chunkObjectOffset);
-            const uint64_t stop = std::min(end, chunkEnd);
+            const uint64_t start = (std::max)(offset, chunkObjectOffset);
+            const uint64_t stop = (std::min)(end, chunkEnd);
             const uint64_t localOffset = start - chunkObjectOffset;
             const uint64_t localLength = stop - start;
             std::string body;

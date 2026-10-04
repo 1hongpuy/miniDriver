@@ -111,7 +111,7 @@ bool MiniDriverStorageAdapter::upload(const std::filesystem::path& input,
                !reportedBytes->compare_exchange_weak(
                    observed, value.logicalBytesCompleted, std::memory_order_relaxed)) {
         }
-        progress(std::max(observed, value.logicalBytesCompleted), value.totalBytes);
+        progress((std::max)(observed, value.logicalBytesCompleted), value.totalBytes);
     };
     miniKV::client::UploadResult result;
     const std::string name = input.filename().string();

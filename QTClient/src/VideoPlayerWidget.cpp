@@ -375,7 +375,7 @@ void VideoPlayerWidget::updatePlaybackDiagnostics() {
     const qint64 now = diagnosticsClock_.elapsed();
     const qint64 timerGap = now - previousDiagnosticsTickMs_;
     previousDiagnosticsTickMs_ = now;
-    maxDiagnosticsTimerGapMs_ = std::max(maxDiagnosticsTimerGapMs_, timerGap);
+    maxDiagnosticsTimerGapMs_ = (std::max)(maxDiagnosticsTimerGapMs_, timerGap);
 
     const qint64 frameWindowElapsed = now - frameWindowStartedMs_;
     if (frameWindowElapsed >= 1000) {

@@ -519,7 +519,7 @@ void MainWindow::updateHeartbeat() {
     const qint64 now = heartbeatClock_.elapsed();
     const qint64 gap = now - lastHeartbeatMs_;
     lastHeartbeatMs_ = now;
-    maxHeartbeatGapMs_ = std::max(maxHeartbeatGapMs_, gap);
+    maxHeartbeatGapMs_ = (std::max)(maxHeartbeatGapMs_, gap);
     if (heartbeatLabel_) {
         heartbeatLabel_->setText(QStringLiteral("GUI heartbeat: %1 ms (max %2 ms)")
             .arg(gap).arg(maxHeartbeatGapMs_));

@@ -554,7 +554,8 @@ void MainWindow::previewSelectedCatalogObject() {
     statusBar()->showMessage(QStringLiteral("Preview download queued: %1").arg(taskId));
 }
 
-QUrl MainWindow::edgePlaybackUrl(const QString& objectId, quint64 version, QString& error) const {
+QUrl MainWindow::edgePlaybackUrl(const QString& objectId, quint64 version,
+                                 const QString& displayName, QString& error) const {
     const QString host = edgeHost_->text().trimmed();
     bool validPort = false;
     const quint16 port = edgePort_->text().toUShort(&validPort);
@@ -562,13 +563,17 @@ QUrl MainWindow::edgePlaybackUrl(const QString& objectId, quint64 version, QStri
         error = QStringLiteral("Enter a valid Edge host, port, and ObjectRef.");
         return {};
     }
-    const QByteArray escapedObjectId = QUrl::toPercentEncoding(objectId);
+    const QString safeName = QFileInfo(displayName).fileName();
     QUrl url;
     url.setScheme(QStringLiteral("http"));
     url.setHost(host);
     url.setPort(port);
-    url.setPath(QStringLiteral("/v1/play/") + QString::fromLatin1(escapedObjectId) +
-                QStringLiteral("/") + QString::number(version));
+    // Windows Media Foundation can use the URL extension while deciding which
+    // demuxer to load. The final segment is presentation-only: Edge still
+    // resolves bytes solely from ObjectRef(objectId, version).
+    url.setPath(QStringLiteral("/v1/play/") + objectId + QStringLiteral("/") +
+                QString::number(version) + QStringLiteral("/") +
+                (safeName.isEmpty() ? QStringLiteral("object.bin") : safeName));
     if (!url.isValid()) error = QStringLiteral("Cannot construct Edge playback URL.");
     return url;
 }
@@ -579,7 +584,7 @@ void MainWindow::playSelectedCatalogObject() {
     QString name;
     if (!selectedCatalogObject(objectId, version, name)) return;
     QString failure;
-    const QUrl url = edgePlaybackUrl(objectId, version, failure);
+    const QUrl url = edgePlaybackUrl(objectId, version, name, failure);
     if (!url.isValid()) {
         QMessageBox::warning(this, QStringLiteral("Invalid Edge endpoint"), failure);
         return;

@@ -111,17 +111,26 @@ bool parseObjectPath(const std::string& path, ObjectRef& object, std::string& er
         return false;
     }
     const std::string tail = path.substr(prefix.size());
-    const size_t slash = tail.rfind('/');
-    if (slash == std::string::npos || slash == 0 || slash + 1 >= tail.size() ||
-        tail.find('/', slash + 1) != std::string::npos) {
-        errorMessage = "expected /v1/play/{objectId}/{objectVersion}";
+    const size_t objectSlash = tail.find('/');
+    if (objectSlash == std::string::npos || objectSlash == 0 || objectSlash + 1 >= tail.size()) {
+        errorMessage = "expected /v1/play/{objectId}/{objectVersion}[/displayName]";
         return false;
     }
-    object.objectId = tail.substr(0, slash);
+    const size_t nameSlash = tail.find('/', objectSlash + 1);
+    const std::string versionText = nameSlash == std::string::npos
+        ? tail.substr(objectSlash + 1)
+        : tail.substr(objectSlash + 1, nameSlash - objectSlash - 1);
+    if (versionText.empty() ||
+        (nameSlash != std::string::npos &&
+         (nameSlash + 1 >= tail.size() || tail.find('/', nameSlash + 1) != std::string::npos))) {
+        errorMessage = "expected /v1/play/{objectId}/{objectVersion}[/displayName]";
+        return false;
+    }
+    object.objectId = tail.substr(0, objectSlash);
     try {
         size_t parsed = 0;
-        object.objectVersion = std::stoull(tail.substr(slash + 1), &parsed);
-        if (parsed != tail.size() - slash - 1 || object.objectVersion == 0) throw std::invalid_argument("version");
+        object.objectVersion = std::stoull(versionText, &parsed);
+        if (parsed != versionText.size() || object.objectVersion == 0) throw std::invalid_argument("version");
     } catch (...) {
         errorMessage = "objectVersion must be a positive integer";
         return false;

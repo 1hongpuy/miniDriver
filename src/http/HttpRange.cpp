@@ -38,8 +38,18 @@ RangeParseStatus parseSingleByteRange(const std::string& headerValue,
     if(dash == std::string::npos || value.find('-', dash + 1) != std::string::npos) {
         return RangeParseStatus::kInvalid;
     }
-    // Suffix ranges are deliberately deferred in 3.0.
-    if(dash == 0) return RangeParseStatus::kInvalid;
+    // RFC 9110 suffix byte-range-spec: "bytes=-N" means the final N bytes.
+    // MOV/MP4 demuxers commonly use it to find an index stored near EOF.
+    if(dash == 0) {
+        uint64_t suffixLength = 0;
+        if(!parseUnsigned(value.substr(1), suffixLength) || suffixLength == 0) {
+            return RangeParseStatus::kInvalid;
+        }
+        if(resourceSize == 0) return RangeParseStatus::kUnsatisfiable;
+        out.length = std::min(suffixLength, resourceSize);
+        out.start = resourceSize - out.length;
+        return RangeParseStatus::kSatisfiable;
+    }
 
     uint64_t start = 0;
     if(!parseUnsigned(value.substr(0, dash), start)) return RangeParseStatus::kInvalid;

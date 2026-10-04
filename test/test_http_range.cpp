@@ -15,7 +15,11 @@ int main()
     MINIKV_CHECK(range.start == 10 && range.length == 90);
     MINIKV_CHECK(parseSingleByteRange("bytes=100-", 100, range) == RangeParseStatus::kUnsatisfiable);
     MINIKV_CHECK(parseSingleByteRange("bytes=9-8", 100, range) == RangeParseStatus::kUnsatisfiable);
-    MINIKV_CHECK(parseSingleByteRange("bytes=-10", 100, range) == RangeParseStatus::kInvalid);
+    MINIKV_CHECK(parseSingleByteRange("bytes=-10", 100, range) == RangeParseStatus::kSatisfiable);
+    MINIKV_CHECK(range.start == 90 && range.length == 10);
+    MINIKV_CHECK(parseSingleByteRange("bytes=-1000", 100, range) == RangeParseStatus::kSatisfiable);
+    MINIKV_CHECK(range.start == 0 && range.length == 100);
+    MINIKV_CHECK(parseSingleByteRange("bytes=-0", 100, range) == RangeParseStatus::kInvalid);
     MINIKV_CHECK(parseSingleByteRange("bytes=0-1,3-4", 100, range) == RangeParseStatus::kInvalid);
     MINIKV_CHECK(parseSingleByteRange("items=0-1", 100, range) == RangeParseStatus::kInvalid);
     MINIKV_CHECK(parseSingleByteRange("bytes= 0-1", 100, range) == RangeParseStatus::kInvalid);

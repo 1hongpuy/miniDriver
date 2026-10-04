@@ -389,6 +389,13 @@ int main(int, char**) {
     server.setHttpCallback([&config](const HttpRequest& request, HttpResponse* response,
                                       const miniKV::network::TcpConnectionPtr&,
                                       const miniKV::http::DeferredResponse::Ptr&) {
+        if (request.path() != "/healthz") {
+            miniKV::utils::logInfo(
+                "event=edge_request method=" + request.methodString() +
+                " path=" + request.path() +
+                " range=" + request.getHeader("Range") +
+                " user_agent=" + request.getHeader("User-Agent"));
+        }
         if (request.method() == HttpRequest::kGet && request.path() == "/healthz") {
             response->setStatusCode(HttpResponse::k200Ok);
             response->setContentType("application/json");

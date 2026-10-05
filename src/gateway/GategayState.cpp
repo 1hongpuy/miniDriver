@@ -1843,7 +1843,7 @@ RoutePlanStatus GatewayState::planRoutes(const std::string& sessionId,
                 const auto& chunk = route.chunk;
                 const auto& lease = route.lease;
                 if(chunk.state != metadata::ChunkState::kAllocated ||
-                   chunk.size != request.chunkSize || lease.state != metadata::LeaseState::kActive ||
+                   chunk.size != request.chunkSize || lease.state != metadata::LeaseState::kActive || lease.expiresAt <= unixSeconds() ||
                    lease.sessionId != sessionId || lease.chunkIndex != request.chunkIndex ||
                    (!request.checksumDigest.empty() && request.checksumDigest != chunk.checksumDigest) ||
                    (request.chunkHash != chunk.checksumDigest && request.identityScheme == "cas-sha256")) {
@@ -1887,21 +1887,72 @@ RoutePlanStatus GatewayState::planRoutes(const std::string& sessionId,
         std::vector<metadata::ReserveLeaseRequest> allReserves;
         std::vector<metadata::ChunkRouteRecord> chunks;
         reserves.reserve(requests.size()); allReserves.reserve(requests.size()); chunks.reserve(requests.size());
-        const int64_t leaseExpires = unixSeconds() + uploadLeaseTtlSeconds();
-        const int64_t observedAt = static_cast<int64_t>(unixSeconds()) * 1000;
+        const int64_t now = unixSeconds();
+        const int64_t leaseExpires = now + uploadLeaseTtlSeconds();
+        const int64_t observedAt = now * 1000;
+        constexpr uint32_t kMaxRecoveryLeaseAttempts = 128;
         for(const auto& request : requests) {
             const auto chunk = remoteMetadata_->chunk(session.objectId, request.chunkIndex);
             if(!chunk || chunk->state != metadata::ChunkState::kAllocated || chunk->size != request.chunkSize) { out.clear(); return RoutePlanStatus::kInvalidRequest; }
-            metadata::ReserveLeaseRequest reserve; reserve.commandId = "reserve-" + sessionId + "-" + std::to_string(request.chunkIndex);
-            reserve.actorType = "gateway"; reserve.actorId = "admin"; reserve.leaseId = "lease-" + sessionId + "-" + std::to_string(request.chunkIndex);
-            reserve.requestKey = sessionId + "/" + std::to_string(request.chunkIndex) + "/" + request.chunkHash;
-            reserve.sessionId = sessionId; reserve.chunkIndex = request.chunkIndex; reserve.routeKey = chunk->routeKey;
-            reserve.chunkSize = request.chunkSize; reserve.generation = chunk->generation; reserve.desiredRf = replicationFactor_;
-            reserve.expiresAt = leaseExpires; reserve.nowMs = observedAt;
-            allReserves.push_back(reserve);
-            // A retry after the preflight create+reserve batch already has a
-            // durable lease.  Reuse it rather than appending another entry.
-            if(!remoteMetadata_->lease(reserve.leaseId)) reserves.push_back(reserve);
+            const std::string baseLeaseId = "lease-" + sessionId + "-" + std::to_string(request.chunkIndex);
+            bool selected = false;
+            for(uint32_t attempt = 0; attempt < kMaxRecoveryLeaseAttempts; ++attempt) {
+                const std::string leaseId = attempt == 0 ? baseLeaseId
+                    : baseLeaseId + "-resume-" + std::to_string(attempt);
+                const auto existing = remoteMetadata_->lease(leaseId);
+                if(!existing) {
+                    metadata::ReserveLeaseRequest reserve;
+                    reserve.commandId = "reserve-" + leaseId;
+                    reserve.actorType = "gateway"; reserve.actorId = "admin"; reserve.leaseId = leaseId;
+                    reserve.requestKey = sessionId + "/" + std::to_string(request.chunkIndex) + "/" + request.chunkHash;
+                    reserve.sessionId = sessionId; reserve.chunkIndex = request.chunkIndex; reserve.routeKey = chunk->routeKey;
+                    reserve.chunkSize = request.chunkSize; reserve.generation = chunk->generation; reserve.desiredRf = replicationFactor_;
+                    reserve.expiresAt = leaseExpires; reserve.nowMs = observedAt;
+                    allReserves.push_back(reserve);
+                    reserves.push_back(reserve);
+                    selected = true;
+                    break;
+                }
+                if(existing->sessionId != sessionId || existing->chunkIndex != request.chunkIndex ||
+                   existing->routeKey != chunk->routeKey || existing->chunkSize != request.chunkSize ||
+                   existing->generation != chunk->generation) {
+                    out.clear();
+                    return RoutePlanStatus::kInvalidRequest;
+                }
+                if(existing->state == metadata::LeaseState::kActive && existing->expiresAt > now) {
+                    metadata::ReserveLeaseRequest reserve;
+                    reserve.commandId = "reserve-" + leaseId;
+                    reserve.actorType = "gateway"; reserve.actorId = "admin"; reserve.leaseId = leaseId;
+                    reserve.requestKey = sessionId + "/" + std::to_string(request.chunkIndex) + "/" + request.chunkHash;
+                    reserve.sessionId = sessionId; reserve.chunkIndex = request.chunkIndex; reserve.routeKey = chunk->routeKey;
+                    reserve.chunkSize = request.chunkSize; reserve.generation = chunk->generation; reserve.desiredRf = replicationFactor_;
+                    reserve.expiresAt = existing->expiresAt; reserve.nowMs = observedAt;
+                    allReserves.push_back(std::move(reserve));
+                    selected = true;
+                    break;
+                }
+                if(existing->state == metadata::LeaseState::kActive) {
+                    metadata::MetadataCommand expire;
+                    expire.commandId = "expire-lease-" + leaseId + "-" + std::to_string(existing->generation) + "-" + std::to_string(existing->expiresAt);
+                    expire.type = metadata::MetadataCommandType::kExpireLease;
+                    expire.actorType = "gateway-expiry";
+                    expire.actorId = "admin";
+                    expire.issuedAt = now;
+                    expire.payload = metadata::ExpireLeasePayload{leaseId, existing->generation, existing->expiresAt, now};
+                    const auto expired = remoteMetadata_->propose(expire);
+                    if(expired.status != metadata::ApplyStatus::kOk &&
+                       expired.status != metadata::ApplyStatus::kAlreadyApplied &&
+                       expired.status != metadata::ApplyStatus::kFenced &&
+                       expired.status != metadata::ApplyStatus::kNotFound) {
+                        out.clear();
+                        return RoutePlanStatus::kNoCapacity;
+                    }
+                    miniKV::utils::logInfo("event=remote_route_lease_expired session=" + sessionId +
+                                           " chunk=" + std::to_string(request.chunkIndex) +
+                                           " lease=" + leaseId);
+                }
+            }
+            if(!selected) { out.clear(); return RoutePlanStatus::kNoCapacity; }
             chunks.push_back(*chunk);
         }
         // Placement is still decided by the Metadata leader, but all lease
@@ -1915,7 +1966,11 @@ RoutePlanStatus GatewayState::planRoutes(const std::string& sessionId,
         }
         for(size_t i = 0; i < requests.size(); ++i) {
             const auto& request = requests[i]; const auto& chunk = chunks[i]; const auto& reserve = allReserves[i];
-            const auto lease = remoteMetadata_->lease(reserve.leaseId); if(!lease) { out.clear(); return RoutePlanStatus::kNoCapacity; }
+            const auto lease = remoteMetadata_->lease(reserve.leaseId);
+            if(!lease || lease->state != metadata::LeaseState::kActive || lease->expiresAt <= now ||
+               lease->sessionId != sessionId || lease->chunkIndex != request.chunkIndex ||
+               lease->routeKey != chunk.routeKey || lease->chunkSize != request.chunkSize ||
+               lease->generation != chunk.generation) { out.clear(); return RoutePlanStatus::kNoCapacity; }
             PlacementPlan plan; plan.chunkIndex=request.chunkIndex; plan.leaseId=lease->leaseId; plan.routeVersion=lease->generation; plan.expiresAt=lease->expiresAt;
             plan.identityScheme = chunk.identityScheme == metadata::IdentityScheme::kContentHash ? "cas-sha256" : "opaque-chunk-id";
             plan.chunkId = chunk.storageIdentity; plan.checksumType = metadata::toString(chunk.checksumType); plan.checksumDigest = chunk.checksumDigest; plan.objectVersion=session.objectVersion;

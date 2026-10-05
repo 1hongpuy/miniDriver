@@ -1062,11 +1062,16 @@ int main(int argc, char** argv)
     std::function<void()> heartbeat;
     bool registered = false;
     bool registrationInFlight = false;
+    // Metadata deduplicates registration by nodeId + bootId.  Keep the
+    // matching request payload immutable for this process lifetime: free
+    // bytes change whenever this node writes a log or chunk, and changing it
+    // on a retry turns an idempotent replay into COMMAND_ID_REUSE_MISMATCH.
+    const uint64_t registeredCapacityBytes = availableBytes(dataDir);
     registerNode = [&] {
         if(registered || registrationInFlight) return;
         registrationInFlight = true;
         controlClient->registerStorageNode({nodeId, bootId, advertiseAddress, port,
-                                            availableBytes(dataDir), 0,
+                                            registeredCapacityBytes, 0,
                                             maxConcurrentWrites, capabilities},
             [&](RpcResult result) {
                 registrationInFlight = false;
@@ -1079,7 +1084,7 @@ int main(int argc, char** argv)
                 }
                 miniKV::utils::logWarn("event=datanode_registration_failed node=" + nodeId +
                                        " error=" + result.error);
-                loop.runAfter(1, registerNode);
+                loop.runAfter(1000, registerNode);
             });
     };
     heartbeat = [&] {

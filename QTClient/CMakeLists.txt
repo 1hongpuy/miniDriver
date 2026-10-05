@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.16)
 
-find_package(Qt6 REQUIRED COMPONENTS Core Widgets Multimedia MultimediaWidgets)
+find_package(Qt6 REQUIRED COMPONENTS Core Widgets Multimedia MultimediaWidgets Sql)
 
 set(CMAKE_AUTOMOC ON)
 set(CMAKE_AUTOUIC ON)
@@ -10,6 +10,7 @@ add_executable(minidriver_qt_client
     app/main.cpp
     include/qtclient/MainWindow.hpp
     include/qtclient/TransferManager.hpp
+    include/qtclient/TransferStore.hpp
     include/qtclient/TransferModel.hpp
     include/qtclient/LogModel.hpp
     include/qtclient/CatalogTypes.hpp
@@ -18,6 +19,7 @@ add_executable(minidriver_qt_client
     include/qtclient/VideoPlayerWidget.hpp
     src/MainWindow.cpp
     src/TransferManager.cpp
+    src/TransferStore.cpp
     src/TransferModel.cpp
     src/LogModel.cpp
     src/CatalogWorker.cpp
@@ -36,6 +38,7 @@ target_link_libraries(minidriver_qt_client PRIVATE
     Qt6::Widgets
     Qt6::Multimedia
     Qt6::MultimediaWidgets
+    Qt6::Sql
     minikv_client
 )
 

@@ -1,5 +1,6 @@
 #pragma once
 
+#include "qtclient/TransferStore.hpp"
 #include "qtclient/TransferWorker.hpp"
 
 #include <QHash>
@@ -27,6 +28,9 @@ public:
     // Raft preflight returns the original session and skips committed chunks.
     bool retry(const QString& taskId, const miniKV::client::ClientConfig& config,
                QString& error);
+    // Restored tasks remain user-controlled: Retry keeps their commandId and
+    // asks MetadataService for authoritative completed chunks.
+    void restoreInterruptedUploads(const miniKV::client::ClientConfig& config);
     bool hasActiveTasks() const noexcept { return !active_.isEmpty(); }
 
 signals:
@@ -47,6 +51,7 @@ private:
 
     void startTask(const TransferSpec& spec);
     TransferSnapshot initialSnapshot(const TransferSpec& spec) const;
+    void persist(const TransferSpec& spec, const TransferSnapshot& snapshot);
 
     static constexpr int kMaxActiveTasks = 2;
     QQueue<TransferSpec> pending_;
@@ -55,6 +60,7 @@ private:
     QSet<QString> finishedTasks_;
     QSet<QString> failedTasks_;
     QSet<QString> retryPending_;
+    TransferStore store_;
 };
 
 }  // namespace miniKV::qtclient

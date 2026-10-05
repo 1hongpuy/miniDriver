@@ -446,6 +446,12 @@ ApplyResult MetadataStateMachine::applyNew(const MetadataCommand& command, uint6
         auto chunk = chunks_.find(chunkKey(session->second.objectId, p->chunkIndex));
         if(chunk == chunks_.end()) return resultFor(command, index, term, ApplyStatus::kNotFound, "chunk not found");
         if(chunk->second.state == ChunkState::kCommitted) return resultFor(command, index, term, ApplyStatus::kAlreadyApplied, "chunk already committed");
+        auto object = objects_.find(session->second.objectId);
+        if(object == objects_.end()) return resultFor(command, index, term, ApplyStatus::kNotFound, "object not found");
+        if(session->second.expired)
+            return resultFor(command, index, term, ApplyStatus::kConflict, "upload session has expired");
+        if(object->second.state != ObjectState::kUploading)
+            return resultFor(command, index, term, ApplyStatus::kConflict, "object is not accepting chunk commits");
         if(lease->second.state != LeaseState::kActive || lease->second.sessionId != p->sessionId
            || lease->second.chunkIndex != p->chunkIndex || lease->second.routeKey != p->routeKey
            || lease->second.chunkSize != p->chunkSize || lease->second.generation != command.generation
@@ -467,7 +473,7 @@ ApplyResult MetadataStateMachine::applyNew(const MetadataCommand& command, uint6
         }
         chunk->second.replicas = std::move(replicas); chunk->second.state = ChunkState::kCommitted;
         ++session->second.completedChunks; finishLease(lease->second, LeaseState::kCommitted);
-        auto object = objects_.find(session->second.objectId); if(object != objects_.end()) object->second.metadataVersion = index;
+        object->second.metadataVersion = index;
         ApplyResult result = resultFor(command, index, term, ApplyStatus::kOk, "chunk committed");
         result.objectId = session->second.objectId; result.objectVersion = session->second.objectVersion;
         result.sessionId = p->sessionId; result.leaseId = p->leaseId; return result;
@@ -482,6 +488,10 @@ ApplyResult MetadataStateMachine::applyNew(const MetadataCommand& command, uint6
            || object->second.objectVersion != p->objectVersion)
             return resultFor(command, index, term, ApplyStatus::kFenced, "object version does not match session");
         if(object->second.state == ObjectState::kCommitted) return resultFor(command, index, term, ApplyStatus::kAlreadyApplied, "object already committed");
+        if(session->second.expired)
+            return resultFor(command, index, term, ApplyStatus::kConflict, "upload session has expired");
+        if(object->second.state != ObjectState::kUploading)
+            return resultFor(command, index, term, ApplyStatus::kConflict, "object is not ready to commit");
         if(session->second.completedChunks != session->second.totalChunks)
             return resultFor(command, index, term, ApplyStatus::kConflict, "not all chunks reached desired RF");
         const std::string pathKey = catalogKey(object->second.ownerId, object->second.parentPath, object->second.name);
@@ -515,7 +525,9 @@ ApplyResult MetadataStateMachine::applyNew(const MetadataCommand& command, uint6
             ApplyResult result = resultFor(command, index, term, ApplyStatus::kAlreadyApplied, "object deletion already started");
             result.objectId = p->objectId; result.objectVersion = p->objectVersion; return result;
         }
-        catalog_.erase(catalogKey(object->second.ownerId, object->second.parentPath, object->second.name));
+        const std::string pathKey = catalogKey(object->second.ownerId, object->second.parentPath, object->second.name);
+        const auto bound = catalog_.find(pathKey);
+        if(bound != catalog_.end() && bound->second == p->objectId) catalog_.erase(bound);
         object->second.state = ObjectState::kDeleting; object->second.metadataVersion = index;
         for(const auto& [key, chunk] : chunks_) {
             if(chunk.objectId != p->objectId || chunk.objectVersion != p->objectVersion) continue;
@@ -540,7 +552,9 @@ ApplyResult MetadataStateMachine::applyNew(const MetadataCommand& command, uint6
         for(auto& [key, object] : objects_) {
             if(object.ownerId != p->ownerId || (object.parentPath != root && object.parentPath.rfind(prefix, 0) != 0)) continue;
             found = true; object.state = ObjectState::kDeleting; object.metadataVersion = index;
-            catalog_.erase(catalogKey(object.ownerId, object.parentPath, object.name));
+            const std::string pathKey = catalogKey(object.ownerId, object.parentPath, object.name);
+            const auto bound = catalog_.find(pathKey);
+            if(bound != catalog_.end() && bound->second == object.objectId) catalog_.erase(bound);
             for(const auto& [chunkKeyValue, chunk] : chunks_) {
                 if(chunk.objectId != object.objectId || chunk.objectVersion != object.objectVersion) continue;
                 DeleteTaskRecord task; task.objectId = object.objectId; task.objectVersion = object.objectVersion;
@@ -665,10 +679,13 @@ std::vector<ObjectRecord> MetadataStateMachine::objects(const std::string& owner
                                                         const std::string& parentPath) const
 {
     std::vector<ObjectRecord> result;
-    for(const auto& [key, object] : objects_) {
-        (void)key;
-        if(object.ownerId == ownerId && object.parentPath == parentPath && object.state != ObjectState::kDeleting)
-            result.push_back(object);
+    for(const auto& [pathKey, objectId] : catalog_) {
+        (void)pathKey;
+        const auto object = objects_.find(objectId);
+        if(object == objects_.end()) continue;
+        if(object->second.ownerId == ownerId && object->second.parentPath == parentPath
+           && object->second.state == ObjectState::kCommitted)
+            result.push_back(object->second);
     }
     std::sort(result.begin(), result.end(), [](const ObjectRecord& lhs, const ObjectRecord& rhs) {
         return lhs.name < rhs.name;

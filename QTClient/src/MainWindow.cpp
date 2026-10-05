@@ -92,6 +92,7 @@ MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent) {
             logModel_, &LogModel::appendEvent);
     connect(transferManager_, &TransferManager::log,
             this, &MainWindow::appendLog);
+    transferManager_->restoreInterruptedUploads(clientConfig());
 }
 
 void MainWindow::buildUi() {

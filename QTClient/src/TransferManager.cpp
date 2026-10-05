@@ -6,6 +6,10 @@ namespace miniKV::qtclient {
 
 TransferManager::TransferManager(QObject* parent) : QObject(parent) {}
 
+void TransferManager::persist(const TransferSpec& spec, const TransferSnapshot& snapshot) {
+    (void)store_.upsert(spec, snapshot);
+}
+
 TransferManager::~TransferManager() {
     for (auto it = active_.begin(); it != active_.end(); ++it) {
         if (it->thread) {
@@ -44,7 +48,9 @@ QString TransferManager::enqueueUpload(const QString& localPath,
     spec.clientConfig = config;
     taskSpecs_.insert(spec.taskId, spec);
     pending_.enqueue(spec);
-    emit taskAdded(initialSnapshot(spec));
+    const TransferSnapshot snapshot = initialSnapshot(spec);
+    persist(spec, snapshot);
+    emit taskAdded(snapshot);
     emit log({spec.taskId, QStringLiteral("manager"), QStringLiteral("upload queued")});
     startNext();
     return spec.taskId;
@@ -62,7 +68,9 @@ QString TransferManager::enqueueDownload(const QString& objectId, quint64 object
     spec.clientConfig = config;
     taskSpecs_.insert(spec.taskId, spec);
     pending_.enqueue(spec);
-    emit taskAdded(initialSnapshot(spec));
+    const TransferSnapshot snapshot = initialSnapshot(spec);
+    persist(spec, snapshot);
+    emit taskAdded(snapshot);
     emit log({spec.taskId, QStringLiteral("manager"), QStringLiteral("download queued")});
     startNext();
     return spec.taskId;
@@ -93,12 +101,31 @@ bool TransferManager::retry(const QString& taskId,
     failedTasks_.remove(taskId);
     finishedTasks_.remove(taskId);
     pending_.enqueue(spec);
-    emit taskUpdated(initialSnapshot(spec));
+    const TransferSnapshot snapshot = initialSnapshot(spec);
+    persist(spec, snapshot);
+    emit taskUpdated(snapshot);
     emit log({taskId, QStringLiteral("manager"),
               QStringLiteral("retry queued; attempt %1; upload keeps its original command ID")
                   .arg(spec.attempt)});
     startNext();
     return true;
+}
+
+void TransferManager::restoreInterruptedUploads(const miniKV::client::ClientConfig& config) {
+    for (TransferSpec spec : store_.interruptedUploads()) {
+        if (taskSpecs_.contains(spec.taskId)) continue;
+        spec.clientConfig = config;
+        taskSpecs_.insert(spec.taskId, spec);
+        failedTasks_.insert(spec.taskId);
+        TransferSnapshot snapshot = initialSnapshot(spec);
+        snapshot.state = TransferState::Failed;
+        snapshot.stage = QStringLiteral("interrupted");
+        snapshot.error = QStringLiteral("Previous client instance stopped; select this row and retry to resume.");
+        persist(spec, snapshot);
+        emit taskAdded(snapshot);
+        emit log({spec.taskId, QStringLiteral("manager"),
+                  QStringLiteral("interrupted upload restored; retry keeps original command ID")});
+    }
 }
 
 void TransferManager::startNext() {
@@ -123,6 +150,10 @@ void TransferManager::startTask(const TransferSpec& spec) {
     auto* worker = new TransferWorker(spec);
     worker->moveToThread(thread);
     active_.insert(spec.taskId, ActiveTask{thread, worker});
+    TransferSnapshot running = initialSnapshot(spec);
+    running.state = TransferState::Running;
+    running.stage = QStringLiteral("starting");
+    persist(spec, running);
 
     connect(thread, &QThread::started, worker, &TransferWorker::start);
     connect(worker, &TransferWorker::progress, this, &TransferManager::onProgress,
@@ -151,6 +182,8 @@ void TransferManager::onFinished(const TransferSnapshot& snapshot) {
     finishedTasks_.insert(snapshot.taskId);
     if (snapshot.state == TransferState::Failed) failedTasks_.insert(snapshot.taskId);
     else failedTasks_.remove(snapshot.taskId);
+    const auto spec = taskSpecs_.constFind(snapshot.taskId);
+    if (spec != taskSpecs_.cend()) persist(spec.value(), snapshot);
     emit taskUpdated(snapshot);
 }
 

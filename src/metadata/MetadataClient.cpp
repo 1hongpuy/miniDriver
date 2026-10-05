@@ -416,7 +416,15 @@ std::optional<ReadDescriptor> MetadataClient::parseDescriptor(const std::string&
 }
 
 std::optional<UploadSessionRecord> MetadataClient::session(const std::string& id, std::string* error) const
-{ client::HttpResponse r; std::string e; if(!request("GET", urlPath("/internal/v4/metadata/sessions/", id), {}, r, e, true) || r.status != 200) { if(error) *error=e; return std::nullopt; } return parseSession(r.body,error); }
+{
+    client::HttpResponse r; std::string e;
+    if(!request("GET", urlPath("/internal/v4/metadata/sessions/", id), {}, r, e, true)) {
+        if(error) *error = e; return std::nullopt;
+    }
+    if(r.status == 404) { if(error) error->clear(); return std::nullopt; }
+    if(r.status != 200) { if(error) *error = "metadata session HTTP " + std::to_string(r.status); return std::nullopt; }
+    return parseSession(r.body, error);
+}
 std::vector<UploadSessionRecord> MetadataClient::sessions(std::string* error) const
 {
     client::HttpResponse r; std::string e; std::vector<UploadSessionRecord> result;

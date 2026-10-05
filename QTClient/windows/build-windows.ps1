@@ -42,6 +42,11 @@ $DeployMode = if ($Configuration -eq 'Debug') { '--debug' } else { '--release' }
 & $DeployQt $DeployMode --compiler-runtime --no-translations (Join-Path $Distribution 'minidriver_qt_client.exe')
 if ($LASTEXITCODE -ne 0) { throw 'windeployqt failed.' }
 
+# QtSql is linked by the client, but the SQLite driver is a runtime plugin.
+# Fail packaging early if windeployqt did not copy it.
+$SqliteDriver = Join-Path $Distribution 'sqldrivers\qsqlite.dll'
+if (-not (Test-Path $SqliteDriver)) { throw "Qt SQLite driver was not deployed: $SqliteDriver" }
+
 # Qt's deployer does not own the OpenSSL runtime used by the SDK.
 $VcpkgBin = Join-Path $VcpkgRoot 'installed\x64-windows\bin'
 Get-ChildItem -Path $VcpkgBin -Filter 'libcrypto*.dll' | Copy-Item -Destination $Distribution -Force

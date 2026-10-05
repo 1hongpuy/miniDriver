@@ -29,6 +29,20 @@ namespace miniKV {
 namespace gateway {
 
 namespace {
+int64_t uploadLeaseTtlSeconds()
+{
+    constexpr int64_t kDefaultSeconds = 30 * 60;
+    constexpr int64_t kMaxSeconds = 24 * 60 * 60;
+    const char* value = std::getenv("MINIKV_UPLOAD_LEASE_TTL_SECONDS");
+    if(value == nullptr || *value == 0) return kDefaultSeconds;
+    try {
+        const int64_t parsed = std::stoll(value);
+        return std::clamp(parsed, int64_t{60}, kMaxSeconds);
+    } catch(...) {
+        return kDefaultSeconds;
+    }
+}
+
 bool legacyAiOutboxEnabled()
 {
     const char* value = std::getenv("MINIKV_GATEWAY_AI_OUTBOX_ENABLED");
@@ -1431,13 +1445,106 @@ PreflightStatus GatewayState::preflightUpload(const UploadPreflightRequest& requ
                                               UploadPreflightResult& out)
 {
     if (remoteMetadata_) {
-        if(request.fileName.empty() || request.fileSize == 0 || request.chunks.empty()) return PreflightStatus::kInvalidRequest;
+        if(request.fileName.empty() || request.fileSize == 0 || request.chunkSize == 0
+           || request.manifestHash.empty() || request.chunks.empty()) return PreflightStatus::kInvalidRequest;
         const std::string commandId = request.commandId.empty()
             ? metadata::MetadataClient::newCommandId("create-session") : request.commandId;
         const std::string sessionId = request.commandId.empty()
             ? metadata::MetadataClient::newCommandId("session") : "session-" + request.commandId;
         const std::string objectId = request.commandId.empty()
             ? metadata::MetadataClient::newCommandId("object") : "object-" + request.commandId;
+
+        // Exact resume is deliberately a read before a mutation.  A retry
+        // keeps its commandId, hence also its derived session/object ids.
+        // Rebuilding CreateSession with a fresh expiresAt would change the
+        // idempotency fingerprint and turn a recoverable timeout into a
+        // COMMAND_ID_REUSE_MISMATCH.
+        if(!request.commandId.empty()) {
+            std::string lookupError;
+            const auto existingSession = remoteMetadata_->session(sessionId, &lookupError);
+            if(existingSession) {
+                const auto existingObject = remoteMetadata_->object(existingSession->objectId, &lookupError);
+                const uint32_t expectedChunks = static_cast<uint32_t>(
+                    (request.fileSize + request.chunkSize - 1) / request.chunkSize);
+                if(!existingObject || existingSession->objectId != objectId
+                   || existingSession->fileSize != request.fileSize
+                   || existingSession->chunkSize != request.chunkSize
+                   || existingSession->totalChunks != expectedChunks
+                   || existingObject->ownerId != "admin"
+                   || existingObject->parentPath != request.dirPath
+                   || existingObject->name != request.fileName
+                   || existingObject->contentHash != request.manifestHash) {
+                    miniKV::utils::logWarn("event=remote_preflight_resume_rejected command_id=" +
+                                           request.commandId + " reason=immutable_manifest_mismatch");
+                    return PreflightStatus::kInvalidRequest;
+                }
+
+                out = {};
+                out.session.sessionId = existingSession->sessionId;
+                out.session.objectId = existingSession->objectId;
+                out.session.objectVersion = existingSession->objectVersion;
+                out.session.ownerId = existingSession->ownerId;
+                out.session.fileName = request.fileName;
+                out.session.dirPath = request.dirPath;
+                out.session.fileSize = existingSession->fileSize;
+                out.session.chunkSize = existingSession->chunkSize;
+                out.session.totalChunks = existingSession->totalChunks;
+                out.session.manifestHash = request.manifestHash;
+                out.session.createdAt = unixSeconds();
+                out.session.lastActivityAt = out.session.createdAt;
+                out.object.objectId = existingObject->objectId;
+                out.object.objectVersion = existingObject->objectVersion;
+                out.object.metadataVersion = existingObject->metadataVersion;
+                out.object.ownerId = existingObject->ownerId;
+                out.object.parentPath = existingObject->parentPath;
+                out.object.name = existingObject->name;
+                out.object.fileHash = existingObject->contentHash;
+                out.object.fileSize = existingObject->fileSize;
+
+                if(existingObject->state == metadata::ObjectState::kCommitted) {
+                    out.object.state = FileState::kAvailable;
+                    return PreflightStatus::kContentExists;
+                }
+                if(existingSession->expired || existingObject->state != metadata::ObjectState::kUploading) {
+                    miniKV::utils::logWarn("event=remote_preflight_resume_rejected command_id=" +
+                                           request.commandId + " reason=session_not_resumable");
+                    return PreflightStatus::kInvalidRequest;
+                }
+
+                for(const auto& input : request.chunks) {
+                    const auto chunk = remoteMetadata_->chunk(existingSession->objectId, input.chunkIndex, &lookupError);
+                    const auto expectedDigest = input.checksumDigest.empty() ? input.chunkHash : input.checksumDigest;
+                    const auto expectedType = input.checksumType == "sha256"
+                        ? metadata::ChecksumType::kSha256 : metadata::ChecksumType::kCrc32c;
+                    if(!chunk || chunk->size != input.chunkSize
+                       || chunk->checksumType != expectedType
+                       || chunk->checksumDigest != expectedDigest) {
+                        miniKV::utils::logWarn("event=remote_preflight_resume_rejected command_id=" +
+                                               request.commandId + " reason=chunk_manifest_mismatch");
+                        return PreflightStatus::kInvalidRequest;
+                    }
+                    if(chunk->state == metadata::ChunkState::kCommitted) {
+                        out.session.completed.emplace(input.chunkIndex,
+                            CompletedChunk{input.chunkIndex, input.chunkHash, input.chunkSize});
+                        out.presentChunks.push_back(input);
+                    } else {
+                        out.missingChunks.push_back(input);
+                    }
+                }
+                out.session.completedChunks = static_cast<uint32_t>(out.session.completed.size());
+                out.object.state = FileState::kProtecting;
+                miniKV::utils::logInfo("event=remote_preflight_resume command_id=" + request.commandId +
+                                      " completed=" + std::to_string(out.session.completedChunks) +
+                                      " missing=" + std::to_string(out.missingChunks.size()));
+                return PreflightStatus::kUploadRequired;
+            }
+            if(!lookupError.empty()) {
+                miniKV::utils::logWarn("event=remote_preflight_resume_lookup_failed command_id=" +
+                                       request.commandId + " error=" + lookupError);
+                return PreflightStatus::kInvalidRequest;
+            }
+        }
+
         metadata::MetadataCommand command;
         command.commandId = commandId;
         command.type = metadata::MetadataCommandType::kCreateSession;
@@ -1446,7 +1553,7 @@ PreflightStatus GatewayState::preflightUpload(const UploadPreflightRequest& requ
         payload.sessionId = sessionId; payload.objectId = objectId; payload.ownerId = "admin";
         payload.parentPath = request.dirPath; payload.name = request.fileName; payload.contentHash = request.manifestHash;
         payload.fileSize = request.fileSize; payload.chunkSize = request.chunkSize == 0 ? 4U * 1024U * 1024U : request.chunkSize;
-        payload.desiredRf = replicationFactor_; payload.expiresAt = unixSeconds() + 300;
+        payload.desiredRf = replicationFactor_; payload.expiresAt = unixSeconds() + uploadLeaseTtlSeconds();
         std::vector<metadata::ReserveLeaseRequest> preflightReserves;
         for(const auto& input : request.chunks) {
             metadata::InitialChunk chunk; chunk.index = input.chunkIndex; chunk.routeKey = sessionId + "/route/" + std::to_string(input.chunkIndex);
@@ -1775,7 +1882,7 @@ RoutePlanStatus GatewayState::planRoutes(const std::string& sessionId,
         std::vector<metadata::ReserveLeaseRequest> allReserves;
         std::vector<metadata::ChunkRouteRecord> chunks;
         reserves.reserve(requests.size()); allReserves.reserve(requests.size()); chunks.reserve(requests.size());
-        const int64_t leaseExpires = unixSeconds() + 300;
+        const int64_t leaseExpires = unixSeconds() + uploadLeaseTtlSeconds();
         const int64_t observedAt = static_cast<int64_t>(unixSeconds()) * 1000;
         for(const auto& request : requests) {
             const auto chunk = remoteMetadata_->chunk(session.objectId, request.chunkIndex);

@@ -310,6 +310,14 @@ private:
             finish(false, "cannot schedule Edge Chunk fetch: " + std::string(exception.what()));
         }
     }
+    bool cancelIfClientDisconnected(const char* stage) {
+        if (connection_->connected()) return false;
+        std::cerr << "event=edge_stream_client_cancelled virtual_path=" << virtualPath_
+                  << " stage=" << stage << '\n';
+        finish(false, std::string("client_cancelled stage=") + stage);
+        return true;
+    }
+
 
     void fetchAndSendNextChunk() {
         const size_t index = nextPart_.fetch_add(1, std::memory_order_relaxed);
@@ -317,11 +325,14 @@ private:
             finish(true, {});
             return;
         }
+        if (cancelIfClientDisconnected("before_chunk")) return;
+
         const PlaybackStreamPart& part = parts_[index];
         const EdgeCacheKey key = EdgeCacheKey::fromChunk(info_.object, part.chunk);
         CacheLease lease;
         std::string cacheError;
         bool cacheHit = config_.cache->acquire(key, lease, cacheError);
+        if (cancelIfClientDisconnected("after_cache_lookup")) return;
         if (!cacheHit) {
             CacheReservation reservation;
             if (!config_.cache->reserve(key, reservation, cacheError)) {
@@ -348,6 +359,8 @@ private:
                 options.keepAlive = true;
                 options.verifyChecksum = true;
                 TransferStats stats;
+                if (cancelIfClientDisconnected("before_origin_read")) return;
+
                 std::string body;
                 std::string failure;
                 if (!originClient_.readWholeChunk(part.chunk, body, options, stats, failure)) {
@@ -367,6 +380,8 @@ private:
                           << " data_requests=" << stats.dataRequests
                           << " replica_fallbacks=" << stats.replicaFallbacks << '\n';
                 const auto publishStartedAt = std::chrono::steady_clock::now();
+                if (cancelIfClientDisconnected("after_origin_read")) return;
+
                 if (!config_.cache->publish(key, body, reservation, lease, cacheError)) {
                     finish(false, "edge cache publish failed: " + cacheError);
                     return;
@@ -379,6 +394,7 @@ private:
                           << " elapsed_ms=" << publishMs << '\n';
             }
         }
+        if (cancelIfClientDisconnected("after_cache_ready")) return;
         if (cacheHit) {
             cacheHits_.fetch_add(1, std::memory_order_relaxed);
         }
@@ -398,7 +414,7 @@ private:
         connection_->ownerLoop()->queueInLoop(
             [self, heldLease, path, offset, bytes, sendHeaders] {
                 if (!self->connection_->connected()) {
-                    self->finishInLoop(false, "client disconnected before Chunk send");
+                    self->cancelIfClientDisconnected("before_chunk_send");
                     return;
                 }
                 if (sendHeaders) {
@@ -417,6 +433,10 @@ private:
                         // after backpressure has drained this segment.
                         (void)heldLease;
                         if (!sent.success || sent.bytesSent != bytes) {
+                            if (!self->connection_->connected()) {
+                                self->cancelIfClientDisconnected("during_chunk_send");
+                                return;
+                            }
                             self->finish(false, "sendfile failed after " +
                                 std::to_string(sent.bytesSent) + " bytes");
                             return;

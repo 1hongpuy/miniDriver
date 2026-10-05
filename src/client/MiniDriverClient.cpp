@@ -559,8 +559,20 @@ bool MiniDriverClient::uploadFile(const std::filesystem::path& input, const std:
     }
     out.timings.createSessionMs = std::chrono::duration<double, std::milli>(
         std::chrono::steady_clock::now() - createStartedAt).count();
+    const std::string preflightStatus = miniKV::util::jsonString(created.body, "status");
+    if (raftMetadata && preflightStatus == "CONTENT_EXISTS") {
+        out.object.objectId = miniKV::util::jsonString(created.body, "objectId");
+        out.object.objectVersion = miniKV::util::jsonUint(created.body, "objectVersion");
+        out.fileHash = miniKV::util::jsonString(created.body, "fileHash");
+        out.chunkSize = preflightChunkSize;
+        out.chunkCount = static_cast<uint32_t>((fileSize + preflightChunkSize - 1) / preflightChunkSize);
+        if (out.object.objectId.empty() || out.object.objectVersion == 0 || out.fileHash.empty()) {
+            error = "Gateway returned incomplete existing object identity";
+            return false;
+        }
+        return true;
+    }
     const std::string sessionId = miniKV::util::jsonString(created.body, "sessionId");
-    if (sessionId.empty()) { error = "Gateway returned no sessionId"; return false; }
     HttpResponse session;
     // Raft preflight already returns the committed session contract.  Reading
     // it back immediately would add another ReadIndex/HTTP round trip to

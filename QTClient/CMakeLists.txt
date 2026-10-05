@@ -52,6 +52,23 @@ target_include_directories(minidriver_qt_k3s_smoke PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/include
     ${CMAKE_SOURCE_DIR}/include
 )
+
+if(BUILD_TESTING)
+    add_executable(test_qt_transfer_store
+        tests/test_transfer_store.cpp
+        src/TransferStore.cpp
+    )
+    target_compile_features(test_qt_transfer_store PRIVATE cxx_std_17)
+    target_include_directories(test_qt_transfer_store PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${CMAKE_SOURCE_DIR}/include
+    )
+    target_link_libraries(test_qt_transfer_store PRIVATE
+        Qt6::Core
+        Qt6::Sql
+    )
+    add_test(NAME qt_transfer_store COMMAND test_qt_transfer_store)
+endif()
 target_link_libraries(minidriver_qt_k3s_smoke PRIVATE
     Qt6::Core
     minikv_client

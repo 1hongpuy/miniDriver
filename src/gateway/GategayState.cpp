@@ -31,8 +31,8 @@ namespace gateway {
 namespace {
 int64_t uploadLeaseTtlSeconds()
 {
-    constexpr int64_t kDefaultSeconds = 30 * 60;
-    constexpr int64_t kMaxSeconds = 24 * 60 * 60;
+    constexpr int64_t kDefaultSeconds = 24 * 60 * 60;
+    constexpr int64_t kMaxSeconds = 7 * 24 * 60 * 60;
     const char* value = std::getenv("MINIKV_UPLOAD_LEASE_TTL_SECONDS");
     if(value == nullptr || *value == 0) return kDefaultSeconds;
     try {
@@ -1505,9 +1505,14 @@ PreflightStatus GatewayState::preflightUpload(const UploadPreflightRequest& requ
                     out.object.state = FileState::kAvailable;
                     return PreflightStatus::kContentExists;
                 }
-                if(existingSession->expired || existingObject->state != metadata::ObjectState::kUploading) {
+                if(existingSession->expired) {
                     miniKV::utils::logWarn("event=remote_preflight_resume_rejected command_id=" +
-                                           request.commandId + " reason=session_not_resumable");
+                                           request.commandId + " reason=session_expired");
+                    return PreflightStatus::kSessionExpired;
+                }
+                if(existingObject->state != metadata::ObjectState::kUploading) {
+                    miniKV::utils::logWarn("event=remote_preflight_resume_rejected command_id=" +
+                                           request.commandId + " reason=object_not_uploading");
                     return PreflightStatus::kInvalidRequest;
                 }
 

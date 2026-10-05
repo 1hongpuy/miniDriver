@@ -20,7 +20,9 @@ public:
     // failure cannot silently disable crash recovery.
     QString databasePath() const { return databasePath_; }
     bool upsert(const TransferSpec& spec, const TransferSnapshot& snapshot);
-    QVector<TransferSpec> interruptedUploads();
+    // Returns false when the journal could not be read. An empty result with
+    // true means there simply is no recoverable upload.
+    bool interruptedUploads(QVector<TransferSpec>& result);
 
 private:
     QString connectionName_;

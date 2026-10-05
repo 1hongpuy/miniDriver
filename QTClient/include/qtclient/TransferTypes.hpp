@@ -34,6 +34,15 @@ struct TransferSpec {
     QString commandId;
     int attempt = 1;
     miniKV::client::ClientConfig clientConfig;
+
+    // Recovery identity. Tokens are deliberately never stored in SQLite.
+    QString gatewayHost;
+    quint16 gatewayPort = 0;
+    QString servicePrincipal;
+    QString metadataMode;
+    QString targetPath = QStringLiteral("/");
+    quint64 sourceSize = 0;
+    qint64 sourceModifiedMs = 0;
 };
 
 struct TransferSnapshot {

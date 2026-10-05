@@ -13,11 +13,10 @@ class TransferWorker final : public QObject {
     Q_OBJECT
 
 public:
-    explicit TransferWorker(TransferSpec spec, QObject* parent = nullptr);
+    using CancellationState = std::shared_ptr<std::atomic_bool>;
 
-    // Safe to call from TransferManager's GUI thread while start() is running
-    // on this worker's QThread. The SDK observes this cooperatively.
-    void requestCancel() noexcept { cancelRequested_->store(true, std::memory_order_release); }
+    explicit TransferWorker(TransferSpec spec, CancellationState cancellation,
+                            QObject* parent = nullptr);
 
 public slots:
     void start();
@@ -34,7 +33,9 @@ private:
     void emitFailure(const QString& stage, const std::string& error);
 
     TransferSpec spec_;
-    std::shared_ptr<std::atomic_bool> cancelRequested_ = std::make_shared<std::atomic_bool>(false);
+    // Owned by TransferManager rather than accessed through a QObject living
+    // on another thread. It remains valid until the worker has unwound.
+    CancellationState cancelRequested_;
 };
 
 }  // namespace miniKV::qtclient

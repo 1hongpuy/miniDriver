@@ -707,21 +707,14 @@ void MainWindow::closeEvent(QCloseEvent* event) {
     QMessageBox choice(this);
     choice.setIcon(QMessageBox::Question);
     choice.setWindowTitle(QStringLiteral("Transfers are active"));
-    choice.setText(QStringLiteral("An upload is still active. Choose how to close the client."));
+    choice.setText(QStringLiteral("An upload is still active. Stop it before exiting?"));
     choice.setInformativeText(
-        QStringLiteral("Continue in background keeps this process uploading. "
-                       "Exit records a recoverable task in SQLite; the next client start will show it as Interrupted, "
-                       "and Retry resumes the same server session."));
-    auto* background = choice.addButton(QStringLiteral("Continue in background"), QMessageBox::AcceptRole);
+        QStringLiteral("Stop and exit records a recoverable task in SQLite. The next client start shows it as Interrupted; "
+                       "Retry resumes the same server session."));
     auto* exit = choice.addButton(QStringLiteral("Exit and resume next time"), QMessageBox::DestructiveRole);
     auto* cancel = choice.addButton(QMessageBox::Cancel);
-    choice.setDefaultButton(exit);
+    choice.setDefaultButton(cancel);
     choice.exec();
-    if (choice.clickedButton() == background) {
-        hide();
-        event->ignore();
-        return;
-    }
     if (choice.clickedButton() == exit) {
         transferManager_->markActiveUploadsInterrupted();
         transferManager_->stopActiveUploadsForExit();

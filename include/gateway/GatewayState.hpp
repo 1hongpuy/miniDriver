@@ -183,7 +183,7 @@ enum class RoutePlanStatus { kOk, kInvalidRequest, kNoCapacity };
 enum class CommitChunkStatus { kCommitted, kAlreadyCommitted, kInvalidRequest };
 enum class FileCommitStatus { kCommitted, kPathConflict, kInvalidRequest };
 enum class DeleteStatus { kDeleted, kNotFound, kInvalidRequest };
-enum class PreflightStatus { kUploadRequired, kContentExists, kPathConflict, kInvalidRequest };
+enum class PreflightStatus { kUploadRequired, kContentExists, kPathConflict, kSessionExpired, kInvalidRequest };
 
 struct CompletedChunk { //最后写入的清单,会话层
     uint32_t index;

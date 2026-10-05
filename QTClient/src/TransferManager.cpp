@@ -6,16 +6,21 @@ namespace miniKV::qtclient {
 
 TransferManager::TransferManager(QObject* parent) : QObject(parent) {}
 
-void TransferManager::persist(const TransferSpec& spec, const TransferSnapshot& snapshot) {
-    if (store_.upsert(spec, snapshot)) return;
-    if (journalFailureReported_) return;
+bool TransferManager::persist(const TransferSpec& spec, const TransferSnapshot& snapshot) {
+    if (store_.upsert(spec, snapshot)) return true;
+    stopActiveUploadsForExit();
+    if (journalFailureReported_) return false;
     journalFailureReported_ = true;
     emit log({spec.taskId, QStringLiteral("journal"),
               QStringLiteral("transfer recovery journal is unavailable: %1 (database: %2)")
                   .arg(store_.error(), store_.databasePath())});
+    return false;
 }
 
 TransferManager::~TransferManager() {
+    stopping_ = true;
+    markActiveUploadsInterrupted();
+    stopActiveUploadsForExit();
     for (auto it = active_.begin(); it != active_.end(); ++it) {
         if (it->thread) {
             it->thread->quit();
@@ -41,6 +46,47 @@ TransferSnapshot TransferManager::initialSnapshot(const TransferSpec& spec) cons
     return snapshot;
 }
 
+bool TransferManager::captureUploadIdentity(TransferSpec& spec, QString& error) const {
+    const QFileInfo source(spec.localPath);
+    if (!source.exists() || !source.isFile() || source.size() <= 0) {
+        error = QStringLiteral("The selected source file no longer exists or is empty.");
+        return false;
+    }
+    spec.gatewayHost = QString::fromStdString(spec.clientConfig.gateway.host);
+    spec.gatewayPort = spec.clientConfig.gateway.port;
+    spec.servicePrincipal = QString::fromStdString(spec.clientConfig.servicePrincipal);
+    spec.metadataMode = qEnvironmentVariable("MINIKV_METADATA_MODE", QStringLiteral("raft"));
+    spec.targetPath = QStringLiteral("/");
+    spec.sourceSize = static_cast<quint64>(source.size());
+    spec.sourceModifiedMs = source.lastModified().toMSecsSinceEpoch();
+    return true;
+}
+
+bool TransferManager::validateUploadResumeIdentity(const TransferSpec& spec,
+                                                   const miniKV::client::ClientConfig& config,
+                                                   QString& error) const {
+    const QString mode = qEnvironmentVariable("MINIKV_METADATA_MODE", QStringLiteral("raft"));
+    if (spec.gatewayHost.isEmpty() || spec.gatewayPort == 0 || spec.servicePrincipal.isEmpty() ||
+        spec.metadataMode.isEmpty() || spec.targetPath.isEmpty() || spec.sourceSize == 0 ||
+        spec.sourceModifiedMs <= 0) {
+        error = QStringLiteral("This interrupted upload was created by an older client without recovery identity. Start a new upload instead.");
+        return false;
+    }
+    if (spec.gatewayHost != QString::fromStdString(config.gateway.host) ||
+        spec.gatewayPort != config.gateway.port ||
+        spec.servicePrincipal != QString::fromStdString(config.servicePrincipal) || spec.metadataMode != mode) {
+        error = QStringLiteral("The current connection does not match the cluster/account/mode that created this upload. Restore its original settings before retrying.");
+        return false;
+    }
+    const QFileInfo source(spec.localPath);
+    if (!source.exists() || !source.isFile() || static_cast<quint64>(source.size()) != spec.sourceSize ||
+        source.lastModified().toMSecsSinceEpoch() != spec.sourceModifiedMs) {
+        error = QStringLiteral("The source file changed, moved, or was deleted. Start a new upload; it cannot safely resume the old session.");
+        return false;
+    }
+    return true;
+}
+
 QString TransferManager::enqueueUpload(const QString& localPath,
                                        const miniKV::client::ClientConfig& config,
                                        bool verifyRoundTrip) {
@@ -51,10 +97,38 @@ QString TransferManager::enqueueUpload(const QString& localPath,
     spec.verifyRoundTrip = verifyRoundTrip;
     spec.commandId = QStringLiteral("qt-upload-") + spec.taskId;
     spec.clientConfig = config;
+    QString identityError;
+    captureUploadIdentity(spec, identityError);
+    TransferSnapshot snapshot = initialSnapshot(spec);
+    if (!identityError.isEmpty()) {
+        snapshot.state = TransferState::Failed;
+        snapshot.stage = QStringLiteral("source");
+        snapshot.error = identityError;
+        taskSpecs_.insert(spec.taskId, spec);
+        failedTasks_.insert(spec.taskId);
+        emit taskAdded(snapshot);
+        return spec.taskId;
+    }
+    if (stopping_) {
+        snapshot.state = TransferState::Failed;
+        snapshot.stage = QStringLiteral("stopping");
+        snapshot.error = QStringLiteral("Client is stopping; no new transfer was started.");
+        taskSpecs_.insert(spec.taskId, spec);
+        failedTasks_.insert(spec.taskId);
+        emit taskAdded(snapshot);
+        return spec.taskId;
+    }
+    if (!persist(spec, snapshot)) {
+        snapshot.state = TransferState::Failed;
+        snapshot.stage = QStringLiteral("journal");
+        snapshot.error = QStringLiteral("Upload was not started because its recovery record could not be saved.");
+        taskSpecs_.insert(spec.taskId, spec);
+        failedTasks_.insert(spec.taskId);
+        emit taskAdded(snapshot);
+        return spec.taskId;
+    }
     taskSpecs_.insert(spec.taskId, spec);
     pending_.enqueue(spec);
-    const TransferSnapshot snapshot = initialSnapshot(spec);
-    persist(spec, snapshot);
     emit taskAdded(snapshot);
     emit log({spec.taskId, QStringLiteral("manager"), QStringLiteral("upload queued")});
     startNext();
@@ -71,10 +145,27 @@ QString TransferManager::enqueueDownload(const QString& objectId, quint64 object
     spec.objectId = objectId;
     spec.objectVersion = objectVersion;
     spec.clientConfig = config;
+    TransferSnapshot snapshot = initialSnapshot(spec);
+    if (stopping_) {
+        snapshot.state = TransferState::Failed;
+        snapshot.stage = QStringLiteral("stopping");
+        snapshot.error = QStringLiteral("Client is stopping; no new transfer was started.");
+        taskSpecs_.insert(spec.taskId, spec);
+        failedTasks_.insert(spec.taskId);
+        emit taskAdded(snapshot);
+        return spec.taskId;
+    }
+    if (!persist(spec, snapshot)) {
+        snapshot.state = TransferState::Failed;
+        snapshot.stage = QStringLiteral("journal");
+        snapshot.error = QStringLiteral("Download was not started because its recovery record could not be saved.");
+        taskSpecs_.insert(spec.taskId, spec);
+        failedTasks_.insert(spec.taskId);
+        emit taskAdded(snapshot);
+        return spec.taskId;
+    }
     taskSpecs_.insert(spec.taskId, spec);
     pending_.enqueue(spec);
-    const TransferSnapshot snapshot = initialSnapshot(spec);
-    persist(spec, snapshot);
     emit taskAdded(snapshot);
     emit log({spec.taskId, QStringLiteral("manager"), QStringLiteral("download queued")});
     startNext();
@@ -84,6 +175,10 @@ QString TransferManager::enqueueDownload(const QString& objectId, quint64 object
 bool TransferManager::retry(const QString& taskId,
                             const miniKV::client::ClientConfig& config,
                             QString& error) {
+    if (stopping_) {
+        error = QStringLiteral("Client is stopping; retry is unavailable.");
+        return false;
+    }
     const auto found = taskSpecs_.constFind(taskId);
     if (found == taskSpecs_.cend()) {
         error = QStringLiteral("Unknown transfer task");
@@ -100,14 +195,20 @@ bool TransferManager::retry(const QString& taskId,
 
     TransferSpec spec = found.value();
     spec.clientConfig = config;
+    if (spec.direction == TransferDirection::Upload && !validateUploadResumeIdentity(spec, config, error)) {
+        return false;
+    }
     ++spec.attempt;
+    const TransferSnapshot snapshot = initialSnapshot(spec);
+    if (!persist(spec, snapshot)) {
+        error = QStringLiteral("Recovery journal could not save the retry: %1").arg(store_.error());
+        return false;
+    }
     taskSpecs_.insert(taskId, spec);
     retryPending_.insert(taskId);
     failedTasks_.remove(taskId);
     finishedTasks_.remove(taskId);
     pending_.enqueue(spec);
-    const TransferSnapshot snapshot = initialSnapshot(spec);
-    persist(spec, snapshot);
     emit taskUpdated(snapshot);
     emit log({taskId, QStringLiteral("manager"),
               QStringLiteral("retry queued; attempt %1; upload keeps its original command ID")
@@ -124,8 +225,16 @@ void TransferManager::restoreInterruptedUploads(const miniKV::client::ClientConf
         return;
     }
 
+    QVector<TransferSpec> interrupted;
+    if (!store_.interruptedUploads(interrupted)) {
+        emit log({QString(), QStringLiteral("journal"),
+                  QStringLiteral("could not read transfer recovery journal: %1 (database: %2)")
+                      .arg(store_.error(), store_.databasePath())});
+        return;
+    }
+
     int restored = 0;
-    for (TransferSpec spec : store_.interruptedUploads()) {
+    for (TransferSpec spec : interrupted) {
         if (taskSpecs_.contains(spec.taskId)) continue;
         spec.clientConfig = config;
         taskSpecs_.insert(spec.taskId, spec);
@@ -133,7 +242,13 @@ void TransferManager::restoreInterruptedUploads(const miniKV::client::ClientConf
         TransferSnapshot snapshot = initialSnapshot(spec);
         snapshot.state = TransferState::Failed;
         snapshot.stage = QStringLiteral("interrupted");
-        snapshot.error = QStringLiteral("Previous client instance stopped; select this row and retry to resume.");
+        QString identityError;
+        if (!validateUploadResumeIdentity(spec, config, identityError)) {
+            snapshot.stage = QStringLiteral("needs attention");
+            snapshot.error = identityError;
+        } else {
+            snapshot.error = QStringLiteral("Previous client instance stopped; select this row and retry to resume.");
+        }
         persist(spec, snapshot);
         emit taskAdded(snapshot);
         emit log({spec.taskId, QStringLiteral("manager"),
@@ -158,15 +273,18 @@ void TransferManager::markActiveUploadsInterrupted() {
 }
 
 void TransferManager::stopActiveUploadsForExit() {
+    stopping_ = true;
+    pending_.clear();
     for (auto it = active_.cbegin(); it != active_.cend(); ++it) {
         const auto spec = taskSpecs_.constFind(it.key());
-        if (spec != taskSpecs_.cend() && spec->direction == TransferDirection::Upload && it->worker) {
-            it->worker->requestCancel();
+        if (spec != taskSpecs_.cend() && spec->direction == TransferDirection::Upload && it->cancellation) {
+            it->cancellation->store(true, std::memory_order_release);
         }
     }
 }
 
 void TransferManager::startNext() {
+    if (stopping_) return;
     // A Retry can be queued while its failed worker is still unwinding. Never
     // overlap attempts of the same logical task/session; defer that entry
     // until QThread::finished removes the old ActiveTask.
@@ -184,14 +302,22 @@ void TransferManager::startNext() {
 
 void TransferManager::startTask(const TransferSpec& spec) {
     retryPending_.remove(spec.taskId);
-    auto* thread = new QThread(this);
-    auto* worker = new TransferWorker(spec);
-    worker->moveToThread(thread);
-    active_.insert(spec.taskId, ActiveTask{thread, worker});
     TransferSnapshot running = initialSnapshot(spec);
     running.state = TransferState::Running;
     running.stage = QStringLiteral("starting");
-    persist(spec, running);
+    if (!persist(spec, running)) {
+        running.state = TransferState::Failed;
+        running.stage = QStringLiteral("journal");
+        running.error = QStringLiteral("Transfer was not started because its recovery record could not be updated.");
+        failedTasks_.insert(spec.taskId);
+        emit taskUpdated(running);
+        return;
+    }
+    auto* thread = new QThread(this);
+    auto cancellation = std::make_shared<std::atomic_bool>(false);
+    auto* worker = new TransferWorker(spec, cancellation);
+    worker->moveToThread(thread);
+    active_.insert(spec.taskId, ActiveTask{thread, std::move(cancellation)});
 
     connect(thread, &QThread::started, worker, &TransferWorker::start);
     connect(worker, &TransferWorker::progress, this, &TransferManager::onProgress,

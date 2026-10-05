@@ -95,8 +95,10 @@ private:
 
 }  // namespace
 
-TransferWorker::TransferWorker(TransferSpec spec, QObject* parent)
-    : QObject(parent), spec_(std::move(spec)) {}
+TransferWorker::TransferWorker(TransferSpec spec, CancellationState cancellation, QObject* parent)
+    : QObject(parent), spec_(std::move(spec)), cancelRequested_(std::move(cancellation)) {
+    if (!cancelRequested_) cancelRequested_ = std::make_shared<std::atomic_bool>(false);
+}
 
 TransferSnapshot TransferWorker::baseSnapshot(TransferState state, const QString& stage) const {
     TransferSnapshot snapshot;

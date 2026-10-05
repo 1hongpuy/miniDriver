@@ -9,6 +9,8 @@
 #include <QSet>
 #include <QThread>
 
+#include <atomic>
+#include <memory>
 namespace miniKV::qtclient {
 
 class TransferManager final : public QObject {
@@ -55,13 +57,18 @@ private slots:
 private:
     struct ActiveTask {
         QThread* thread = nullptr;
-        TransferWorker* worker = nullptr;
+        TransferWorker::CancellationState cancellation;
     };
 
     void startTask(const TransferSpec& spec);
     TransferSnapshot initialSnapshot(const TransferSpec& spec) const;
-    void persist(const TransferSpec& spec, const TransferSnapshot& snapshot);
+    // A transfer must never touch Gateway/DataNode until its recoverable
+    // snapshot is durably stored.
+    bool persist(const TransferSpec& spec, const TransferSnapshot& snapshot);
 
+    bool captureUploadIdentity(TransferSpec& spec, QString& error) const;
+    bool validateUploadResumeIdentity(const TransferSpec& spec,
+                                      const miniKV::client::ClientConfig& config, QString& error) const;
     static constexpr int kMaxActiveTasks = 2;
     QQueue<TransferSpec> pending_;
     QHash<QString, ActiveTask> active_;
@@ -71,6 +78,7 @@ private:
     QSet<QString> retryPending_;
     TransferStore store_;
     bool journalFailureReported_ = false;
+    bool stopping_ = false;
 };
 
 }  // namespace miniKV::qtclient

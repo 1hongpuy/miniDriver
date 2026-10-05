@@ -966,6 +966,8 @@ int main(int argc, char** argv) {
             } else if (status == PreflightStatus::kContentExists) {
                 json(response, 200, "{\"status\":\"CONTENT_EXISTS\",\"object\":" +
                     objectJson(result.object) + "}");
+            } else if (status == PreflightStatus::kSessionExpired) {
+                json(response, 410, jsonError("upload session expired; start a new upload"));
             } else if (status == PreflightStatus::kUploadRequired) {
                 json(response, 200, uploadPreflightJson(result, chunkProtocol));
             } else {

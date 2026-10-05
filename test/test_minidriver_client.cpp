@@ -197,6 +197,25 @@ int main() {
     MINIKV_CHECK(firstCrossReplica.request().find("Range: bytes=1-2") != std::string::npos);
     MINIKV_CHECK(secondCrossReplica.request().find("Range: bytes=0-1") != std::string::npos);
     std::filesystem::remove(crossOutput, filesystemError);
-    std::cout << "PASS: SDK V3 ReadPlan verifies checksum and falls back to a replica\n";
+    // Replaying a completed Raft command must be success, not a malformed
+    // "no sessionId" error. No DataNode call is necessary for CONTENT_EXISTS.
+    const std::filesystem::path uploadInput = std::filesystem::temp_directory_path() /
+        "minikv_client_content_exists_test.bin";
+    { std::ofstream input(uploadInput, std::ios::binary); input << "same-content"; }
+    OneShotHttpServer existingGateway(response("{\"status\":\"CONTENT_EXISTS\",\"object\":{\"objectId\":\"object-existing\",\"objectVersion\":3,\"fileHash\":\"hash-existing\",\"fileSize\":12,\"state\":\"AVAILABLE\"}}"));
+    miniKV::client::ClientConfig uploadConfig;
+    uploadConfig.gateway = {"127.0.0.1", existingGateway.port()};
+    miniKV::client::MiniDriverClient uploadClient(uploadConfig);
+    miniKV::client::UploadOptions uploadOptions;
+    uploadOptions.commandId = "retry-command-1";
+    miniKV::client::UploadResult uploadResult;
+    ::setenv("MINIKV_METADATA_MODE", "raft", 1);
+    MINIKV_CHECK(uploadClient.uploadFile(uploadInput, "same-content.bin", "/", uploadOptions, uploadResult, error));
+    ::unsetenv("MINIKV_METADATA_MODE");
+    MINIKV_CHECK(uploadResult.object.objectId == "object-existing");
+    MINIKV_CHECK(uploadResult.object.objectVersion == 3);
+    MINIKV_CHECK(uploadResult.fileHash == "hash-existing");
+    MINIKV_CHECK(existingGateway.request().find("POST /api/v2/upload/preflight") != std::string::npos);
+    std::filesystem::remove(uploadInput, filesystemError);
     return 0;
 }

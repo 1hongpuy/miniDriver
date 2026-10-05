@@ -384,6 +384,7 @@ bool EdgeCacheStore::publish(const EdgeCacheKey& key, const std::string& bytes,
     if (renameError) { std::filesystem::remove(temporaryBody, renameError); std::filesystem::remove(temporaryMeta, renameError); error = "cannot publish edge cache body: " + renameError.message(); return false; }
     std::filesystem::rename(temporaryMeta, meta, renameError);
     if (renameError) { std::error_code ignored; std::filesystem::remove(body, ignored); std::filesystem::remove(temporaryMeta, ignored); error = "cannot publish edge cache metadata: " + renameError.message(); return false; }
+    bool published = false;
     {
         std::lock_guard<std::mutex> lock(state_->mutex);
         auto [found, inserted] = state_->entries.emplace(key.id, CacheLease::State::Entry{key, body, meta, 0});
@@ -397,17 +398,17 @@ bool EdgeCacheStore::publish(const EdgeCacheKey& key, const std::string& bytes,
                 out = CacheLease(state_, key.id, found->second.body, found->second.key.size);
             }
         } else {
-            state_->reservedBytes -= reservation.bytes();
-            state_->filling.erase(key.id);
-            reservation = {};
             state_->readyBytes += key.size;
             found->second.pins = 1;
             out = CacheLease(state_, key.id, body, key.size);
-            state_->ready.notify_all();
-            return true;
+            published = true;
         }
     }
+    // CacheReservation::reset() takes state_->mutex. It must run after the
+    // critical section; resetting it while holding that mutex deadlocks every
+    // successful cache fill and leaves later readers waiting on FETCHING.
     reservation.reset();
+    if (published) return true;
     if (out.valid()) return true;
     error = "concurrent cache publication cannot acquire winner";
     return false;

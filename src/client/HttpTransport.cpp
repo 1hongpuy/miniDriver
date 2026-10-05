@@ -169,7 +169,9 @@ void throttle(uint64_t bytes, uint64_t maxReadBytesPerSecond) {
 }
 
 bool readResponse(TransportSocket fd, int timeoutMs, HttpResponse& response, std::string& error,
-                  uint64_t maxReadBytesPerSecond) {
+                  uint64_t maxReadBytesPerSecond, const std::function<bool()>& isCancelled) {
+    constexpr int kCancellationPollMs = 100;
+    auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeoutMs);
     response = {};
     std::string bytes;
     char buffer[64 * 1024];
@@ -177,7 +179,19 @@ bool readResponse(TransportSocket fd, int timeoutMs, HttpResponse& response, std
     uint64_t expectedBody = 0;
     while (true) {
         if (headerEnd != std::string::npos && bytes.size() >= headerEnd + 4 + expectedBody) break;
-        if (!waitFor(fd, kPollIn, timeoutMs, error)) return false;
+        if (isCancelled && isCancelled()) { error = "HTTP request cancelled"; return false; }
+        const auto now = std::chrono::steady_clock::now();
+        if (now >= deadline) { error = "HTTP socket timed out"; return false; }
+        const int remainingMs = static_cast<int>(std::max<int64_t>(1,
+            std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now).count()));
+        const int pollMs = isCancelled ? std::min(remainingMs, kCancellationPollMs) : remainingMs;
+        if (!waitFor(fd, kPollIn, pollMs, error)) {
+            if (error == "HTTP socket timed out" && std::chrono::steady_clock::now() < deadline) {
+                error.clear();
+                continue;
+            }
+            return false;
+        }
 #ifdef _WIN32
         const int result = ::recv(fd, buffer, static_cast<int>(sizeof(buffer)), 0);
 #else
@@ -189,6 +203,7 @@ bool readResponse(TransportSocket fd, int timeoutMs, HttpResponse& response, std
             error = socketErrorText(socketError()); return false;
         }
         const size_t oldSize = bytes.size();
+        deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeoutMs);
         bytes.append(buffer, static_cast<size_t>(result));
         if (headerEnd != std::string::npos) {
             const size_t bodyStart = headerEnd + 4;
@@ -267,9 +282,10 @@ bool StreamingRequest::write(const char* bytes, size_t size, std::string& error)
 }
 
 bool StreamingRequest::finish(HttpResponse& response, std::string& error,
-                              uint64_t maxReadBytesPerSecond) {
+                              uint64_t maxReadBytesPerSecond,
+                              const std::function<bool()>& isCancelled) {
     if (fd_ == kInvalidTransportSocket || sentBytes_ != expectedBytes_) { error = "SDK request body is incomplete"; cancel(); return false; }
-    const bool ok = readResponse(fd_, timeoutMs_, response, error, maxReadBytesPerSecond);
+    const bool ok = readResponse(fd_, timeoutMs_, response, error, maxReadBytesPerSecond, isCancelled);
     expectedBytes_ = 0;
     sentBytes_ = 0;
     const std::string* connection = findHeader(response.headers, "Connection");

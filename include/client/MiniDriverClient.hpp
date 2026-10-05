@@ -37,6 +37,10 @@ struct ReadOptions {
     bool allowReplicaRetry = true;
     uint32_t maxReplicaAttempts = 2;
     uint64_t maxReadBytesPerSecond = 0;
+    // Read-side cooperative cancellation. A cancelled read closes its DataNode
+    // socket promptly and does not retry another replica.
+    std::function<bool()> isCancelled;
+
 };
 
 struct UploadOptions {

@@ -910,6 +910,10 @@ bool MiniDriverClient::readChunkRange(const ChunkReadPlan& chunk, uint64_t offse
         options.allowReplicaRetry ? std::max<uint32_t>(1, options.maxReplicaAttempts) : 1);
     std::string lastError;
     for (uint32_t attempt = 0; attempt < attempts; ++attempt) {
+        if (options.isCancelled && options.isCancelled()) {
+            error = "chunk read cancelled";
+            return false;
+        }
         const ReplicaTarget& candidate = chunk.replicas[attempt];
         const StreamingRequest::Stats before = dataRequest_.stats();
         HttpResponse response;
@@ -925,9 +929,13 @@ bool MiniDriverClient::readChunkRange(const ChunkReadPlan& chunk, uint64_t offse
         const bool ok = dataRequest_.open(candidate.endpoint, "GET", path, headers, 0,
                                      config_.dataNodeTimeoutMs, lastError, options.keepAlive) &&
             dataRequest_.write(nullptr, 0, lastError) &&
-            dataRequest_.finish(response, lastError, options.maxReadBytesPerSecond);
+            dataRequest_.finish(response, lastError, options.maxReadBytesPerSecond, options.isCancelled);
         addDelta(before, dataRequest_.stats(), stats);
         if (!ok) continue;
+        if (options.isCancelled && options.isCancelled()) {
+            error = "chunk read cancelled";
+            return false;
+        }
         const int expectedStatus = wholeChunk ? 200 : 206;
         if (response.status != expectedStatus) {
             lastError = "DataNode HTTP " + std::to_string(response.status);

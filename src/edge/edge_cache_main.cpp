@@ -357,6 +357,9 @@ private:
                           << " chunk_bytes=" << part.chunk.size << '\n';
                 ReadOptions options;
                 options.keepAlive = true;
+                options.isCancelled = [this] {
+                    return finished_.load(std::memory_order_relaxed) || !connection_->connected();
+                };
                 options.verifyChecksum = true;
                 TransferStats stats;
                 if (cancelIfClientDisconnected("before_origin_read")) return;
@@ -364,6 +367,10 @@ private:
                 std::string body;
                 std::string failure;
                 if (!originClient_.readWholeChunk(part.chunk, body, options, stats, failure)) {
+                    if (options.isCancelled()) {
+                        cancelIfClientDisconnected("during_origin_read");
+                        return;
+                    }
                     finish(false, "origin chunk read failed: " + failure);
                     return;
                 }

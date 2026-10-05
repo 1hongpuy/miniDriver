@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <functional>
 #include <map>
 #include <string>
 #include <string_view>
@@ -56,7 +57,8 @@ public:
               bool keepAlive = false);
     bool write(const char* bytes, size_t size, std::string& error);
     bool finish(HttpResponse& response, std::string& error,
-                uint64_t maxReadBytesPerSecond = 0);
+                uint64_t maxReadBytesPerSecond = 0,
+                const std::function<bool()>& isCancelled = {});
     void cancel();
     const Stats& stats() const { return stats_; }
 

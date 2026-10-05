@@ -1143,7 +1143,8 @@ ApplyResult NuRaftMetadataService::commitChunk(const std::string& sessionId,
                                                const std::string& leaseId)
 {
     MetadataCommand command;
-    command.commandId = "commit-chunk-" + sessionId + "-" + std::to_string(index);
+    command.commandId = "commit-chunk-" + sessionId + "-" + std::to_string(index) +
+                        "-" + leaseId;
     command.type = MetadataCommandType::kCommitChunk;
     command.actorType = "datanode";
     command.actorId = successfulNodes.empty() ? std::string{} : successfulNodes.front();

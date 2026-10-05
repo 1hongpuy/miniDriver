@@ -58,6 +58,39 @@ int main()
         MINIKV_CHECK(service.linearizableReadBarrier("read-1"));
     }
     {
+        // A rejected commit is still deduplicated by the state machine.  If
+        // recovery replaces its lease, the recovered commit must therefore
+        // use a distinct command identity while a retry with the same lease
+        // remains idempotent.
+        MetadataService recovery;
+        MINIKV_CHECK(recovery.propose(nodeCommand("recovery-n1", "dn-1")).status == ApplyStatus::kOk);
+        MINIKV_CHECK(recovery.propose(onlineCommand("recovery-on1", "dn-1")).status == ApplyStatus::kOk);
+        MINIKV_CHECK(recovery.propose(nodeCommand("recovery-n2", "dn-2")).status == ApplyStatus::kOk);
+        MINIKV_CHECK(recovery.propose(onlineCommand("recovery-on2", "dn-2")).status == ApplyStatus::kOk);
+        MINIKV_CHECK(recovery.propose(sessionCommand()).status == ApplyStatus::kOk);
+        MINIKV_CHECK(recovery.heartbeat({"dn-1", 1, 900, 0, 0, 0, 0, 0, 2000}));
+        MINIKV_CHECK(recovery.heartbeat({"dn-2", 1, 900, 0, 0, 0, 0, 0, 2000}));
+
+        ReserveLeaseRequest oldLease;
+        oldLease.commandId = "recovery-lease-old"; oldLease.leaseId = "l-old";
+        oldLease.requestKey = "recovery-old"; oldLease.sessionId = "s1"; oldLease.routeKey = "r1";
+        oldLease.chunkSize = 4; oldLease.generation = 1; oldLease.desiredRf = 2;
+        oldLease.expiresAt = 10000; oldLease.nowMs = 2001;
+        MINIKV_CHECK(recovery.reserveLease(oldLease).status == ApplyStatus::kOk);
+        MINIKV_CHECK(recovery.commitChunk("s1", 0, 4, {"dn-1"}, "l-old").status == ApplyStatus::kConflict);
+
+        MetadataCommand release;
+        release.commandId = "recovery-release-old"; release.type = MetadataCommandType::kReleaseLease;
+        release.generation = 1; release.payload = ReleaseLeasePayload{"l-old", 1};
+        MINIKV_CHECK(recovery.propose(release).status == ApplyStatus::kOk);
+
+        ReserveLeaseRequest recoveredLease = oldLease;
+        recoveredLease.commandId = "recovery-lease-new"; recoveredLease.leaseId = "l-recovered";
+        recoveredLease.requestKey = "recovery-new";
+        MINIKV_CHECK(recovery.reserveLease(recoveredLease).status == ApplyStatus::kOk);
+        MINIKV_CHECK(recovery.commitChunk("s1", 0, 4, {"dn-1", "dn-2"}, "l-recovered").status == ApplyStatus::kOk);
+    }
+    {
         MetadataService recovered(directory);
         MINIKV_CHECK(recovered.session("s1"));
         MINIKV_CHECK(recovered.propose(sessionCommand()).status == ApplyStatus::kOk);

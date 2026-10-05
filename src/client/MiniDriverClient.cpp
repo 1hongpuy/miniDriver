@@ -21,6 +21,10 @@
 namespace miniKV::client {
 namespace {
 
+bool uploadCancelled(const std::function<bool()>& isCancelled) {
+    return isCancelled && isCancelled();
+}
+
 uint32_t crc32c(const char* bytes, size_t size) {
     static const auto table = [] {
         std::array<uint32_t, 256> value{};
@@ -281,7 +285,9 @@ bool replicaChain(const std::string& route, std::string& out, std::string& error
 bool putChunk(const ClientConfig& config, const std::filesystem::path& inputPath,
               const std::string& sessionId, uint64_t fileSize, uint64_t chunkSize,
               uint32_t chunkIndex, const std::string& checksumType,
+              const std::function<bool()>& isCancelled,
               UploadPhaseTimings& timings, std::string& error) {
+    if (uploadCancelled(isCancelled)) { error = "upload cancelled"; return false; }
     const auto chunkStartedAt = std::chrono::steady_clock::now();
     const uint64_t offset = static_cast<uint64_t>(chunkIndex) * chunkSize;
     const uint64_t size = std::min<uint64_t>(chunkSize, fileSize - offset);
@@ -309,10 +315,12 @@ bool putChunk(const ClientConfig& config, const std::filesystem::path& inputPath
     // idempotent while a fresh capability avoids reusing a stale token.
     std::string lastDataError;
     for (uint32_t dataAttempt = 0; dataAttempt < 3; ++dataAttempt) {
+        if (uploadCancelled(isCancelled)) { error = "upload cancelled"; return false; }
         HttpResponse routes;
         bool routed = false;
         const auto routeStartedAt = std::chrono::steady_clock::now();
         for (uint32_t routeAttempt = 0; routeAttempt < 6; ++routeAttempt) {
+            if (uploadCancelled(isCancelled)) { error = "upload cancelled"; return false; }
             std::string routeError;
             if (!httpRequest(config.gateway, "POST", routePath,
                              {{"Content-Type", "application/json"}}, routeBody,
@@ -367,6 +375,7 @@ bool putChunk(const ClientConfig& config, const std::filesystem::path& inputPath
             std::array<char, 64 * 1024> buffer{};
             uint64_t remaining = size;
             while (remaining > 0) {
+                if (uploadCancelled(isCancelled)) { request.cancel(); attemptError = "upload cancelled"; bodySent = false; break; }
                 const size_t wanted = static_cast<size_t>(std::min<uint64_t>(remaining, buffer.size()));
                 input.read(buffer.data(), static_cast<std::streamsize>(wanted));
                 if (static_cast<size_t>(input.gcount()) != wanted || !request.write(buffer.data(), wanted, attemptError)) {
@@ -462,6 +471,7 @@ bool MiniDriverClient::uploadFile(const std::filesystem::path& input, const std:
                                   const std::string& dirPath, const UploadOptions& options,
                                   UploadResult& out, std::string& error) const {
     out = {};
+    if (uploadCancelled(options.isCancelled)) { error = "upload cancelled"; return false; }
     if (fileName.empty() || options.chunkWindow == 0 ||
         (options.checksumType != "crc32c" && options.checksumType != "sha256")) {
         error = "file name, positive chunk window, and crc32c|sha256 checksum are required";
@@ -505,6 +515,7 @@ bool MiniDriverClient::uploadFile(const std::filesystem::path& input, const std:
         std::string canonical = "minikv-manifest-v1\n" + std::to_string(fileSize) + "\n" +
                                 std::to_string(preflightChunkSize) + "\n";
         for(uint32_t index = 0; index < total; ++index) {
+            if (uploadCancelled(options.isCancelled)) { error = "upload cancelled"; return false; }
             const uint64_t offset = static_cast<uint64_t>(index) * preflightChunkSize;
             const uint64_t size = std::min<uint64_t>(preflightChunkSize, fileSize - offset);
             std::string sha, crc, digestError;
@@ -540,6 +551,7 @@ bool MiniDriverClient::uploadFile(const std::filesystem::path& input, const std:
         ? std::map<std::string, std::string>{{"Content-Type", "application/json"},
                                              {"X-Minidriver-Command-Id", controlCommandId}}
         : std::map<std::string, std::string>{};
+    if (uploadCancelled(options.isCancelled)) { error = "upload cancelled"; return false; }
     if (!httpRequest(config_.gateway, "POST", createPath, createHeaders, createBody,
                      config_.gatewayTimeoutMs, created, error) || created.status < 200 || created.status >= 300) {
         if(error.empty()) error = "POST " + createPath + " HTTP " + std::to_string(created.status) + ": " + created.body;
@@ -615,6 +627,11 @@ bool MiniDriverClient::uploadFile(const std::filesystem::path& input, const std:
     for (uint32_t worker = 0; worker < workerCount; ++worker) {
         workers.emplace_back([&] {
             while (!failed.load()) {
+                if (uploadCancelled(options.isCancelled)) {
+                    std::lock_guard<std::mutex> lock(errorMutex);
+                    if (!failed.exchange(true)) chunkError = "upload cancelled";
+                    return;
+                }
                 const size_t task = next.fetch_add(1);
                 if (task >= pending.size()) return;
                 std::string currentError;
@@ -625,7 +642,7 @@ bool MiniDriverClient::uploadFile(const std::filesystem::path& input, const std:
                     options.acquireChunk();
                 }
                 const bool uploaded = putChunk(config_, input, sessionId, fileSize, chunkSize, pending[task],
-                                               gatewayChecksum, chunkTimings, currentError);
+                                               gatewayChecksum, options.isCancelled, chunkTimings, currentError);
                 if (options.releaseChunk) options.releaseChunk();
                 {
                     std::lock_guard<std::mutex> lock(timingMutex);
@@ -661,6 +678,7 @@ bool MiniDriverClient::uploadFile(const std::filesystem::path& input, const std:
     }
     for (std::thread& worker : workers) worker.join();
     if (failed.load()) { error = chunkError; return false; }
+    if (uploadCancelled(options.isCancelled)) { error = "upload cancelled"; return false; }
     HttpResponse committed;
     const auto commitStartedAt = std::chrono::steady_clock::now();
     if (!requestSuccess(config_.gateway, "POST", "/api/v2/upload/sessions/" + pathEscape(sessionId) +

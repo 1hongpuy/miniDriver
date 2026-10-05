@@ -715,7 +715,7 @@ void MainWindow::closeEvent(QCloseEvent* event) {
     auto* background = choice.addButton(QStringLiteral("Continue in background"), QMessageBox::AcceptRole);
     auto* exit = choice.addButton(QStringLiteral("Exit and resume next time"), QMessageBox::DestructiveRole);
     auto* cancel = choice.addButton(QMessageBox::Cancel);
-    choice.setDefaultButton(background);
+    choice.setDefaultButton(exit);
     choice.exec();
     if (choice.clickedButton() == background) {
         hide();
@@ -724,6 +724,7 @@ void MainWindow::closeEvent(QCloseEvent* event) {
     }
     if (choice.clickedButton() == exit) {
         transferManager_->markActiveUploadsInterrupted();
+        transferManager_->stopActiveUploadsForExit();
         event->accept();
         return;
     }

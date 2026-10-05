@@ -157,6 +157,15 @@ void TransferManager::markActiveUploadsInterrupted() {
     }
 }
 
+void TransferManager::stopActiveUploadsForExit() {
+    for (auto it = active_.cbegin(); it != active_.cend(); ++it) {
+        const auto spec = taskSpecs_.constFind(it.key());
+        if (spec != taskSpecs_.cend() && spec->direction == TransferDirection::Upload && it->worker) {
+            it->worker->requestCancel();
+        }
+    }
+}
+
 void TransferManager::startNext() {
     // A Retry can be queued while its failed worker is still unwinding. Never
     // overlap attempts of the same logical task/session; defer that entry

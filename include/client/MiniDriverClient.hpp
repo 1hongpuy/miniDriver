@@ -65,6 +65,9 @@ struct UploadOptions {
     // then after each logical Chunk completes;
     // it does not change retry, RF2, checksum, or commit semantics.
     std::function<void(const UploadProgress&)> onProgress;
+    // Cooperative cancellation. The SDK checks this before expensive hashing,
+    // before new HTTP requests, and between streamed body blocks.
+    std::function<bool()> isCancelled;
 };
 
 // Replayable source required by the current upload retry contract.  A generic

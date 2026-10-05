@@ -113,6 +113,10 @@ TransferSnapshot TransferWorker::baseSnapshot(TransferState state, const QString
 }
 
 void TransferWorker::start() {
+    if (cancelRequested_->load(std::memory_order_acquire)) {
+        emitFailure(QStringLiteral("interrupted"), "upload cancelled before it started; select this row and retry to resume");
+        return;
+    }
     TransferSnapshot running = baseSnapshot(TransferState::Running, QStringLiteral("starting"));
     emit progress(running);
     if (spec_.direction == TransferDirection::Upload) runUpload();
@@ -138,9 +142,14 @@ void TransferWorker::runUpload() {
             snapshot.totalBytes = total;
             applyRates(snapshot, meter.sample(completed, total));
             if (uiThrottle.shouldEmit(completed, total)) emit progress(snapshot);
-        }, object, error, spec_.commandId.toStdString());
+        }, object, error, spec_.commandId.toStdString(),
+        [cancel = cancelRequested_] { return cancel->load(std::memory_order_acquire); });
     if (!ok) {
-        emitFailure(QStringLiteral("upload"), error);
+        if (cancelRequested_->load(std::memory_order_acquire)) {
+            emitFailure(QStringLiteral("interrupted"), "upload cancelled; select this row and retry to resume");
+        } else {
+            emitFailure(QStringLiteral("upload"), error);
+        }
         return;
     }
     QString verificationResult;

@@ -34,6 +34,16 @@ TransferStore::TransferStore()
         return;
     }
     QSqlQuery query(db);
+    // Each snapshot is an SQLite autocommit transaction. WAL plus FULL sync
+    // makes a forced process termination or power loss recover the last
+    // committed task record on the next start.
+    if (!query.exec(QStringLiteral("PRAGMA journal_mode=WAL")) ||
+        !query.exec(QStringLiteral("PRAGMA synchronous=FULL")) ||
+        !query.exec(QStringLiteral("PRAGMA busy_timeout=5000"))) {
+        error_ = query.lastError().text();
+        db.close();
+        return;
+    }
     if (!query.exec(QStringLiteral(
             "CREATE TABLE IF NOT EXISTS transfer_tasks ("
             "task_id TEXT PRIMARY KEY, direction INTEGER NOT NULL, local_path TEXT NOT NULL, "

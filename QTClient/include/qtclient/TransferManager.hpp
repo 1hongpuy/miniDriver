@@ -40,6 +40,7 @@ public:
     // It does not pretend to cancel an in-flight HTTP request; the worker
     // still unwinds normally while Qt tears down its thread.
     void markActiveUploadsInterrupted();
+    void stopActiveUploadsForExit();
 
 signals:
     void taskAdded(const miniKV::qtclient::TransferSnapshot& snapshot);

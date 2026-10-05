@@ -93,7 +93,8 @@ bool MiniDriverStorageAdapter::upload(const std::filesystem::path& input,
                                       const ProgressCallback& progress,
                                       miniKV::client::ObjectRef& object,
                                       std::string& error,
-                                      const std::string& commandId) {
+                                      const std::string& commandId,
+                                      const CancellationCallback& cancellation) {
     std::error_code ec;
     const uint64_t total = std::filesystem::file_size(input, ec);
     if (ec || total == 0) {
@@ -103,6 +104,7 @@ bool MiniDriverStorageAdapter::upload(const std::filesystem::path& input,
 
     miniKV::client::UploadOptions options;
     options.commandId = commandId;
+    options.isCancelled = cancellation;
     auto reportedBytes = std::make_shared<std::atomic<uint64_t>>(0);
     options.onProgress = [progress, reportedBytes](const miniKV::client::UploadProgress& value) {
         if (!progress) return;

@@ -12,6 +12,7 @@ namespace miniKV::qtclient {
 class MiniDriverStorageAdapter {
 public:
     using ProgressCallback = std::function<void(uint64_t completed, uint64_t total)>;
+    using CancellationCallback = std::function<bool()>;
 
     explicit MiniDriverStorageAdapter(miniKV::client::ClientConfig config);
 
@@ -19,7 +20,8 @@ public:
                 const ProgressCallback& progress,
                 miniKV::client::ObjectRef& object,
                 std::string& error,
-                const std::string& commandId = {});
+                const std::string& commandId = {},
+                const CancellationCallback& cancellation = {});
 
     bool download(const miniKV::client::ObjectRef& object,
                   const std::filesystem::path& output,

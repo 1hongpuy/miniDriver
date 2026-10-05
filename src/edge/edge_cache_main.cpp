@@ -13,6 +13,7 @@
 #include "utils/Util.hpp"
 
 #include <atomic>
+#include <chrono>
 #include <cctype>
 #include <cerrno>
 #include <csignal>
@@ -282,6 +283,7 @@ public:
                        uint64_t length, bool closeAfterResponse, std::string virtualPath)
         : config_(config),
           workers_(workers),
+          originClient_(config.client),
           connection_(std::move(connection)),
           info_(std::move(info)),
           parts_(std::move(parts)),
@@ -337,24 +339,44 @@ private:
                 }
             }
             if (!cacheHit) {
-                MiniDriverClient client(config_.client);
+                const auto fetchStartedAt = std::chrono::steady_clock::now();
+                std::cerr << "event=edge_stream_part_fetch_begin virtual_path=" << virtualPath_
+                          << " part=" << index
+                          << " chunk_index=" << part.chunk.index
+                          << " chunk_bytes=" << part.chunk.size << '\n';
                 ReadOptions options;
                 options.keepAlive = true;
                 options.verifyChecksum = true;
                 TransferStats stats;
                 std::string body;
                 std::string failure;
-                if (!client.readWholeChunk(part.chunk, body, options, stats, failure)) {
+                if (!originClient_.readWholeChunk(part.chunk, body, options, stats, failure)) {
                     finish(false, "origin chunk read failed: " + failure);
                     return;
                 }
                 originBytes_.fetch_add(body.size(), std::memory_order_relaxed);
                 originRequests_.fetch_add(stats.dataRequests, std::memory_order_relaxed);
                 replicaFallbacks_.fetch_add(stats.replicaFallbacks, std::memory_order_relaxed);
+                const auto originReadMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::steady_clock::now() - fetchStartedAt).count();
+                std::cerr << "event=edge_stream_part_origin_read virtual_path=" << virtualPath_
+                          << " part=" << index
+                          << " chunk_index=" << part.chunk.index
+                          << " bytes=" << body.size()
+                          << " elapsed_ms=" << originReadMs
+                          << " data_requests=" << stats.dataRequests
+                          << " replica_fallbacks=" << stats.replicaFallbacks << '\n';
+                const auto publishStartedAt = std::chrono::steady_clock::now();
                 if (!config_.cache->publish(key, body, reservation, lease, cacheError)) {
                     finish(false, "edge cache publish failed: " + cacheError);
                     return;
                 }
+                const auto publishMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::steady_clock::now() - publishStartedAt).count();
+                std::cerr << "event=edge_stream_part_cache_published virtual_path=" << virtualPath_
+                          << " part=" << index
+                          << " chunk_index=" << part.chunk.index
+                          << " elapsed_ms=" << publishMs << '\n';
             }
         }
         if (cacheHit) {
@@ -441,6 +463,7 @@ private:
     }
 
     const EdgeConfig& config_;
+    MiniDriverClient originClient_;
     miniKV::utils::ThreadPool* workers_;
     TcpConnectionPtr connection_;
     ObjectInfo info_;

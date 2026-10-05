@@ -2077,7 +2077,15 @@ CommitChunkStatus GatewayState::commitChunk(const std::string& sessionId, uint32
         SessionState session; if(!getSession(sessionId, session)) return CommitChunkStatus::kInvalidRequest;
         const auto chunk = remoteMetadata_->chunk(session.objectId, index); const auto lease = remoteMetadata_->lease(leaseId);
         if(!chunk || !lease || lease->state != metadata::LeaseState::kActive) return CommitChunkStatus::kInvalidRequest;
-        metadata::MetadataCommand command; command.commandId = "commit-chunk-" + sessionId + "-" + std::to_string(index) + "-" + std::to_string(chunk->generation);
+        // A failed commit is deliberately remembered by the Metadata state
+        // machine for idempotency. A resumed upload can have the same
+        // session/chunk/generation but a replacement lease, so its command
+        // identity must include that lease too. Otherwise the retry is
+        // rejected as a command-id fingerprint mismatch before the valid
+        // replacement lease can be committed.
+        metadata::MetadataCommand command;
+        command.commandId = "commit-chunk-" + sessionId + "-" + std::to_string(index) +
+                            "-" + leaseId + "-" + std::to_string(chunk->generation);
         command.type = metadata::MetadataCommandType::kCommitChunk; command.actorType="gateway"; command.actorId="admin"; command.generation=chunk->generation; command.issuedAt=unixSeconds();
         metadata::CommitChunkPayload payload; payload.sessionId=sessionId; payload.leaseId=leaseId; payload.chunkIndex=index; payload.routeKey=chunk->routeKey; payload.chunkSize=size; payload.checksumType=chunk->checksumType; payload.checksumDigest=chunk->checksumDigest;
         for(const auto& nodeId : successfulNodes) { auto target=std::find_if(lease->targets.begin(), lease->targets.end(), [&](const auto& candidate){ return candidate.nodeId==nodeId; }); if(target==lease->targets.end()) return CommitChunkStatus::kInvalidRequest; payload.replicas.push_back({nodeId,target->nodeEpoch,chunk->checksumDigest,unixSeconds()}); }

@@ -7,7 +7,12 @@ namespace miniKV::qtclient {
 TransferManager::TransferManager(QObject* parent) : QObject(parent) {}
 
 void TransferManager::persist(const TransferSpec& spec, const TransferSnapshot& snapshot) {
-    (void)store_.upsert(spec, snapshot);
+    if (store_.upsert(spec, snapshot)) return;
+    if (journalFailureReported_) return;
+    journalFailureReported_ = true;
+    emit log({spec.taskId, QStringLiteral("journal"),
+              QStringLiteral("transfer recovery journal is unavailable: %1 (database: %2)")
+                  .arg(store_.error(), store_.databasePath())});
 }
 
 TransferManager::~TransferManager() {
@@ -112,6 +117,14 @@ bool TransferManager::retry(const QString& taskId,
 }
 
 void TransferManager::restoreInterruptedUploads(const miniKV::client::ClientConfig& config) {
+    if (!store_.available()) {
+        emit log({QString(), QStringLiteral("journal"),
+                  QStringLiteral("transfer recovery is disabled: %1 (database: %2)")
+                      .arg(store_.error(), store_.databasePath())});
+        return;
+    }
+
+    int restored = 0;
     for (TransferSpec spec : store_.interruptedUploads()) {
         if (taskSpecs_.contains(spec.taskId)) continue;
         spec.clientConfig = config;
@@ -125,6 +138,22 @@ void TransferManager::restoreInterruptedUploads(const miniKV::client::ClientConf
         emit taskAdded(snapshot);
         emit log({spec.taskId, QStringLiteral("manager"),
                   QStringLiteral("interrupted upload restored; retry keeps original command ID")});
+        ++restored;
+    }
+    emit log({QString(), QStringLiteral("journal"),
+              QStringLiteral("transfer recovery journal ready: %1; restored %2 interrupted upload(s)")
+                  .arg(store_.databasePath()).arg(restored)});
+}
+
+void TransferManager::markActiveUploadsInterrupted() {
+    for (auto it = active_.cbegin(); it != active_.cend(); ++it) {
+        const auto spec = taskSpecs_.constFind(it.key());
+        if (spec == taskSpecs_.cend() || spec->direction != TransferDirection::Upload) continue;
+        TransferSnapshot snapshot = initialSnapshot(*spec);
+        snapshot.state = TransferState::Failed;
+        snapshot.stage = QStringLiteral("interrupted");
+        snapshot.error = QStringLiteral("Client exited while this upload was active; select this row and retry to resume.");
+        persist(*spec, snapshot);
     }
 }
 

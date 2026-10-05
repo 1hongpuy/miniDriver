@@ -16,11 +16,15 @@ public:
 
     bool available() const noexcept { return available_; }
     QString error() const { return error_; }
+    // Kept visible to the UI so an unavailable QSQLITE plugin or a permission
+    // failure cannot silently disable crash recovery.
+    QString databasePath() const { return databasePath_; }
     bool upsert(const TransferSpec& spec, const TransferSnapshot& snapshot);
     QVector<TransferSpec> interruptedUploads();
 
 private:
     QString connectionName_;
+    QString databasePath_;
     bool available_ = false;
     QString error_;
 };

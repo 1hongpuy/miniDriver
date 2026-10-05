@@ -26,8 +26,9 @@ TransferStore::TransferStore()
         error_ = QStringLiteral("cannot create application data directory for transfer journal");
         return;
     }
+    databasePath_ = root + QStringLiteral("/transfers.sqlite3");
     QSqlDatabase db = QSqlDatabase::addDatabase(QStringLiteral("QSQLITE"), connectionName_);
-    db.setDatabaseName(root + QStringLiteral("/transfers.sqlite3"));
+    db.setDatabaseName(databasePath_);
     if (!db.open()) {
         error_ = db.lastError().text();
         return;

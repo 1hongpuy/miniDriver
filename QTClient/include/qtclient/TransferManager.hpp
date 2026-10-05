@@ -32,6 +32,14 @@ public:
     // asks MetadataService for authoritative completed chunks.
     void restoreInterruptedUploads(const miniKV::client::ClientConfig& config);
     bool hasActiveTasks() const noexcept { return !active_.isEmpty(); }
+    bool transferJournalAvailable() const noexcept { return store_.available(); }
+    QString transferJournalPath() const { return store_.databasePath(); }
+    QString transferJournalError() const { return store_.error(); }
+
+    // Records recoverable snapshots before an intentional application exit.
+    // It does not pretend to cancel an in-flight HTTP request; the worker
+    // still unwinds normally while Qt tears down its thread.
+    void markActiveUploadsInterrupted();
 
 signals:
     void taskAdded(const miniKV::qtclient::TransferSnapshot& snapshot);
@@ -61,6 +69,7 @@ private:
     QSet<QString> failedTasks_;
     QSet<QString> retryPending_;
     TransferStore store_;
+    bool journalFailureReported_ = false;
 };
 
 }  // namespace miniKV::qtclient

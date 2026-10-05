@@ -704,12 +704,31 @@ void MainWindow::closeEvent(QCloseEvent* event) {
         event->accept();
         return;
     }
-    const auto answer = QMessageBox::question(
-        this, QStringLiteral("Transfers are active"),
-        QStringLiteral("A synchronous transfer is still running. Wait for it to finish and close?"),
-        QMessageBox::Yes | QMessageBox::No, QMessageBox::No);
-    if (answer == QMessageBox::Yes) event->accept();
-    else event->ignore();
+    QMessageBox choice(this);
+    choice.setIcon(QMessageBox::Question);
+    choice.setWindowTitle(QStringLiteral("Transfers are active"));
+    choice.setText(QStringLiteral("An upload is still active. Choose how to close the client."));
+    choice.setInformativeText(
+        QStringLiteral("Continue in background keeps this process uploading. "
+                       "Exit records a recoverable task in SQLite; the next client start will show it as Interrupted, "
+                       "and Retry resumes the same server session."));
+    auto* background = choice.addButton(QStringLiteral("Continue in background"), QMessageBox::AcceptRole);
+    auto* exit = choice.addButton(QStringLiteral("Exit and resume next time"), QMessageBox::DestructiveRole);
+    auto* cancel = choice.addButton(QMessageBox::Cancel);
+    choice.setDefaultButton(background);
+    choice.exec();
+    if (choice.clickedButton() == background) {
+        hide();
+        event->ignore();
+        return;
+    }
+    if (choice.clickedButton() == exit) {
+        transferManager_->markActiveUploadsInterrupted();
+        event->accept();
+        return;
+    }
+    Q_UNUSED(cancel);
+    event->ignore();
 }
 
 }  // namespace miniKV::qtclient

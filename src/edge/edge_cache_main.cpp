@@ -279,7 +279,7 @@ class EdgePlaybackStream final : public std::enable_shared_from_this<EdgePlaybac
 public:
     EdgePlaybackStream(const EdgeConfig& config, miniKV::utils::ThreadPool* workers,
                        TcpConnectionPtr connection, ObjectInfo info,
-                       std::vector<PlaybackStreamPart> parts, uint64_t start,
+                       std::vector<PlaybackStreamPart> parts, uint64_t start, bool partial,
                        uint64_t length, bool closeAfterResponse, std::string virtualPath)
         : config_(config),
           workers_(workers),
@@ -287,7 +287,7 @@ public:
           connection_(std::move(connection)),
           info_(std::move(info)),
           parts_(std::move(parts)),
-          start_(start),
+          start_(start), partial_(partial),
           length_(length),
           closeAfterResponse_(closeAfterResponse),
           virtualPath_(std::move(virtualPath)) {}
@@ -428,7 +428,7 @@ private:
                     HttpResponse response;
                     response.setCloseConnection(false);
                     addObjectHeaders(&response, self->info_, self->info_.size,
-                                     self->start_, self->length_, true);
+                                     self->start_, self->length_, self->partial_);
                     miniKV::network::Buffer output;
                     response.appendToBuffer(&output);
                     self->connection_->send(std::string(output.peek(), output.readableBytes()));
@@ -496,6 +496,7 @@ private:
     ObjectInfo info_;
     std::vector<PlaybackStreamPart> parts_;
     uint64_t start_ = 0;
+    bool partial_ = false;
     uint64_t length_ = 0;
     bool closeAfterResponse_ = false;
     std::string virtualPath_;
@@ -558,7 +559,7 @@ bool startStreamingPlayback(const HttpRequest& request, HttpResponse* response,
 
     deferred->defer();
     auto stream = std::make_shared<EdgePlaybackStream>(
-        config, workers, connection, std::move(info), std::move(parts), start, length,
+        config, workers, connection, std::move(info), std::move(parts), start, partial, length,
         requestClosesConnection(request), std::move(virtualPath));
     stream->start();
     return true;
